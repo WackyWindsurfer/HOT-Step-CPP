@@ -518,7 +518,14 @@ function cdRunSummary(name: string, cap = 0) {
 }
 // Rungs a run reached at or below 0.6 (the snapshots the prune keeps), shallowest first.
 function cdRungsDesc(dsKey: string, crop: number): string[] {
-  return [...cdRunSummary(cdName(dsKey, crop)).rungs.keys()].map(Number).filter(v => v <= 0.6 + 1e-9).sort((x, y) => y - x).map(v => v.toFixed(1));
+  const s = cdRunSummary(cdName(dsKey, crop));
+  const out = [...s.rungs.keys()].map(Number).filter(v => v <= 0.6 + 1e-9).sort((x, y) => y - x).map(v => v.toFixed(1));
+  // The final export (best epoch) counts as the deepest rung when it went
+  // meaningfully below the last snapshot: a run that ends at 0.31 without
+  // crossing 0.3 has a depth the 0.4 snapshot does not represent.
+  const deepest = out.length ? Number(out[out.length - 1]) : Infinity;
+  if (s.last && hasWeights(s.last) && typeof s.saved === 'number' && s.saved <= deepest - 0.05) out.push('final');
+  return out;
 }
 // depth: the crop-800 run at four depths spread from 0.6 to the deepest rung it
 // reached. crop: every crop cap at the deepest rung ALL THREE reached, but no
@@ -528,7 +535,8 @@ function cdSetItems(dsKey: string): Record<string, string[]> {
   if (r800.length < 2) throw new Error(`${dsKey}: crop-800 run has ${r800.length} rung(s) at or below 0.6 — nothing to compare`);
   const k = Math.min(4, r800.length);
   const depthRungs = Array.from({ length: k }, (_, i) => r800[Math.round(i * (r800.length - 1) / (k - 1))]);
-  const common = CD_CROPS.map(c => new Set(cdRungsDesc(dsKey, c))).reduce((acc, st) => new Set([...acc].filter(x => st.has(x))));
+  // 'final' exports sit at different losses per run, so only snapshots count as common.
+  const common = CD_CROPS.map(c => new Set(cdRungsDesc(dsKey, c).filter(r => r !== 'final'))).reduce((acc, st) => new Set([...acc].filter(x => st.has(x))));
   const commonAsc = [...common].map(Number).sort((x, y) => x - y);
   if (!commonAsc.length) throw new Error(`${dsKey}: no loss rung common to all three crops`);
   const rung = Math.max(0.3, commonAsc[0]).toFixed(1);
@@ -617,11 +625,15 @@ async function cdSongs(dsKey: string): Promise<{ slug: string; gen: CdGen; src: 
 }
 function cdResolve(dsKey: string, item: string): { dir: string | null; note: string } {
   if (item === 'base') return { dir: null, note: 'base model, no adapter' };
-  const m = item.replace(/#.*$/, '').match(/^c(\d+)@([\d.]+)$/);
+  const m = item.replace(/#.*$/, '').match(/^c(\d+)@([\d.]+|final)$/);
   if (!m) throw new Error(`bad item ${item}`);
   const crop = Number(m[1]);
-  const rung = Number(m[2]).toFixed(1);
   const s = cdRunSummary(cdName(dsKey, crop));
+  if (m[2] === 'final') {
+    if (!s.last || !hasWeights(s.last)) throw new Error(`${item}: no final export`);
+    return { dir: s.last, note: `crop cap ${crop} (used ${s.crop}), final export = best epoch, ma5 ${s.saved?.toFixed(3)} after ${s.epochs} epochs` };
+  }
+  const rung = Number(m[2]).toFixed(1);
   const hit = s.rungs.get(rung);
   if (hit) return { dir: hit.dir, note: `crop cap ${crop} (used ${s.crop}), snapshot at first ma5 <= ${rung} (epoch ${hit.epoch})` };
   // Rung never reached: ship the run's final export (its best epoch) and say so in the key.
