@@ -494,13 +494,14 @@ static bool dit_pissa_export(const DitAdapterLora & ad, const char * dir, const 
                        meta.trigger_position.empty() ? std::string("prepend") : meta.trigger_position });
         md.push_back({ "modelspec.trigger_phrase", meta.trigger });
     }
-    // F32, not BF16: the two halves [B, -B0][A; A0] are large and nearly
-    // cancel (each ~0.7 |W| at rank 128 on this DiT), so BF16's 3.9e-3 relative
-    // precision leaves a noise residual of the same order as the adapter's own
-    // delta. The blind test's "strangely louder" PiSSA render (2026-09-04) is
-    // the suspected symptom. Twice the file, exact merge.
+    // BF16. The two halves [B, -B0][A; A0] are large (each ~1.1-1.3 |W| at
+    // rank 128 on this DiT) and nearly cancel, so BF16 leaves ~0.5% |W| of
+    // residual, about a tenth of the adapter's own delta. An F32 export was
+    // A/B'd against it on three full songs (2026-09-04): no appreciable
+    // difference by ear, so the half-size file wins. (Note: an F32 export at
+    // this rank is 2.5 GB, which also found the 2 GiB stat bug in the probe.)
     const std::string sf = lm_join(d, "adapter_model.safetensors");
-    if (!st_write_file(sf.c_str(), tensors, md, STW_F32)) {
+    if (!st_write_file(sf.c_str(), tensors, md, STW_BF16)) {
         *err = "cannot write " + sf;
         return false;
     }
