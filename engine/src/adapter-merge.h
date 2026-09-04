@@ -31,6 +31,7 @@
 // PendingCopy lookup is O(1) via hashmap.
 
 #include "ggml-alloc.h"
+#include "hot-step-fsutf8.h"  // hs_stat: 64-bit sizes + UTF-8 paths (plain stat() fails at 2 GiB on MSVC)
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf-weights.h"
@@ -1768,8 +1769,8 @@ static bool adapter_merge(WeightCtx *          wctx,
     std::string sf_path;
     std::string cfg_dir;
 
-    struct stat sb;
-    if (stat(adapter_path, &sb) != 0) {
+    HS_STAT_T sb;
+    if (hs_stat(std::string(adapter_path), &sb) != 0) {
         fprintf(stderr, "[Adapter] path does not exist: %s\n", adapter_path);
         return false;
     }
@@ -1780,11 +1781,11 @@ static bool adapter_merge(WeightCtx *          wctx,
         // no adapter_model.safetensors). Mirrors hot-step-server.cpp's probe.
         sf_path = std::string(adapter_path) + "/adapter_model.safetensors";
         cfg_dir = adapter_path;
-        if (stat(sf_path.c_str(), &sb) == 0) {
+        if (hs_stat(sf_path, &sb) == 0) {
             // warn if adapter_config.json is missing, alpha lives there for PEFT so
             // the merge silently falls back to alpha=rank (scaling=1) otherwise
             std::string cfg_path = cfg_dir + "/adapter_config.json";
-            if (stat(cfg_path.c_str(), &sb) != 0) {
+            if (hs_stat(cfg_path, &sb) != 0) {
                 fprintf(stderr,
                         "[Adapter] WARNING: PEFT directory %s missing adapter_config.json, alpha falls back to rank "
                         "(scaling=1.0). If training used lora_alpha != rank, the merge will be under or over scaled.\n",
@@ -1795,7 +1796,7 @@ static bool adapter_merge(WeightCtx *          wctx,
             // writes (lokr_weights.safetensors, alpha per-module, deliberately no
             // adapter_config.json). Same probe order as hot-step-server.cpp.
             sf_path = std::string(adapter_path) + "/lokr_weights.safetensors";
-            if (stat(sf_path.c_str(), &sb) != 0) {
+            if (hs_stat(sf_path, &sb) != 0) {
                 fprintf(stderr,
                         "[Adapter] directory %s is neither a PEFT nor a LoKR layout, missing "
                         "adapter_model.safetensors and lokr_weights.safetensors\n",
@@ -1821,8 +1822,8 @@ static bool adapter_merge(WeightCtx *          wctx,
     const STFile * rebase_ptr = nullptr;
     if (rebase_source && rebase_source[0] && rebase_beta != 0.0f) {
         std::string rb_path = rebase_source;
-        struct stat rsb;
-        if (stat(rb_path.c_str(), &rsb) == 0 && S_ISDIR(rsb.st_mode)) {
+        HS_STAT_T rsb;
+        if (hs_stat(rb_path, &rsb) == 0 && S_ISDIR(rsb.st_mode)) {
             rb_path += "/model.safetensors";
         }
         if (st_open(&rebase_st, rb_path.c_str())) {

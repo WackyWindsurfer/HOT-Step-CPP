@@ -688,8 +688,8 @@ static int64_t adapter_trt_apply(
     // Resolve safetensors file path
     std::string st_path;
     std::string cfg_dir;
-    struct stat st_stat;
-    if (stat(adapter_path, &st_stat) != 0) {
+    HS_STAT_T st_stat;
+    if (hs_stat(std::string(adapter_path), &st_stat) != 0) {
         fprintf(stderr, "[Adapter-TRT] Path not found: %s\n", adapter_path);
         return -1;
     }
