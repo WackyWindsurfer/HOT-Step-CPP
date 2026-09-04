@@ -18,6 +18,7 @@
 import fs from 'fs';
 import path from 'path';
 import { spawnSync } from 'child_process';
+import crypto from 'crypto';
 import { aceClient, type AceRequest } from '../src/services/aceClient.js';
 import { config } from '../src/config.js';
 
@@ -45,6 +46,11 @@ const DATASETS: Record<string, Ds> = {
     id: '8203ce8f-92c3-480f-a073-0bfe463c0a58',
     caption: 'classic early-80s heavy metal, galloping bass, twin harmony guitars, powerful male vocal, big arena drums',
     lyrics: '[Verse]\nRide the night on wheels of thunder\n\n[Chorus]\nHold on, the sky is falling down\n',
+  },
+  adtr_whatseparates: {
+    id: '7f18925e-ad7c-4ac2-a860-f6ba9a18b18f',
+    caption: 'anthemic pop punk with metalcore breakdowns, chugging drop-tuned guitars, fast punchy drums, gang vocals, clean male lead switching to screams',
+    lyrics: '[Verse]\nBurn the map and drive all night\n\n[Chorus]\nWe were never coming home\n',
   },
   carpenterbrut_trilogy: {
     id: '3da921d9-45e0-4a8b-8dd5-c4ffe262bf33',
@@ -430,9 +436,273 @@ async function phaseBlind(dsKey: string, sub: string, armKeys: string[], songs: 
   log(`${dsKey}/${sub}: blind set complete — key sealed in _key/KEY.json`);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Crop cap × depth study (night of 2026-09-04). Plain LoRA r128 throughout;
+// the only things that move are the crop cap and the DEPTH — which loss rung's
+// milestone snapshot ships. One training run per crop cap, trained toward 0.1
+// with a snapshot at every 0.1 of ma5, so every depth rung comes from the same
+// run (no depth-vs-seed confound). Two sealed sets per dataset:
+//   depth: crop 800 at ma5 0.5 / 0.3 / 0.2 / 0.1 + base
+//   crop:  550 / 800 / 1500 at ma5 0.3 + base + a hidden repeat of the 800
+// The repeat is the same adapter rendered twice with the same seed, so it is
+// the listener's own noise floor.
+//
+//   --phase cd        --datasets mj_dangerous,adtr_whatseparates   (train, then render, per dataset)
+//   --phase cd-train  / --phase cd-blind / --phase cd-plan (dry run: songs + run state)
+// ═══════════════════════════════════════════════════════════════════════════
+const CD_LST    = path.join(ROOT, '_experiments', '_LISTENING', '2026-09-05-dit-crop-depth');
+const CD_CROPS  = [550, 800, 1500];
+const CD_TARGET = 0.1;
+// Epoch caps per crop. Rob's own crop-800 LoKr run on mj_dangerous needed all
+// 500 epochs to get near 0.3, and the LoRA A/B arm sat at 0.65 after 200, so
+// the depth rungs are chosen from whatever the run actually reaches (see
+// cdSetItems). The 1500 cap is lower because its epochs cost ~2x.
+const CD_EPOCHS: Record<number, number> = { 550: 800, 800: 800, 1500: 600 };
+// Lyric Studio generation ids (the dataset's own album profile). Two per dataset.
+const CD_SONGS: Record<string, number[]> = {
+  mj_dangerous: [4673, 3811],          // Front Page (134 bpm, 238 s), Girl in the Red Dress (120 bpm, 213 s)
+  adtr_whatseparates: [4311, 3983],    // House Money (140 bpm, 196 s), Dead Air (112 bpm, 156 s)
+};
+// Item grammar: 'base' | 'c<crop>@<rung>' with an optional '#dup' marker.
+// The sets are built from the rungs the runs actually reached — cdSetItems().
+const cdName = (dsKey: string, crop: number) => `cd-${dsKey}-c${crop}`;
+const hasWeights = (d: string) => fs.existsSync(path.join(d, 'adapter_model.safetensors'));
+
+type CdLog = {
+  config?: { crop?: number; crop_max?: number; epochs?: number };
+  epochs_run?: number; saved_ma5?: number; saved_reason?: string; total_ms?: number;
+  milestones?: { loss: number; epoch: number; path: string }[];
+  epochs?: { ma5?: number }[];
+};
+function readCdLog(dir: string): CdLog | null {
+  try { return JSON.parse(fs.readFileSync(path.join(dir, 'dit_train_log.json'), 'utf8')) as CdLog; } catch { return null; }
+}
+// Every run dir ever written for an adapter name (oldest first), including
+// one that holds only a log + milestones (a run killed mid-way).
+function allRunDirs(name: string): string[] {
+  const root = config.aceServer.adapters;
+  const out: string[] = [];
+  for (const top of fs.readdirSync(root)) {
+    if (!top.startsWith('dit-')) continue;
+    const nameDir = path.join(root, top, name);
+    if (!fs.existsSync(nameDir)) continue;
+    for (const run of fs.readdirSync(nameDir)) {
+      const d = path.join(nameDir, run);
+      if (fs.statSync(d).isDirectory() && fs.existsSync(path.join(d, 'dit_train_log.json'))) out.push(d);
+    }
+  }
+  return out.sort();
+}
+// Cumulative state of a cd run across its (possibly resumed) run dirs.
+function cdRunSummary(name: string, cap = 0) {
+  const dirs = allRunDirs(name);
+  let epochs = 0, ms = 0, reached = false;
+  let saved: number | null = null, crop: number | null = null;
+  const rungs = new Map<string, { dir: string; epoch: number }>();
+  for (const d of dirs) {
+    const jl = readCdLog(d);
+    if (!jl) continue;
+    const eRun = jl.epochs_run ?? (jl.epochs?.length ?? 0);
+    for (const m of jl.milestones ?? []) {
+      const mp = path.join(d, m.path);
+      if (hasWeights(mp)) rungs.set(m.loss.toFixed(1), { dir: mp, epoch: epochs + m.epoch });
+    }
+    epochs += eRun;
+    ms += jl.total_ms ?? 0;
+    if (jl.saved_reason === 'target') reached = true;
+    if (typeof jl.saved_ma5 === 'number') saved = jl.saved_ma5;
+    if (jl.config?.crop) crop = jl.config.crop;
+  }
+  const last = dirs.length ? dirs[dirs.length - 1] : null;
+  return { dirs, last, epochs, minutes: ms / 60000, reached, saved, crop, rungs, complete: reached || (cap > 0 && epochs >= cap) };
+}
+// Rungs a run reached at or below 0.6 (the snapshots the prune keeps), shallowest first.
+function cdRungsDesc(dsKey: string, crop: number): string[] {
+  return [...cdRunSummary(cdName(dsKey, crop)).rungs.keys()].map(Number).filter(v => v <= 0.6 + 1e-9).sort((x, y) => y - x).map(v => v.toFixed(1));
+}
+// depth: the crop-800 run at four depths spread from 0.6 to the deepest rung it
+// reached. crop: every crop cap at the deepest rung ALL THREE reached, but no
+// deeper than 0.3 (the shipped target), plus a hidden repeat of the 800.
+function cdSetItems(dsKey: string): Record<string, string[]> {
+  const r800 = cdRungsDesc(dsKey, 800);
+  if (r800.length < 2) throw new Error(`${dsKey}: crop-800 run has ${r800.length} rung(s) at or below 0.6 — nothing to compare`);
+  const k = Math.min(4, r800.length);
+  const depthRungs = Array.from({ length: k }, (_, i) => r800[Math.round(i * (r800.length - 1) / (k - 1))]);
+  const common = CD_CROPS.map(c => new Set(cdRungsDesc(dsKey, c))).reduce((acc, st) => new Set([...acc].filter(x => st.has(x))));
+  const commonAsc = [...common].map(Number).sort((x, y) => x - y);
+  if (!commonAsc.length) throw new Error(`${dsKey}: no loss rung common to all three crops`);
+  const rung = Math.max(0.3, commonAsc[0]).toFixed(1);
+  return {
+    depth: ['base', ...depthRungs.map(l => `c800@${l}`)],
+    crop:  ['base', ...CD_CROPS.map(c => `c${c}@${rung}`), `c800@${rung}#dup`],
+  };
+}
+
+async function ensureTensors(dsKey: string): Promise<void> {
+  const ds = DATASETS[dsKey];
+  const variantKey = SYNTH_MODEL.replace(/\.gguf$/i, '');
+  const st = await (await fetch(`${API}/datasets/${ds.id}/preprocess`)).json() as
+    { variants?: { variantKey: string; processed: number; total: number; failed: number }[] };
+  const v = (st.variants ?? []).find(x => x.variantKey === variantKey);
+  if (v && v.processed === v.total && v.failed === 0) { log(`${dsKey}: tensors present (${v.total} samples, ${variantKey})`); return; }
+  log(`${dsKey}: no tensors for ${variantKey} — preprocessing`);
+  const jobId = await post(`/datasets/${ds.id}/preprocess`, { ditModel: SYNTH_MODEL });
+  const r = await waitJob(jobId, `${dsKey}/preprocess`);
+  if (r.status !== 'done') throw new Error(`${dsKey}: preprocess ${r.status}: ${r.error ?? ''}`);
+  log(`${dsKey}: preprocess done in ${Math.round(r.secs)} s`);
+}
+
+async function cdTrain(dsKey: string): Promise<void> {
+  const ds = DATASETS[dsKey];
+  fs.mkdirSync(path.join(CD_LST, dsKey), { recursive: true });
+  const readme = path.join(CD_LST, dsKey, 'README.md');
+  if (!fs.existsSync(readme)) {
+    fs.writeFileSync(readme,
+      `# ${dsKey} — crop cap × depth\n\nPlain LoRA r128 / alpha 256, Prodigy, bf16-f32 mirror, flash attention, ` +
+      `target ${CD_TARGET} (ma5), epoch caps ${JSON.stringify(CD_EPOCHS)}, milestone snapshot at every 0.1 of ma5. One run per crop cap; ` +
+      `everything else is the train-dit route's default. "rungs" = first epoch whose ma5 reached that value; the blind ` +
+      `sets render those snapshots.\n\n| crop cap | crop used | epochs | min | saved ma5 | rungs (epoch) | state |\n|---|---|---|---|---|---|---|\n`);
+  }
+  await ensureTensors(dsKey);
+  for (const crop of CD_CROPS) {
+    const name = cdName(dsKey, crop);
+    const cap = CD_EPOCHS[crop];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const s = cdRunSummary(name, cap);
+      if (s.complete) { log(`${name}: complete (${s.epochs} epochs, saved ${s.saved}, ${s.reached ? 'target' : 'cap'})`); break; }
+      const remaining = Math.max(1, cap - s.epochs);
+      const body: Record<string, unknown> = {
+        adapterName: name, adapterType: 'lora', rank: 128, alpha: 256,
+        cropMax: crop, targetLoss: CD_TARGET, epochs: remaining,
+        milestoneStep: 0.1, milestoneKeep: 8, attnBackend: 'flash',
+      };
+      if (s.last && !hasWeights(s.last)) {
+        // Killed mid-run: no top-level export to continue from, so the route's
+        // 'latest' would skip this dir. Continue from the deepest snapshot.
+        const deepest = [...s.rungs.entries()].sort((x, y) => Number(x[0]) - Number(y[0]))[0];
+        body.initAdapter = deepest ? deepest[1].dir : '';
+      }
+      log(`${name}: ${s.epochs ? `resuming after ${s.epochs} epochs` : 'from scratch'}, ${remaining} epochs ${JSON.stringify(body)}`);
+      const jobId = await post(`/datasets/${ds.id}/train-dit`, body);
+      const r = await waitJob(jobId, name);
+      log(`${name}: ${r.status} after ${Math.round(r.secs)} s${r.error ? ` — ${r.error}` : ''}`);
+      if (r.status === 'done') break;
+    }
+    const s = cdRunSummary(name, cap);
+    const rungs = [...s.rungs.entries()].sort((x, y) => Number(y[0]) - Number(x[0])).map(([l, v]) => `${l}@${v.epoch}`).join(' ');
+    fs.appendFileSync(readme, `| ${crop} | ${s.crop ?? '?'} | ${s.epochs} | ${s.minutes.toFixed(0)} | ${s.saved?.toFixed(3) ?? '?'} | ${rungs} | ${s.reached ? 'target' : s.complete ? 'epoch cap' : 'INCOMPLETE'} |\n`);
+  }
+}
+
+type CdGen = { id: number; title: string; caption: string; lyrics: string; bpm: number; key: string; duration: number };
+async function cdSongs(dsKey: string): Promise<{ slug: string; gen: CdGen; src: string }[]> {
+  const ds = DATASETS[dsKey];
+  const ids = CD_SONGS[dsKey];
+  if (!ids) throw new Error(`${dsKey}: no songs configured`);
+  const r = await (await fetch(`${API}/datasets/${ds.id}/ls-generations`)).json() as { artist: string; album: string; generations: CdGen[] };
+  const dir = path.join(CD_LST, dsKey);
+  fs.mkdirSync(dir, { recursive: true });
+  return ids.map((id, i) => {
+    const g = r.generations.find(x => x.id === id);
+    if (!g) throw new Error(`${dsKey}: Lyric Studio generation #${id} not found`);
+    if (!g.caption || !g.lyrics) throw new Error(`#${id} lacks caption/lyrics`);
+    const slug = `song${i + 1}`;
+    const src = `Lyric Studio #${g.id} "${g.title}" — ${r.artist} / ${r.album}, bpm ${g.bpm}, ${g.key}, ${g.duration} s`;
+    for (const [f, c] of [[`${slug}.lyrics.txt`, g.lyrics], [`${slug}.caption.txt`, g.caption], [`${slug}.SOURCE.txt`, src + '\n']] as const) {
+      const fp = path.join(dir, f);
+      if (!fs.existsSync(fp)) fs.writeFileSync(fp, c);
+    }
+    return { slug, gen: g, src };
+  });
+}
+function cdResolve(dsKey: string, item: string): { dir: string | null; note: string } {
+  if (item === 'base') return { dir: null, note: 'base model, no adapter' };
+  const m = item.replace(/#.*$/, '').match(/^c(\d+)@([\d.]+)$/);
+  if (!m) throw new Error(`bad item ${item}`);
+  const crop = Number(m[1]);
+  const rung = Number(m[2]).toFixed(1);
+  const s = cdRunSummary(cdName(dsKey, crop));
+  const hit = s.rungs.get(rung);
+  if (hit) return { dir: hit.dir, note: `crop cap ${crop} (used ${s.crop}), snapshot at first ma5 <= ${rung} (epoch ${hit.epoch})` };
+  // Rung never reached: ship the run's final export (its best epoch) and say so in the key.
+  if (s.last && hasWeights(s.last)) {
+    return { dir: s.last, note: `crop cap ${crop}: rung ${rung} NOT reached — final export, ma5 ${s.saved?.toFixed(3)} after ${s.epochs} epochs` };
+  }
+  throw new Error(`${item}: no adapter for rung ${rung}`);
+}
+function shuffleSecure<T>(xs: T[]): T[] {
+  const a = xs.slice();
+  for (let i = a.length - 1; i > 0; i--) { const j = crypto.randomInt(i + 1); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+type CdKey = Record<string, Record<string, Record<string, { item: string; note: string }>>>;
+async function cdBlind(dsKey: string, seed: number): Promise<void> {
+  const base = path.join(CD_LST, dsKey);
+  const keyDir = path.join(base, '_key');
+  fs.mkdirSync(keyDir, { recursive: true });
+  const keyPath = path.join(keyDir, 'KEY.json');
+  const key: CdKey = fs.existsSync(keyPath) ? JSON.parse(fs.readFileSync(keyPath, 'utf8')) as CdKey : {};
+  const saveKey = () => fs.writeFileSync(keyPath, JSON.stringify(key, null, 2));
+  const songs = await cdSongs(dsKey);
+  const rate = path.join(base, 'RATE.md');
+  if (!fs.existsSync(rate)) {
+    fs.writeFileSync(rate,
+      `# Blind rating — ${dsKey} — crop cap × depth\n\nEvery adapter here is plain LoRA r128 on this dataset; only the training crop cap ` +
+      `and the depth (which loss the shipped snapshot was taken at) differ. Two sets, ${songs.length} songs each, 5 files per song, ` +
+      `one of which is the base model. Letters are shuffled per song and per set. Same LM plan per song (seed ${seed}), thirds DiT, ` +
+      `50 steps, guidance 20, no post-processing.\n\n- depth/: the 800-frame crop at four depths\n- crop/: three crop caps at one depth\n\n` +
+      `Score 1-10 on quality / expressiveness / likeness, or rank. Open _key/KEY.json only when done.\n\n`);
+  }
+  const sets = cdSetItems(dsKey);
+  log(`${dsKey}: sets ${JSON.stringify(sets)}`);
+  for (const [set, items] of Object.entries(sets)) {
+    const letters = 'ABCDEFGH'.slice(0, items.length).split('');
+    const setDir = path.join(base, set);
+    fs.mkdirSync(setDir, { recursive: true });
+    for (const sng of songs) {
+      key[set] ??= {};
+      if (!key[set][sng.slug]) {
+        const order = shuffleSecure(items);
+        key[set][sng.slug] = {};
+        letters.forEach((L, i) => { key[set][sng.slug][L] = { item: order[i], note: '' }; });
+        saveKey();
+      }
+      const hdr = `## ${set} — ${sng.slug}`;
+      if (!fs.readFileSync(rate, 'utf8').includes(hdr)) {
+        fs.appendFileSync(rate, `${hdr} — ${sng.src}\n\n| file | quality | expressiveness | likeness | notes |\n|---|---|---|---|---|\n` +
+          letters.map(L => `| ${set}/${sng.slug}_${L}.wav |  |  |  |  |`).join('\n') + '\n\n');
+      }
+      const ov: RenderOverride = {
+        lyrics: sng.gen.lyrics, caption: sng.gen.caption.trim(), duration: sng.gen.duration || 240, seed, key: `${dsKey}:cd:${sng.slug}`,
+      };
+      for (const L of letters) {
+        const wav = path.join(setDir, `${sng.slug}_${L}.wav`);
+        if (fs.existsSync(wav)) { log(`${dsKey} ${set}/${sng.slug}_${L}: exists, skipping`); continue; }
+        const entry = key[set][sng.slug][L];
+        const res = cdResolve(dsKey, entry.item);
+        entry.note = res.note;
+        saveKey();
+        await waitEngine();
+        log(`${dsKey} ${set}/${sng.slug}_${L}: render (${entry.item})`);
+        await render(dsKey, res.dir, wav, ov);
+      }
+    }
+  }
+  log(`${dsKey}: blind sets complete — key sealed in _key/KEY.json`);
+}
+async function cdPlan(dsKey: string): Promise<void> {
+  const songs = await cdSongs(dsKey);
+  for (const s of songs) log(`${dsKey} ${s.slug}: ${s.src} (caption ${s.gen.caption.length} chars, lyrics ${s.gen.lyrics.length} chars)`);
+  for (const c of CD_CROPS) {
+    const s = cdRunSummary(cdName(dsKey, c), CD_EPOCHS[c]);
+    log(`${cdName(dsKey, c)}: ${s.dirs.length} run dir(s), ${s.epochs} epochs, saved ${s.saved ?? '-'}, rungs [${[...s.rungs.keys()].join(' ')}], ${s.complete ? 'complete' : 'pending'}`);
+  }
+  try { log(`${dsKey}: sets ${JSON.stringify(cdSetItems(dsKey))}`); } catch (e: any) { log(`${dsKey}: sets not yet derivable — ${e.message}`); }
+}
+
 async function main() {
   const a = args();
-  const phase = a.get('phase') || 'all';  // lm | dit | all | render | blind
+  const phase = a.get('phase') || 'all';  // lm | dit | all | render | blind | cd | cd-train | cd-blind | cd-plan
   const dsKeys = (a.get('datasets') || 'mj_dangerous,dio_holydiver,carpenterbrut_trilogy').split(',').map(s => s.trim()).filter(Boolean);
   const target = Number(a.get('target') || 0.5);
   const epochs = Number(a.get('epochs') || 200);
@@ -448,6 +718,13 @@ async function main() {
     const armKeys = (a.get('arms') || 'rslora,lora,hira,pissa,dora').split(',').map(x => x.trim()).filter(Boolean);
     await phaseBlind(dsKeys[0], a.get('sub') || 'blind', armKeys, Number(a.get('songs') || 3), Number(a.get('seed') || 20260904), rank);
   }
+  if (phase === 'cd' || phase === 'cd-train' || phase === 'cd-blind') {
+    for (const k of dsKeys) {
+      if (phase !== 'cd-blind') await cdTrain(k);
+      if (phase !== 'cd-train') await cdBlind(k, Number(a.get('seed') || 20260904));
+    }
+  }
+  if (phase === 'cd-plan') for (const k of dsKeys) await cdPlan(k);
   if (phase === 'render') {
     // --lyrics-file <path> --caption-file <path> [--duration s] [--seed n] [--sub full]
     const lyricsFile = a.get('lyrics-file'); const captionFile = a.get('caption-file');
