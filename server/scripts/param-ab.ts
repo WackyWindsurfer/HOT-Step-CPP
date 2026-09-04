@@ -94,11 +94,21 @@ async function post(p: string, body: unknown): Promise<string> {
 async function waitJob(jobId: string, label: string): Promise<{ status: string; error: string | null; secs: number }> {
   const t0 = Date.now();
   let lastPhase = '';
+  let unknown = 0;
   for (;;) {
-    const j = await (await fetch(`${API}/jobs/${jobId}`)).json() as { status: string; phase: string; error: string | null };
+    const res = await fetch(`${API}/jobs/${jobId}`).catch(() => null);
+    const j = res ? await res.json().catch(() => ({})) as { status?: string; phase?: string; error?: string | null } : {};
+    if (!res || res.status === 404 || !j.status) {
+      // The job queue is in-memory: a server restart forgets every job. Three
+      // misses in a row = the run is gone (its child died with the server).
+      if (++unknown >= 3) return { status: 'failed', error: 'job vanished (server restarted?)', secs: (Date.now() - t0) / 1000 };
+      await new Promise(r => setTimeout(r, 5000));
+      continue;
+    }
+    unknown = 0;
     if (j.phase && j.phase !== lastPhase) { lastPhase = j.phase; log(`${label}: ${j.phase}`); }
     if (j.status === 'done' || j.status === 'failed' || j.status === 'cancelled') {
-      return { status: j.status, error: j.error, secs: (Date.now() - t0) / 1000 };
+      return { status: j.status, error: j.error ?? null, secs: (Date.now() - t0) / 1000 };
     }
     await new Promise(r => setTimeout(r, 5000));
   }
