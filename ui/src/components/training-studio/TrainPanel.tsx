@@ -261,7 +261,17 @@ export const TrainPanel: React.FC = () => {
       ...(form.captionDropout > 0 ? { captionDropout: form.captionDropout } : {}),
       // Parameterization + soft prompt (2026-09-04): only when moved off
       // default, LoRA type only — the server ignores them under lokr anyway.
+      // dora/hira/loha/pissa/hra (2026-09-05) use the SAME exclusion guards as
+      // handleStartDit below — TrainLmForm's pickMethod already makes the
+      // illegal combination unrepresentable, these are the payload-level
+      // safety net, textually identical so the two trainers never disagree
+      // about which flag a given boolean set resolves to.
+      ...(form.adapterType === 'lora' && form.dora ? { dora: true } : {}),
+      ...(form.adapterType === 'lora' && form.hira ? { hira: true } : {}),
+      ...(form.adapterType === 'lora' && form.loha ? { loha: true } : {}),
       ...(form.adapterType === 'lora' && form.rslora ? { rslora: true } : {}),
+      ...(form.adapterType === 'lora' && form.pissa && !form.dora && !form.hira && !form.loha ? { pissa: true } : {}),
+      ...(form.adapterType === 'lora' && form.hra && !form.dora && !form.hira && !form.loha && !form.pissa ? { hra: true } : {}),
       ...(form.adapterType === 'lora' && form.loraPlusRatio !== 1 ? { loraPlusRatio: form.loraPlusRatio } : {}),
       // The token is on by default server-side too; an explicit '' is the off switch.
       ...(form.adapterType === 'lora' && form.artistTokenOn

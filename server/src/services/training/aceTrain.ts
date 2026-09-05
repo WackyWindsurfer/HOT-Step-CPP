@@ -358,6 +358,16 @@ export interface ResolvedTrainLmOptions {
   captionDropout: number;
   rslora: boolean;
   loraPlusRatio: number;
+  /** LoRA-family parameterizations (2026-09-05), mirroring TrainDitOptions'
+   *  dora/hira/loha/pissa/hra exactly — same exclusivity, same precedence
+   *  order in buildTrainLmArgs. All are LoRA-type only (adapterType==='lora');
+   *  a request with adapterType 'lokr' and any of these set is the caller's
+   *  mistake, same as it is for train-dit. */
+  dora?: boolean;
+  hira?: boolean;
+  loha?: boolean;
+  pissa?: boolean;
+  hra?: boolean;
   /** Soft prompt: '' = no token. Emitted on every leg; the engine adopts the
    *  trained token/prefix from --init-adapter on a resume. */
   artistToken: string;
@@ -423,6 +433,19 @@ export function buildTrainLmArgs(input: {
     // --adapter-type rejects it loudly rather than silently training a LoRA
     // when a LoKr was asked for.
     ...(o.initAdapter ? [] : ['--adapter-type', o.adapterType]),
+    // LoRA-family parameterizations (2026-09-05). Precedence order is
+    // textually identical to buildTrainDitArgs's chain: dora, then rslora
+    // (independent — a rank-scaling modifier, not a competing method), then
+    // hira (excludes dora), loha (excludes dora/hira), pissa (excludes
+    // dora/hira/loha, and not resumable), hra (excludes dora/hira/loha/
+    // pissa/rslora). All five are LoRA-only, same as DiT's.
+    ...(o.dora && o.adapterType === 'lora' ? ['--dora'] : []),
+    ...(o.rslora && o.adapterType === 'lora' ? ['--rslora'] : []),
+    ...(o.hira && o.adapterType === 'lora' && !o.dora ? ['--hira'] : []),
+    ...(o.loha && o.adapterType === 'lora' && !o.dora && !o.hira ? ['--loha'] : []),
+    ...(o.pissa && o.adapterType === 'lora' && !o.dora && !o.hira && !o.loha && !o.initAdapter ? ['--pissa'] : []),
+    ...(o.hra && o.adapterType === 'lora' && !o.dora && !o.hira && !o.loha && !o.pissa && !o.rslora ? ['--hra'] : []),
+    ...(o.loraPlusRatio && o.loraPlusRatio !== 1 ? ['--lora-plus-ratio', String(o.loraPlusRatio)] : []),
     // Always emitted so an ace-train that predates --optimizer rejects it loudly
     // rather than silently training on AdamW when Muon was asked for.
     '--optimizer', o.optimizer,
@@ -474,8 +497,8 @@ export function buildTrainLmArgs(input: {
   // just the first one. Only-non-default emission (same rule as --weights)
   // keeps an older ace-train.exe that predates these flags working.
   if (o.captionDropout > 0) args.push('--caption-dropout', String(o.captionDropout));
-  if (o.rslora && o.adapterType === 'lora') args.push('--rslora');
-  if (o.loraPlusRatio && o.loraPlusRatio !== 1) args.push('--lora-plus-ratio', String(o.loraPlusRatio));
+  // rslora / loraPlusRatio (and dora/hira/loha/pissa/hra) are emitted earlier,
+  // in the LoRA-family precedence chain right after --adapter-type.
   // Soft prompt (token + prefix). These ARE adapter-identity flags, but they
   // are emitted on every leg on purpose: the engine reads the trained vectors
   // out of --init-adapter and only uses these to know the token is wanted.

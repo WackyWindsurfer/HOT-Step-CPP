@@ -70,8 +70,21 @@ export interface TrainLmFormState {
    *  trainer). 0 = off. */
   captionDropout: number;
   /** Parameterization + soft prompt (2026-09-04). LoRA type only. The artist
-   *  token and prefix train WITH the LoRA and ship in the same file. */
+   *  token and prefix train WITH the LoRA and ship in the same file.
+   *
+   *  dora/hira/loha/pissa/hra (2026-09-05) port train-dit's method row onto
+   *  the LM trainer — same DitMethod shape (see TrainDitForm.tsx), same
+   *  mutual exclusivity, same LoRA-only restriction. ace-train's train-lm
+   *  parser does not accept the five underlying flags yet (the DiT trainer
+   *  does); a run that sets one is refused with exit 2 on an engine build
+   *  that predates the port, same "loud refusal beats a silent no-op" choice
+   *  every other new-flag rollout in this codebase makes. */
   rslora: boolean;
+  dora: boolean;
+  hira: boolean;
+  loha: boolean;
+  pissa: boolean;
+  hra: boolean;
   loraPlusRatio: number;
   artistTokenOn: boolean;    // default on (Rob, 2026-09-04: arm 05 by ear)
   artistToken: string;       // '' = the adapter's name
@@ -214,6 +227,11 @@ export const TRAIN_LM_DEFAULTS: TrainLmFormState = {
   // a batch-pipeline run (empty option bag) trains the same recipe.
   captionDropout: 0.3,
   rslora: false,
+  dora: false,
+  hira: false,
+  loha: false,
+  pissa: false,
+  hra: false,
   loraPlusRatio: 1,
   // ON by default, named after the adapter. k=32 / lr 5e-3 / prefix 8 is the
   // recipe Rob picked by ear (arm 05, 2026-09-04); k=32 also beat k=8 on every
@@ -250,6 +268,26 @@ const LABEL = 'text-xs font-semibold text-zinc-600 dark:text-zinc-400';
 /** Checkbox-row label text — same size as the row it sits in, not the field
  *  label above a box, so a hoverable checkbox caption doesn't change weight. */
 const CHECK_LABEL = 'text-xs text-zinc-700 dark:text-zinc-300';
+
+/** What the adapter-type row offers (2026-09-05), same shape as train-dit's
+ *  DitMethod (TrainDitForm.tsx): LoKr is its own type; DoRA/HiRA/LoHa/HRA are
+ *  the LoRA type with one parameterization flag set, so PiSSA/rsLoRA/LoRA+
+ *  sit underneath as checkboxes rather than as buttons of their own. */
+export type LmMethod = 'lokr' | 'lora' | 'dora' | 'hira' | 'loha' | 'hra';
+const methodOf = (s: TrainLmFormState): LmMethod =>
+  s.adapterType === 'lokr' ? 'lokr' : s.dora ? 'dora' : s.hira ? 'hira' : s.loha ? 'loha' : s.hra ? 'hra' : 'lora';
+/** i18n suffixes under trainingStudio.train.lm.* for each method's button
+ *  label and hover text. dora/hira/loha/hra get their OWN Info keys — not the
+ *  DiT's — because the DiT hover text carries DiT-specific measured facts
+ *  (crop/depth findings) that say nothing about the LM. */
+const METHOD_KEYS: Record<LmMethod, { label: string; info: string }> = {
+  lokr: { label: 'adapterLokr', info: 'adapterTypeHint' },
+  lora: { label: 'adapterLora', info: 'adapterTypeHint' },
+  dora: { label: 'dora', info: 'doraInfo' },
+  hira: { label: 'hira', info: 'hiraInfo' },
+  loha: { label: 'loha', info: 'lohaInfo' },
+  hra:  { label: 'hra',  info: 'hraInfo' },
+};
 
 interface Props {
   capabilities: TrainingCapabilities | null;
@@ -312,6 +350,23 @@ export const TrainLmForm: React.FC<Props> = ({
   const toggleStage = (stage: TrainLmStage, on: boolean) => {
     const next = ALL_STAGES.filter(s => (s === stage ? on : value.stages.includes(s)));
     onChange({ stages: next });
+  };
+
+  // The LM form has no per-type default BUNDLE the way TrainDitForm's pickType
+  // does (lokrDim/rank/alpha already live side by side in one flat state, only
+  // their visibility changes), so switching method here is just the flag set —
+  // no whole-form reset needed. PiSSA drops when hopping off plain LoRA; rsLoRA
+  // drops for HRA, which has no meaning for reflections.
+  const method = methodOf(value);
+  const pickMethod = (m: LmMethod) => {
+    if (m === method) return;
+    if (m === 'lokr') { onChange({ adapterType: 'lokr' }); return; }
+    onChange({
+      adapterType: 'lora',
+      dora: m === 'dora', hira: m === 'hira', loha: m === 'loha', hra: m === 'hra',
+      pissa: m === 'lora' ? value.pissa : false,
+      rslora: m === 'hra' ? false : value.rslora,
+    });
   };
 
   /** Field label + hover explanation. `key` is the i18n suffix under
@@ -656,28 +711,45 @@ export const TrainLmForm: React.FC<Props> = ({
 
           <div className="flex flex-col gap-1.5">
             {P('lm.adapterType', 'Default LoRA')}
-            <StyledSelect
-              accent="amber"
-              value={value.adapterType}
-              disabled={lock}
-              onChange={(v) => onChange({ adapterType: v })}
-              options={[
-                { value: 'lora' as const, label: t('trainingStudio.train.lm.adapterLora') },
-                { value: 'lokr' as const, label: t('trainingStudio.train.lm.adapterLokr') },
-              ]}
-            />
+            <div className="flex flex-wrap items-center gap-1.5">
+              {(['lokr', 'lora', 'dora', 'hira', 'loha', 'hra'] as LmMethod[]).map(m => {
+                const active = method === m;
+                return (
+                  <button
+                    key={m}
+                    type="button"
+                    disabled={lock}
+                    onClick={() => pickMethod(m)}
+                    title={t(`trainingStudio.train.lm.${METHOD_KEYS[m].info}`)}
+                    className={`px-4 py-1.5 rounded-lg text-xs font-bold border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                      active
+                        ? 'text-amber-500 bg-amber-500/10 border-amber-500/30'
+                        : 'text-zinc-500 border-zinc-300 dark:border-white/10 hover:text-zinc-700 dark:hover:text-zinc-300'
+                    }`}
+                  >
+                    {t(`trainingStudio.train.lm.${METHOD_KEYS[m].label}`)}
+                  </button>
+                );
+              })}
+            </div>
             <span className="text-[11px] text-zinc-500">{t('trainingStudio.train.lm.adapterTypeHint')}</span>
           </div>
 
           {/* LoRA-family options next to the type they modify (moved out of the
-              soft-prompt group, 2026-09-05). The LM trainer has LoRA and LoKr
-              only; DoRA / HiRA / LoHa / HRA / PiSSA exist for the DiT. */}
+              soft-prompt group, 2026-09-05; DoRA/HiRA/LoHa/HRA joined the row
+              above the same day, porting train-dit's method row here — see
+              LmMethod). */}
           {value.adapterType === 'lora' && (
             <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-zinc-200 dark:border-white/5 px-3 py-2">
               <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
-                <input type="checkbox" checked={value.rslora} disabled={lock} className="accent-amber-500"
+                <input type="checkbox" checked={value.pissa} disabled={lock || method !== 'lora'} className="accent-amber-500"
+                  onChange={(e) => onChange({ pissa: e.target.checked })} />
+                {P('lm.pissa', method === 'lora' ? 'Default off' : 'Plain LoRA only', CHECK_LABEL)}
+              </label>
+              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+                <input type="checkbox" checked={value.rslora} disabled={lock || method === 'hra'} className="accent-amber-500"
                   onChange={(e) => onChange({ rslora: e.target.checked })} />
-                {P('rslora', 'Default off', CHECK_LABEL)}
+                {P('rslora', method === 'hra' ? 'Not with HRA' : 'Default off', CHECK_LABEL)}
               </label>
               <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
                 {P('loraPlusRatio', 'Default 1 = off · paper 16 · AdamW/Prodigy only', CHECK_LABEL)}
