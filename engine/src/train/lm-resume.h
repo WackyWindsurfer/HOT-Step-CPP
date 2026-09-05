@@ -58,6 +58,10 @@
 struct LmResumeSource {
     std::string dir;                    // the --init-adapter dir
     std::string adapter_type = "lora";
+    // Post-LoRA parameterization: "lora" | "dora" | "hira" | "loha"
+    // (lm-export.h `param_method`). Identity, not a knob — a DoRA adapter
+    // resumed as a plain LoRA would silently drop its magnitudes.
+    std::string method       = "lora";
     int         rank = 0, alpha = 0;
     int         lokr_dim = 0, lokr_factor = 0;
     float       lokr_alpha = 0.0f;
@@ -77,6 +81,7 @@ struct LmResumeSource {
  *  parser). Explicit-and-different from the source → refuse; omitted → adopt. */
 struct LmResumeExplicit {
     bool rank = false, alpha = false, adapter_type = false;
+    bool method = false;  // --dora / --hira / --loha typed on this run's CLI
     bool lokr_dim = false, lokr_alpha = false, lokr_factor = false;
     bool weights = false;
     bool prodigy_d0 = false;   // not identity: only decides whether the source's d is adopted
@@ -106,6 +111,7 @@ static bool lm_resume_read_log(const std::string & dir, LmResumeSource * src, st
     };
     src->dir              = dir;
     src->adapter_type     = s("adapter_type").empty() ? "lora" : s("adapter_type");
+    src->method           = s("param_method").empty() ? "lora" : s("param_method");
     src->rank             = i("rank", 0);
     src->alpha            = i("alpha", 0);
     src->lokr_dim         = i("lokr_dim", 0);
@@ -239,6 +245,16 @@ static bool lm_resume_load(LmLora * L, const std::string & dir, int * n_loaded, 
                          lm_resume_fill(st, (std::string(stem) + ".lokr_w2_b").c_str(), pr.w2_b, err);
                     count += 2;
                 }
+            } else if (pr.has_loha()) {
+                // LyCORIS layout, the inverse of lm_export_peft's LoHa branch:
+                // hada_w1_a = B, hada_w1_b = A, hada_w2_a = B2, hada_w2_b = A2.
+                const std::string stem      = lm_lycoris_key_stem(l, s);
+                ggml_tensor *     four[4]   = { pr.B, pr.A, pr.B2, pr.A2 };
+                const char *      sfx[4]    = { "hada_w1_a", "hada_w1_b", "hada_w2_a", "hada_w2_b" };
+                for (int k = 0; k < 4 && ok; k++) {
+                    ok = lm_resume_fill(st, (stem + "." + sfx[k]).c_str(), four[k], err);
+                    count++;
+                }
             } else {
                 if (!pr.A || !pr.B) {
                     continue;
@@ -253,6 +269,18 @@ static bool lm_resume_load(LmLora * L, const std::string & dir, int * n_loaded, 
                     ok = lm_resume_fill(st, nm, pr.B, err);
                 }
                 count += 2;
+                // DoRA magnitudes. Every expected tensor must be present — a
+                // resumed DoRA that quietly fell back to ||W||_col would be a
+                // different adapter than the one that was saved. `nrm` is NOT
+                // read: it is re-derived from the resumed A/B at the first
+                // optimizer window (lm_lora_dora_refresh).
+                if (ok && pr.m) {
+                    snprintf(nm, sizeof(nm),
+                             "base_model.model.model.layers.%d.%s.lora_magnitude_vector.weight", l,
+                             lm_slot_peft_name(s));
+                    ok = lm_resume_fill(st, nm, pr.m, err);
+                    count++;
+                }
             }
         }
     }
@@ -290,6 +318,13 @@ static bool lm_resume_prepare(ArgsT * a, const LmResumeExplicit & saw, LmResumeS
     if (saw.weights && a->weights != src->weights) {
         bad.push_back({ "--weights", a->weights, src->weights });
     }
+    // Parameterization identity. Typed-and-different is a refusal; omitted is
+    // adopted below, so `--init-adapter <a DoRA run>` continues as DoRA without
+    // the user having to remember to re-type --dora.
+    const std::string cli_method = a->hira ? "hira" : a->loha ? "loha" : a->dora ? "dora" : "lora";
+    if (saw.method && cli_method != src->method) {
+        bad.push_back({ "--dora/--hira/--loha", cli_method, src->method });
+    }
     check_i(saw.rank, "--rank", a->rank, src->rank);
     check_i(saw.alpha, "--alpha", a->alpha, src->alpha);
     check_i(saw.lokr_dim, "--lokr-dim", a->lokr_dim, src->lokr_dim);
@@ -312,6 +347,9 @@ static bool lm_resume_prepare(ArgsT * a, const LmResumeExplicit & saw, LmResumeS
     // Adopt. Shape identity always comes from the source; sampling knobs
     // (lr, epochs, target, schedule) stay whatever this run asked for.
     a->adapter_type = src->adapter_type;
+    a->dora = (src->method == "dora");
+    a->hira = (src->method == "hira");
+    a->loha = (src->method == "loha");
     if (src->rank > 0) {
         a->rank = src->rank;
     }

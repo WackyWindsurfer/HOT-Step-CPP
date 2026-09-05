@@ -34,6 +34,7 @@
 
 #include "backend.h"
 #include "safetensors.h"
+#include "yyjson.h"
 
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
@@ -94,6 +95,14 @@ enum MM3LmAdapterComp {
     MM3_LM_COMP_W2A,
     MM3_LM_COMP_W2B,
     MM3_LM_COMP_ALPHA,
+    // PEFT DoRA's lora_magnitude_vector, [out].
+    MM3_LM_COMP_MAG,
+    // LyCORIS LoHa. hada_w1_a is our B, hada_w1_b our A, hada_w2_a our B2 and
+    // hada_w2_b our A2 (train/lm-export.h's LoHa branch, inverted).
+    MM3_LM_COMP_HADA_W1A,
+    MM3_LM_COMP_HADA_W1B,
+    MM3_LM_COMP_HADA_W2A,
+    MM3_LM_COMP_HADA_W2B,
 };
 
 struct MM3LmAdapterPair {
@@ -114,8 +123,25 @@ struct MM3LmAdapterPair {
     float         alpha_raw  = 0.0f;     // the file's alpha scalar, pre-division
     bool          has_alpha  = false;
 
+    // ── DoRA (2026-09-05) ──────────────────────────────────────────────────
+    // m   = PEFT's lora_magnitude_vector, straight off disk, [out] f32.
+    // nrm = ||W + base_scale*BA||_col, which needs the BASE weights this loader
+    //       never sees — mm3_lm_dora_prepare() fills it once the LM is resident.
+    // Both present => mm3_lm_mm rescales by m/nrm. m without nrm is refused
+    // before any graph is built (see MM3LmAdapter::dora_pending).
+    ggml_tensor * m          = nullptr;
+    ggml_tensor * nrm        = nullptr;
+
+    // ── LoHa: delta = (A1 B1) (.) (A2 B2) ──────────────────────────────────
+    // The second pair shares a/b's shapes. MERGE MODE ONLY — the delta is a
+    // full [in, out] tensor, so a per-token runtime apply is not on.
+    ggml_tensor * a2         = nullptr;  // [in, r]
+    ggml_tensor * b2         = nullptr;  // [r, out]
+
     bool has_lora() const { return a && b; }
     bool has_lokr() const { return w1 && (w2 || (w2_a && w2_b)); }
+    bool has_dora() const { return m && nrm; }
+    bool has_loha() const { return a && b && a2 && b2; }
 };
 
 struct MM3LmAdapter {
@@ -125,6 +151,35 @@ struct MM3LmAdapter {
     bool             is_lokr = false;
     MM3LmAdapterPair mods[MM3_LM_ADAPTER_LAYERS][MM3_LM_ADAPTER_MODULES];
     int              n_loaded = 0;
+
+    // ── adapter_config.json (2026-09-05) ───────────────────────────────────
+    //
+    // This loader used to read NOTHING but the tensors, taking base_scale from
+    // an optional per-module `.alpha` scalar and defaulting to 1.0. That was
+    // right for SimpleTuner checkpoints (no alpha tensors, alpha == rank) and
+    // WRONG the moment a trainer wrote use_rslora: alpha/sqrt(r) is 16x
+    // alpha/r at r256, and nothing in the file would have said so.
+    //
+    // COMPATIBILITY RULE, load-bearing: when adapter_config.json is absent, or
+    // when it says alpha == r with use_rslora false, the computed base_scale is
+    // exactly 1.0 — byte-identical to what every already-shipped adapter in
+    // M:\HOT-Step-CPP\Adapters\mm3-lm-adapters got before this existed.
+    bool             cfg_rslora = false;
+    bool             cfg_dora   = false;
+    std::string      cfg_peft   = "LORA";
+    float            cfg_ratio  = -1.0f;  // alpha/r (or alpha/sqrt(r)); -1 = no config
+
+    // Merge-only parameterizations. Both are LOADED here — merge mode needs the
+    // tensors — and refused at the point of use by the runtime graph, which is
+    // where the low-rank assumption actually lives.
+    bool             is_loha      = false;
+    bool             is_hira      = false;
+
+    int              dora_n       = 0;
+    bool             dora_pending = false;  // nrm not filled yet — do NOT build a graph
+    // Which resident LM the norms were computed against, so a pristine reload
+    // or a model swap re-runs the pass instead of reusing stale norms.
+    const void *     dora_base    = nullptr;
 
     ggml_context *        ctx         = nullptr;
     ggml_backend_buffer_t buf         = nullptr;
@@ -159,7 +214,8 @@ static void mm3_lm_adapter_free(MM3LmAdapter * ad) {
 
 // Accept keys with or without the `language_model.` prefix, and PEFT's
 // `.default.` infix (present after PeftModel round-trips).
-static bool mm3_lm_adapter_parse_key(const std::string & key, int * layer, int * module, bool * is_a) {
+static bool mm3_lm_adapter_parse_key(const std::string & key, int * layer, int * module,
+                                     MM3LmAdapterComp * comp) {
     const char * s = key.c_str();
     if (strncmp(s, "language_model.", 15) == 0) {
         s += 15;
@@ -191,9 +247,11 @@ static bool mm3_lm_adapter_parse_key(const std::string & key, int * layer, int *
     }
     // remainder: lora_A.weight / lora_B.weight, optionally lora_A.default.weight
     if (strncmp(s, "lora_A.", 7) == 0) {
-        *is_a = true;
+        *comp = MM3_LM_COMP_A;
     } else if (strncmp(s, "lora_B.", 7) == 0) {
-        *is_a = false;
+        *comp = MM3_LM_COMP_B;
+    } else if (strncmp(s, "lora_magnitude_vector.", 22) == 0) {
+        *comp = MM3_LM_COMP_MAG;
     } else {
         return false;
     }
@@ -249,6 +307,14 @@ static MM3LmAdapterComp mm3_lm_adapter_parse_lokr(const std::string & key, int *
         c = MM3_LM_COMP_W2;
     } else if (strcmp(s, "alpha") == 0) {
         c = MM3_LM_COMP_ALPHA;
+    } else if (strcmp(s, "hada_w1_a") == 0) {
+        c = MM3_LM_COMP_HADA_W1A;
+    } else if (strcmp(s, "hada_w1_b") == 0) {
+        c = MM3_LM_COMP_HADA_W1B;
+    } else if (strcmp(s, "hada_w2_a") == 0) {
+        c = MM3_LM_COMP_HADA_W2A;
+    } else if (strcmp(s, "hada_w2_b") == 0) {
+        c = MM3_LM_COMP_HADA_W2B;
     } else {
         return MM3_LM_COMP_NONE;
     }
@@ -259,9 +325,9 @@ static MM3LmAdapterComp mm3_lm_adapter_parse_lokr(const std::string & key, int *
 
 // One parse for both layouts. MM3_LM_COMP_NONE means "not an LM adapter key".
 static MM3LmAdapterComp mm3_lm_adapter_parse_any(const std::string & key, int * layer, int * module) {
-    bool is_a = false;
-    if (mm3_lm_adapter_parse_key(key, layer, module, &is_a)) {
-        return is_a ? MM3_LM_COMP_A : MM3_LM_COMP_B;
+    MM3LmAdapterComp c = MM3_LM_COMP_NONE;
+    if (mm3_lm_adapter_parse_key(key, layer, module, &c)) {
+        return c;
     }
     return mm3_lm_adapter_parse_lokr(key, layer, module);
 }
@@ -276,8 +342,55 @@ static ggml_tensor ** mm3_lm_pair_slot(MM3LmAdapterPair & p, MM3LmAdapterComp c)
         case MM3_LM_COMP_W2:  return &p.w2;
         case MM3_LM_COMP_W2A: return &p.w2_a;
         case MM3_LM_COMP_W2B: return &p.w2_b;
+        case MM3_LM_COMP_MAG: return &p.m;
+        // LoHa, mapped back onto our own naming: w?_a is a B, w?_b is an A.
+        case MM3_LM_COMP_HADA_W1A: return &p.b;
+        case MM3_LM_COMP_HADA_W1B: return &p.a;
+        case MM3_LM_COMP_HADA_W2A: return &p.b2;
+        case MM3_LM_COMP_HADA_W2B: return &p.a2;
         default:              return nullptr;
     }
+}
+
+// ─── adapter_config.json (2026-09-05) ───────────────────────────────────────
+//
+// `path` is the safetensors FILE; the config sits beside it. Everything here is
+// optional and every field has a value that reproduces the pre-2026-09-05
+// behaviour exactly, so an adapter written before this existed loads unchanged.
+struct MM3LmAdapterCfg {
+    float       ratio     = -1.0f;   // alpha/r, or alpha/sqrt(r) under rsLoRA
+    bool        rslora    = false;
+    bool        dora      = false;
+    std::string peft_type = "LORA";
+};
+
+static MM3LmAdapterCfg mm3_lm_adapter_read_cfg(const std::string & sf_path) {
+    MM3LmAdapterCfg out;
+    const size_t    slash = sf_path.find_last_of("/\\");
+    const std::string dir = (slash == std::string::npos) ? std::string(".") : sf_path.substr(0, slash);
+    yyjson_doc *    doc   = yyjson_read_file((dir + "/adapter_config.json").c_str(), 0, NULL, NULL);
+    if (!doc) {
+        return out;
+    }
+    yyjson_val * root  = yyjson_doc_get_root(doc);
+    double       alpha = 0.0, r = 0.0;
+    if (root && yyjson_is_obj(root)) {
+        yyjson_val * a  = yyjson_obj_get(root, "lora_alpha");
+        yyjson_val * rv = yyjson_obj_get(root, "r");
+        yyjson_val * rs = yyjson_obj_get(root, "use_rslora");
+        yyjson_val * dv = yyjson_obj_get(root, "use_dora");
+        yyjson_val * pt = yyjson_obj_get(root, "peft_type");
+        if (a && yyjson_is_num(a)) alpha = yyjson_get_num(a);
+        if (rv && yyjson_is_num(rv)) r = yyjson_get_num(rv);
+        if (rs && yyjson_is_true(rs)) out.rslora = true;
+        if (dv && yyjson_is_true(dv)) out.dora = true;
+        if (pt && yyjson_is_str(pt)) out.peft_type = yyjson_get_str(pt);
+    }
+    yyjson_doc_free(doc);
+    if (alpha > 0.0 && r > 0.0) {
+        out.ratio = (float) (out.rslora ? alpha / sqrt(r) : alpha / r);
+    }
+    return out;
 }
 
 // Load a PEFT LM LoRA. Acquires its own backend reference (same shared pool
@@ -300,6 +413,14 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
     MM3LmAdapter * ad = new MM3LmAdapter();
     ad->path          = path;
     ad->mtime         = (int64_t) sb.st_mtime;
+    {
+        const MM3LmAdapterCfg cfg = mm3_lm_adapter_read_cfg(path);
+        ad->cfg_ratio  = cfg.ratio;
+        ad->cfg_rslora = cfg.rslora;
+        ad->cfg_dora   = cfg.dora;
+        ad->cfg_peft   = cfg.peft_type;
+        ad->is_hira    = cfg.peft_type == "HIRA";
+    }
     ad->bp            = backend_init("MM3-LM-Adapter");
     ad->backend_ref   = true;
     ggml_backend_t backend = ad->bp.backend ? ad->bp.backend : ad->bp.cpu_backend;
@@ -307,11 +428,15 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
     // Pass 1: count matched pairs so the ggml context can be sized exactly.
     int matched = 0;   // tensor-backed components only (alpha is a scalar)
     int n_alpha = 0;
+    int n_mag   = 0;   // each magnitude also needs a same-shaped nrm tensor
     for (const STEntry & e : st.entries) {
         int                    layer, module;
         const MM3LmAdapterComp c = mm3_lm_adapter_parse_any(e.name, &layer, &module);
         if (c == MM3_LM_COMP_ALPHA) {
             n_alpha++;
+        } else if (c == MM3_LM_COMP_MAG) {
+            matched++;
+            n_mag++;
         } else if (c != MM3_LM_COMP_NONE) {
             matched++;
         }
@@ -327,7 +452,7 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
     (void) n_alpha;
 
     ggml_init_params ip = {
-        /*mem_size   =*/(size_t) (matched + 2) * ggml_tensor_overhead(),
+        /*mem_size   =*/(size_t) (matched + n_mag + 4) * ggml_tensor_overhead(),
         /*mem_buffer =*/nullptr,
         /*no_alloc   =*/true,
     };
@@ -340,6 +465,21 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
         const MM3LmAdapterComp c = mm3_lm_adapter_parse_any(e.name, &layer, &module);
         if (c == MM3_LM_COMP_NONE || c == MM3_LM_COMP_ALPHA) {
             continue;   // alpha is read during upload; it gets no tensor
+        }
+        if (c == MM3_LM_COMP_MAG) {
+            // F32, not F16 like everything else here: nrm is computed in F32
+            // and the two are divided elementwise in-graph, and a magnitude is
+            // a per-output NORM whose values can sit well above the f16 range.
+            int64_t n = 1;
+            for (int d = 0; d < e.n_dims; d++) {
+                n *= e.shape[d];
+            }
+            MM3LmAdapterPair & pm = ad->mods[layer][module];
+            pm.m                  = ggml_new_tensor_1d(ad->ctx, GGML_TYPE_F32, n);
+            pm.nrm                = ggml_new_tensor_1d(ad->ctx, GGML_TYPE_F32, n);
+            ggml_set_name(pm.m, e.name.c_str());
+            ad->dora_n++;
+            continue;
         }
         if (e.n_dims != 2) {
             if (err) {
@@ -387,6 +527,20 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
             continue;
         }
         MM3LmAdapterPair & p = ad->mods[layer][module];
+        if (c == MM3_LM_COMP_MAG) {
+            const int64_t n = ggml_nelements(p.m);
+            f32.resize((size_t) n);
+            if (!adapter_to_f32(st_data(st, e), f32.data(), n, e.dtype)) {
+                st_close(&st);
+                if (err) {
+                    *err = "unsupported dtype " + e.dtype + " on " + e.name;
+                }
+                mm3_lm_adapter_free(ad);
+                return nullptr;
+            }
+            ggml_backend_tensor_set(p.m, f32.data(), 0, (size_t) n * sizeof(float));
+            continue;
+        }
         if (c == MM3_LM_COMP_ALPHA) {
             // A scalar (or 1-element tensor). Stored, not uploaded.
             float av = 0.0f;
@@ -507,11 +661,60 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
                 p.out_k = p.w2 ? p.w2->ne[1] : p.w2_a->ne[1];
                 n_lokr++;
             }
+            if (p.m && !p.a) {
+                if (err) {
+                    *err = "DoRA magnitude without a lora_A/lora_B pair at layer " + std::to_string(l);
+                }
+                mm3_lm_adapter_free(ad);
+                return nullptr;
+            }
+            if (p.m && p.m->ne[0] != p.b->ne[1]) {
+                if (err) {
+                    *err = "DoRA magnitude length does not match lora_B's output width at layer " +
+                           std::to_string(l);
+                }
+                mm3_lm_adapter_free(ad);
+                return nullptr;
+            }
+            // Half a LoHa is worse than none: it would apply a plain LoRA
+            // delta where a Hadamard was trained, silently.
+            if ((p.a2 != nullptr) != (p.b2 != nullptr)) {
+                if (err) {
+                    *err = "unpaired LoHa hada_w2_a/hada_w2_b at layer " + std::to_string(l);
+                }
+                mm3_lm_adapter_free(ad);
+                return nullptr;
+            }
+            if (p.a2 && !p.a) {
+                if (err) {
+                    *err = "LoHa second pair without a first pair at layer " + std::to_string(l);
+                }
+                mm3_lm_adapter_free(ad);
+                return nullptr;
+            }
+            if (p.has_loha()) {
+                ad->is_loha = true;
+            }
             if (p.a || p.has_lokr()) {
                 ad->n_loaded++;
             }
         }
     }
+    // use_dora and the tensors on disk must agree. Either alone means the file
+    // was written by something that half-understood DoRA, and guessing which
+    // half is right is how an adapter silently renders at the wrong strength.
+    if (ad->cfg_dora != (ad->dora_n > 0)) {
+        if (err) {
+            *err = "adapter_config.json says use_dora=" + std::string(ad->cfg_dora ? "true" : "false") +
+                   " but the file carries " + std::to_string(ad->dora_n) + " lora_magnitude_vector tensor(s)";
+        }
+        mm3_lm_adapter_free(ad);
+        return nullptr;
+    }
+    // The norms need the resident base weights, which this loader does not
+    // have. Until mm3_lm_dora_prepare() runs, nrm is UNINITIALISED and no graph
+    // may read it.
+    ad->dora_pending = ad->dora_n > 0;
     ad->is_lokr = n_lokr > 0;
     if (ad->is_lokr && ad->rank != 0) {
         if (err) {
@@ -520,7 +723,40 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
         mm3_lm_adapter_free(ad);
         return nullptr;
     }
-    fprintf(stderr, "[MM3] LM adapter loaded: %s (%d modules, %s, %.1f MB)\n", path, ad->n_loaded,
-            ad->is_lokr ? "LoKr" : "LoRA", (double) ggml_backend_buffer_get_size(ad->buf) / 1e6);
+    // Per-module base_scale. Precedence, and the compatibility rule that keeps
+    // every already-shipped adapter byte-identical:
+    //   1. a per-module `.alpha` scalar (comfy-style exports) -> alpha/rank;
+    //   2. else adapter_config.json's alpha/r, or alpha/sqrt(r) under rsLoRA;
+    //   3. else 1.0 — which is also what (2) computes for alpha == r without
+    //      rsLoRA, so every SimpleTuner and every pre-2026-09-05 HOT-Step
+    //      checkpoint lands on exactly 1.0, as it did before this read the file.
+    float scale_shown = 1.0f;
+    if (!ad->is_lokr) {
+        for (int l = 0; l < MM3_LM_ADAPTER_LAYERS; l++) {
+            for (int mo = 0; mo < MM3_LM_ADAPTER_MODULES; mo++) {
+                MM3LmAdapterPair & p = ad->mods[l][mo];
+                if (!p.has_lora()) {
+                    continue;
+                }
+                const float rank_f = (float) p.a->ne[1];
+                if (ad->cfg_rslora && ad->cfg_ratio > 0.0f) {
+                    // rsLoRA cannot be recovered from a per-module alpha scalar
+                    // (it is alpha/sqrt(r), and the scalar is just alpha), so
+                    // the config wins whenever it says use_rslora.
+                    p.base_scale = ad->cfg_ratio;
+                } else if (p.has_alpha && rank_f > 0.0f) {
+                    p.base_scale = p.alpha_raw / rank_f;
+                } else if (ad->cfg_ratio > 0.0f) {
+                    p.base_scale = ad->cfg_ratio;
+                }
+                scale_shown = p.base_scale;
+            }
+        }
+    }
+    fprintf(stderr, "[MM3] LM adapter loaded: %s (%d modules, %s%s%s%s%s, base scale %.4f, %.1f MB)\n", path, ad->n_loaded,
+            ad->is_lokr ? "LoKr" : ad->is_loha ? "LoHa" : "LoRA", ad->is_hira ? " HiRA" : "",
+            ad->cfg_rslora ? " +rsLoRA" : "", ad->dora_n ? " +DoRA" : "",
+            (ad->is_loha || ad->is_hira) ? " (merge mode only)" : "",
+            (double) scale_shown, (double) ggml_backend_buffer_get_size(ad->buf) / 1e6);
     return ad;
 }

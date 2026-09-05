@@ -51,7 +51,42 @@ struct QwLoraPair {
     int64_t              in_m = 0, in_n = 0, out_l = 0, out_k = 0;
     float                lokr_scale = 1.0f;  // alpha / dim
 
+    // ─── DoRA (Liu et al. 2024), 2026-09-05 ─────────────────────────────────
+    //
+    // W' = m * (W + s*BA) / ||W + s*BA||_col. `m` is the learned per-output
+    // magnitude (a PARAM in the trainer, PEFT's lora_magnitude_vector on disk);
+    // `nrm` holds the column norm of the CURRENT W + s*BA.
+    //
+    // The two runtimes differ in WHEN nrm is filled, not in what it means:
+    //   * trainer   — refreshed once per optimizer window (lm_lora_dora_refresh),
+    //                 because A/B move at every optimizer step;
+    //   * inference — W, A and B are all frozen, so it is computed EXACTLY ONCE
+    //                 at adapter load and reused for every token. That is what
+    //                 makes DoRA correct in the unmerged runtime path here,
+    //                 where the DiT's adapter-runtime.h only warns and defers to
+    //                 merge mode.
+    // Both null = not a DoRA adapter, and the emitted graph is unchanged.
+    struct ggml_tensor * m   = nullptr;  // [out]
+    struct ggml_tensor * nrm = nullptr;  // [out]
+
+    // ─── LoHa (LyCORIS, Hyeon-Woo 2021) ─────────────────────────────────────
+    // delta = (A1 B1) (.) (A2 B2). The second pair shares A/B's shapes. Both
+    // null = not a LoHa. NOT applied by qwen3_linear_lora: the delta is a full
+    // [in, out] tensor per module per forward, which at LM widths is a ~100 MB
+    // transient per adapted projection PER TOKEN. The loaders refuse it in
+    // runtime mode and point at merge mode, exactly as adapter-runtime.h does.
+    struct ggml_tensor * A2 = nullptr;  // [in, r]
+    struct ggml_tensor * B2 = nullptr;  // [r, out]
+
+    // ─── HiRA (Huang et al., ICLR 2025) ─────────────────────────────────────
+    // delta = W (.) (s*BA). Same A/B shapes as a LoRA, but the update is
+    // modulated elementwise by the base, so it is NOT low-rank and has the same
+    // runtime cost story as LoHa above — refused in runtime mode, merged.
+    bool                 hira = false;
+
     bool has_lokr() const { return w1 && (w2 || (w2_a && w2_b)); }
+    bool has_dora() const { return m && nrm; }
+    bool has_loha() const { return A2 && B2; }
 };
 
 // LoKr delta: y += kron(w1, w2) . x, contracted factor-by-factor so the full
@@ -102,6 +137,18 @@ struct QwLoraLayer {
 // addressable (mirrors the DiT runtime-adapter fusion skip, dit.h:420).
 inline bool g_qwen3_load_no_fuse = false;
 
+// DoRA's per-output rescale: y <- y * (m / nrm). m/nrm is [out] and broadcasts
+// over the token axis. Shared by every LoRA apply so the rescale cannot be
+// wired into one path and silently forgotten in another.
+static inline struct ggml_tensor * qwen3_lora_dora(struct ggml_context * ctx,
+                                                   const QwLoraPair *    p,
+                                                   struct ggml_tensor *  y) {
+    if (!p || !p->has_dora()) {
+        return y;
+    }
+    return ggml_mul(ctx, y, ggml_div(ctx, p->m, p->nrm));
+}
+
 // y = W@x (+ LoRA delta when the pair is populated).
 static inline struct ggml_tensor * qwen3_linear_lora(struct ggml_context * ctx,
                                                      struct ggml_tensor *  w,
@@ -112,6 +159,8 @@ static inline struct ggml_tensor * qwen3_linear_lora(struct ggml_context * ctx,
         struct ggml_tensor * t = ggml_mul_mat(ctx, p->A, x);   // [r, S]
         t = ggml_scale(ctx, t, p->scale);                      // cheapest on the rank-r side
         y = ggml_add(ctx, y, ggml_mul_mat(ctx, p->B, t));      // [out, S]
+        // DoRA. A no-op node-for-node when the pair carries no magnitude.
+        y = qwen3_lora_dora(ctx, p, y);
     } else if (p && p->has_lokr()) {
         y = qwen3_lokr_delta(ctx, p, x, y);
     }

@@ -66,6 +66,21 @@ struct Qwen3Layer {
     const QwLoraLayer * lora;  // NULL = no adapter
 };
 
+// The base weight behind a LoRA slot. DoRA needs it (column norms) and HiRA
+// needs it in-graph. Shared by the trainer (train/lm-graph.h) and the runtime
+// adapter loader (lm-adapter.h) so the two cannot map slots differently.
+static struct ggml_tensor * lm_slot_weight(Qwen3Layer * ly, int slot) {
+    switch (slot) {
+        case QW_LORA_Q:    return ly->q_proj;
+        case QW_LORA_K:    return ly->k_proj;
+        case QW_LORA_V:    return ly->v_proj;
+        case QW_LORA_O:    return ly->o_proj;
+        case QW_LORA_GATE: return ly->gate_proj;
+        case QW_LORA_UP:   return ly->up_proj;
+        default:           return ly->down_proj;
+    }
+}
+
 // Standalone model (text encoder)
 struct Qwen3GGML {
     Qwen3Config cfg;

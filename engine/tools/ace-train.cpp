@@ -165,6 +165,21 @@ static void print_usage(void) {
             "                at factor 16: every w2 goes monolithic there and LyCORIS\n"
             "                forces alpha == dim, so lokr_scale is exactly 1.\n"
             "                [--lokr-w1-only] keep w2 monolithic-only (no w2_a/w2_b).\n"
+            "                [--rslora] alpha/sqrt(r) instead of alpha/r, so the update\n"
+            "                does not shrink with rank (16x at r256). Written to\n"
+            "                adapter_config.json as use_rslora and re-derived by BOTH the\n"
+            "                runtime and merge loaders — never one without the other.\n"
+            "                LoRA only.\n"
+            "                [--dora] learn a per-output magnitude on top of the LoRA\n"
+            "                direction; exported as lora_magnitude_vector + use_dora. The\n"
+            "                runtime path computes ||W+sBA||_col ONCE at adapter load\n"
+            "                (W, A and B are all frozen there) and applies it; merge mode\n"
+            "                folds it into the weights. LoRA only.\n"
+            "                [--hira] W (.) (s*BA) and [--loha] (A1B1)(.)(A2B2). Neither\n"
+            "                delta is low-rank, so both are MERGE MODE ONLY — runtime\n"
+            "                mode refuses them by name rather than loading an adapter it\n"
+            "                would then silently ignore. Mutually exclusive with --dora\n"
+            "                and with each other.\n"
             "                [--attn exact|flash|flash-f32] default exact. flash swaps\n"
             "                the manual attention chain for the fused\n"
             "                FLASH_ATTN_TRAIN/_BACK pair, so the [S_kv,S,Nh] softmax is\n"
@@ -491,6 +506,21 @@ static void print_usage(void) {
             "                                            give K exactly zero gradient forever).\n"
             "    --rslora                                alpha/sqrt(r) scaling (see train-dit). Written as\n"
             "                                            use_rslora; lm-adapter.h re-derives it at load.\n"
+            "    --dora                                  learn a per-output-row magnitude on top of the\n"
+            "                                            LoRA direction: y = (m/||W+sBA||)(W+sBA)x. m\n"
+            "                                            starts at ||W||, so step 0 is a no-op. Written\n"
+            "                                            as use_dora + lora_magnitude_vector; the LM\n"
+            "                                            runtime computes the norm ONCE at load (W, A\n"
+            "                                            and B are all frozen there) and applies it.\n"
+            "                                            LoRA only, not with --hira/--loha.\n"
+            "    --hira                                  HiRA: W (.) (s*BA). Same parameter count, high\n"
+            "                                            effective rank. TRAINS AND EXPORTS, but the\n"
+            "                                            AS1.5 planner LM has no merge mode and the\n"
+            "                                            delta is not low-rank, so THIS ENGINE CANNOT\n"
+            "                                            LOAD the result — you get a warning, not a\n"
+            "                                            refusal. Use mm3-lm-train for a usable one.\n"
+            "    --loha                                  LoHa: (A1B1) (.) (A2B2), LyCORIS hada_w* on\n"
+            "                                            disk. Same load caveat as --hira.\n"
             "    --lora-plus-ratio <f>       1           LoRA+: B at f x A's learning rate (paper: ~16).\n"
             "                                            AdamW-rule tensors only, Muon ignores it.\n"
             "\n"
@@ -1819,6 +1849,11 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--artist-token-only")) a.artist_only  = true;
         else if (!strcmp(argv[i], "--artist-token-lr"))   a.artist_lr    = (float) atof(next("--artist-token-lr"));
         else if (!strcmp(argv[i], "--lora-plus-ratio"))   a.lora_plus_ratio = (float) atof(next("--lora-plus-ratio"));
+        else if (!strcmp(argv[i], "--rslora"))            a.rslora       = true;
+        else if (!strcmp(argv[i], "--dora"))              a.dora         = true;
+        else if (!strcmp(argv[i], "--hira"))              a.hira         = true;
+        else if (!strcmp(argv[i], "--loha"))              a.loha         = true;
+        else if (!strcmp(argv[i], "--verify-export"))     a.verify_export = true;
         else if (!strcmp(argv[i], "--attn"))              a.attn         = next("--attn");
         else if (!strcmp(argv[i], "--fd-eps"))        fd_eps         = atof(next("--fd-eps"));
         else if (!strcmp(argv[i], "--fd-frames"))     fd_frames      = atoll(next("--fd-frames"));
@@ -1859,6 +1894,31 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
     // PASS for a formulation the run never used.
     if (a.attn != "exact" && a.attn != "flash" && a.attn != "flash-f32") {
         fprintf(stderr, "ace-train mm3-lm-train: --attn must be exact|flash|flash-f32\n");
+        return 2;
+    }
+    // Parameterization exclusivity, the same block train-dit carries
+    // (dit-train-run.h). Validated BEFORE the --fd-check early return for the
+    // same reason --attn is: the gate builds the same graphs from the same
+    // flags, so a combination that fell through here would be gated in one
+    // shape and trained in another.
+    if (a.loha && (a.adapter_type != "lora" || a.dora || a.hira)) {
+        fprintf(stderr, "ace-train mm3-lm-train: --loha applies to the LoRA parameterization only and cannot "
+                        "combine with --dora or --hira\n");
+        return 2;
+    }
+    if (a.hira && (a.adapter_type != "lora" || a.dora)) {
+        fprintf(stderr, "ace-train mm3-lm-train: --hira applies to the LoRA parameterization only and cannot "
+                        "combine with --dora\n");
+        return 2;
+    }
+    if (a.dora && a.adapter_type != "lora") {
+        fprintf(stderr, "ace-train mm3-lm-train: --dora applies to the LoRA parameterization only "
+                        "(LoKr has no per-row direction to rescale)\n");
+        return 2;
+    }
+    if (a.rslora && a.adapter_type != "lora") {
+        fprintf(stderr, "ace-train mm3-lm-train: --rslora applies to the LoRA parameterization only "
+                        "(LoKr's scale is alpha/dim by LyCORIS rule)\n");
         return 2;
     }
     // COLLISION, refused rather than coerced — the shape train-lm uses for
@@ -3937,6 +3997,9 @@ static int cmd_train_lm(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--prefix-n") && i + 1 < argc) a.prefix_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--prefix-sigma") && i + 1 < argc) a.prefix_sigma = (float) atof(argv[++i]);
         else if (!strcmp(argv[i], "--rslora")) a.rslora = true;
+        else if (!strcmp(argv[i], "--dora")) { a.dora = true; saw.method = true; }
+        else if (!strcmp(argv[i], "--hira")) { a.hira = true; saw.method = true; }
+        else if (!strcmp(argv[i], "--loha")) { a.loha = true; saw.method = true; }
         else if (!strcmp(argv[i], "--lora-plus-ratio") && i + 1 < argc) a.lora_plus_ratio = (float) atof(argv[++i]);
         else if (!strcmp(argv[i], "--no-milestones")) a.milestone_step = 0.0f;
         else if (!strcmp(argv[i], "--overwrite")) a.overwrite = true;
@@ -3989,6 +4052,46 @@ static int cmd_train_lm(int argc, char ** argv) {
                 "[train-lm] resuming %s (%s, saved_loss %.4f @ epoch %d) — identity adopted from its log\n",
                 a.init_adapter.c_str(), resume_src.adapter_type.c_str(), resume_src.saved_loss,
                 resume_src.saved_epoch);
+    }
+
+    // ── parameterization exclusivity (the train-dit block, dit-train-run.h) ─
+    //
+    // AFTER lm_resume_prepare, so a resumed run validates the ADOPTED method
+    // rather than the empty CLI. A refusal names the conflicting pair; nothing
+    // here is coerced.
+    if (a.loha && (a.adapter_type != "lora" || a.dora || a.hira)) {
+        fprintf(stderr, "ace-train train-lm: --loha applies to the LoRA parameterization only and cannot combine "
+                        "with --dora or --hira\n");
+        return 2;
+    }
+    if (a.hira && (a.adapter_type != "lora" || a.dora)) {
+        fprintf(stderr, "ace-train train-lm: --hira applies to the LoRA parameterization only and cannot combine "
+                        "with --dora\n");
+        return 2;
+    }
+    if (a.dora && a.adapter_type != "lora") {
+        fprintf(stderr, "ace-train train-lm: --dora applies to the LoRA parameterization only (LoKr has no "
+                        "per-row direction to rescale)\n");
+        return 2;
+    }
+    if (a.rslora && a.adapter_type != "lora") {
+        fprintf(stderr, "ace-train train-lm: --rslora applies to the LoRA parameterization only (LoKr's scale is "
+                        "alpha/dim by LyCORIS rule)\n");
+        return 2;
+    }
+    // HiRA and LoHa have no unmerged runtime path (the delta is a full [in,out]
+    // tensor per module PER TOKEN) and the AS1.5 planner LM has no merge mode
+    // at all — lm-adapter.h is runtime-only. The training path is real and
+    // FD-gated, and the file is a valid LyCORIS/PEFT artefact, so this is a
+    // WARNING and not a refusal; but the adapter will not load in HOT-Step and
+    // the user has to hear that before the run, not after it.
+    if (a.hira || a.loha) {
+        fprintf(stderr,
+                "ace-train train-lm: WARNING — --%s trains, but the AS1.5 planner LM has no merge path and its\n"
+                "  runtime loader refuses non-low-rank deltas, so THIS ENGINE WILL NOT LOAD the resulting\n"
+                "  adapter. The export is a valid LyCORIS/PEFT file for external tools. For an adapter you can\n"
+                "  render with, use --dora or --rslora here, or mm3-lm-train (which has merge mode).\n",
+                a.hira ? "hira" : "loha");
     }
 
     // ── numeric sanity (the server clamps these too; be defensive) ───────

@@ -840,11 +840,15 @@ export const MM3_LM_DEFAULTS = {
   // started (they existed, they were just never wired past the arg builder);
   // --attn exact|flash|flash-f32 landed on mm3-lm-train mid-session (R3 of the
   // flash-attn roadmap) and is real — see the note on attnBackend below.
-  // --rslora, --dora, --hira, --loha, --pissa[-oversample/-iters], --hra and a
-  // TRAINABLE --prefix-n still do NOT exist in that parser as of this commit —
-  // they are being ported concurrently, to the same names train-dit and
-  // train-lm use. Emitting them here ahead of the engine change is
-  // deliberate: an ace-train that predates a flag exits 2 loudly on the
+  // --rslora, --dora, --hira and --loha LANDED on mm3-lm-train in the same
+  // session and are real: the four are FD-gated on the MM3 trainer, refuse the
+  // same combinations train-dit refuses, and reach the runtime and merge
+  // loaders (rsLoRA as use_rslora, DoRA as lora_magnitude_vector, HiRA/LoHa as
+  // peft_type + merge mode only).
+  // --pissa[-oversample/-iters], --hra and a TRAINABLE --prefix-n still do NOT
+  // exist in that parser — they are being ported separately, to the same names
+  // train-dit and train-lm use. Emitting them here ahead of the engine change
+  // is deliberate: an ace-train that predates a flag exits 2 loudly on the
   // unknown option, which is a far better failure than a UI control that
   // silently does nothing.
   /** 'exact' is the byte-identical graph; 'flash' routes through the fused

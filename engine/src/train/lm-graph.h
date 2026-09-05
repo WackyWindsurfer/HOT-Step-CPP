@@ -28,6 +28,9 @@
 #include "train/lm-common.h"
 #include "train/flash-prec.h"  // dit_flash_probe / dit_flash_prec_label (--attn flash)
 
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -193,6 +196,29 @@ struct LmLora {
     int   lokr_factor    = 0;
     float lokr_alpha     = 0.0f;
     bool  lokr_decompose = true;
+
+    // ─── post-LoRA parameterizations (2026-09-05, ported from dit-adapter.h) ─
+    //
+    // All three sit on the SAME A/B tensors, so the optimizer, the checkpoint
+    // driver, the resume file and the export path see one extra tensor set at
+    // most and nothing structural moves. Mutually exclusive; the CLI refuses
+    // every combination (ace-train.cpp), and lm_lora_init refuses them here too
+    // rather than trusting the caller.
+    bool  dora           = false;  // learned per-output magnitude
+    bool  hira           = false;  // W (.) (s*BA)
+    bool  loha           = false;  // (A1B1) (.) (A2B2)
+    // Qwen3LM the bank is attached to — lm_lora_dora_refresh needs the base
+    // weights to recompute ||W + s*BA||_col. Set by lm_lora_init.
+    Qwen3LM * model      = nullptr;
+    std::vector<uint8_t> dora_arena;
+};
+
+// What lm_lora_init should build on top of the plain A/B pair. Default = the
+// shipped plain LoRA, byte-for-byte: every existing call site passes nothing.
+struct LmLoraOpts {
+    bool dora = false;
+    bool hira = false;
+    bool loha = false;
 };
 
 // rsLoRA: switch a freshly initialised LoRA to alpha/sqrt(r). Every pair
@@ -248,21 +274,92 @@ static const char * lm_slot_peft_name(int slot) {
     }
 }
 
+// LyCORIS key stem, identical in construction to dit_lycoris_key_stem: the
+// naming rule lives in one place per model family and the LoHa exporter, the
+// LoKr exporter and the resume reader all call it.
+static std::string lm_lycoris_key_stem(int l, int slot) {
+    std::string site(lm_slot_peft_name(slot));
+    for (size_t i = 0; i < site.size(); i++) {
+        if (site[i] == '.') {
+            site[i] = '_';
+        }
+    }
+    return "lycoris_layers_" + std::to_string(l) + "_" + site;
+}
+
+// ||W||_col on the HOST, one column norm per output row.
+//
+// F32/BF16/F16 are read directly; anything else goes through the type's own
+// to_float, so a q8_0 base works. That matters: the shipped MM3 LM recipe
+// TRAINS against q8_0 (the f16 base does not leave room for the optimizer), and
+// refusing quantized here — as the DiT's DoRA init does — would have made
+// --dora unreachable on the exact configuration people use. The in-graph
+// refresh (lm_lora_dora_refresh) never had the problem: ggml_cast dequantizes.
+static bool lm_col_norms(ggml_tensor * w, std::vector<float> * out, std::vector<uint8_t> * raw, std::string * err) {
+    const int64_t in = w->ne[0], o_n = w->ne[1];
+    raw->resize(ggml_nbytes(w));
+    ggml_backend_tensor_get(w, raw->data(), 0, raw->size());
+    out->assign((size_t) o_n, 0.0f);
+
+    const bool plain = w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_BF16 || w->type == GGML_TYPE_F16;
+    const ggml_type_traits * tr = plain ? nullptr : ggml_get_type_traits(w->type);
+    if (!plain && (!tr || !tr->to_float)) {
+        *err = std::string("DoRA cannot take a column norm of '") + w->name + "': " + ggml_type_name(w->type) +
+               " has no host dequantizer";
+        return false;
+    }
+    const size_t       row_bytes = plain ? 0 : ggml_row_size(w->type, in);
+    std::vector<float> row;
+    if (!plain) {
+        row.resize((size_t) in);
+    }
+    for (int64_t o = 0; o < o_n; o++) {
+        if (!plain) {
+            tr->to_float(raw->data() + (size_t) o * row_bytes, row.data(), (int64_t) in);
+        }
+        double acc = 0.0;
+        for (int64_t i = 0; i < in; i++) {
+            float v;
+            if (w->type == GGML_TYPE_F32) {
+                v = ((const float *) raw->data())[o * in + i];
+            } else if (w->type == GGML_TYPE_BF16) {
+                const uint32_t bits = (uint32_t) ((const uint16_t *) raw->data())[o * in + i] << 16;
+                memcpy(&v, &bits, 4);
+            } else if (w->type == GGML_TYPE_F16) {
+                v = ggml_fp16_to_fp32(((const ggml_fp16_t *) raw->data())[o * in + i]);
+            } else {
+                v = row[(size_t) i];
+            }
+            acc += (double) v * (double) v;
+        }
+        (*out)[(size_t) o] = (float) sqrt(acc);
+    }
+    return true;
+}
+
 // True PEFT init: A ~ N(0, 1/sqrt(in)), B = 0. b_sigma > 0 breaks that (the
 // self-test needs it: with B == 0, dL/dA is identically zero by construction).
 // The LoRA tensors live in their OWN plain buffer — ggml_opt_step_adamw writes
 // into them, so they must not share the mirror's WEIGHTS-usage buffer.
 static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, int rank, float alpha, uint64_t seed,
-                         float b_sigma, std::string * err) {
+                         float b_sigma, std::string * err, const LmLoraOpts & lo = LmLoraOpts{}) {
     const Qwen3LMConfig & c = lm->cfg;
     L->rank     = rank;
     L->alpha    = alpha;
     L->scale    = alpha / (float) rank;
     L->layer_lo = layer_lo;
     L->layer_hi = layer_hi;
+    L->dora     = lo.dora;
+    L->hira     = lo.hira;
+    L->loha     = lo.loha;
+    L->model    = lm;
+    if ((int) lo.dora + (int) lo.hira + (int) lo.loha > 1) {
+        *err = "DoRA, HiRA and LoHa are mutually exclusive parameterizations";
+        return false;
+    }
 
     const int n_lay = layer_hi - layer_lo;
-    const int n_ten = n_lay * QW_LORA_NSLOTS * 2;
+    const int n_ten = n_lay * QW_LORA_NSLOTS * (2 + (lo.dora ? 2 : 0) + (lo.loha ? 2 : 0));
     ggml_init_params p = { (size_t) (n_ten + 8) * ggml_tensor_overhead(), nullptr, true };
     L->ctx             = ggml_init(p);
     if (!L->ctx) {
@@ -282,6 +379,7 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
             pr.A            = ggml_new_tensor_2d(L->ctx, GGML_TYPE_F32, in_dim, rank);
             pr.B            = ggml_new_tensor_2d(L->ctx, GGML_TYPE_F32, rank, out_dim);
             pr.scale        = L->scale;
+            pr.hira         = lo.hira;
             char nm[96];
             snprintf(nm, sizeof(nm), "L%d.s%d.lora_A", l, s);
             ggml_set_name(pr.A, nm);
@@ -291,6 +389,33 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
             ggml_set_param(pr.B);
             L->params.push_back(pr.A);
             L->params.push_back(pr.B);
+            if (lo.loha) {
+                pr.A2 = ggml_new_tensor_2d(L->ctx, GGML_TYPE_F32, in_dim, rank);
+                pr.B2 = ggml_new_tensor_2d(L->ctx, GGML_TYPE_F32, rank, out_dim);
+                snprintf(nm, sizeof(nm), "L%d.s%d.hada_A2", l, s);
+                ggml_set_name(pr.A2, nm);
+                snprintf(nm, sizeof(nm), "L%d.s%d.hada_B2", l, s);
+                ggml_set_name(pr.B2, nm);
+                ggml_set_param(pr.A2);
+                ggml_set_param(pr.B2);
+                L->params.push_back(pr.A2);
+                L->params.push_back(pr.B2);
+            }
+            if (lo.dora) {
+                // `m` is a PARAM; `nrm` is an INPUT the refresh pass rewrites
+                // once per optimizer window. Only `m` goes on L->params, which
+                // is also what keeps it out of the resume file's optimizer
+                // blocks and off the LoRA+ lr multiplier (A/B only).
+                pr.m   = ggml_new_tensor_1d(L->ctx, GGML_TYPE_F32, out_dim);
+                pr.nrm = ggml_new_tensor_1d(L->ctx, GGML_TYPE_F32, out_dim);
+                snprintf(nm, sizeof(nm), "L%d.s%d.dora_m", l, s);
+                ggml_set_name(pr.m, nm);
+                snprintf(nm, sizeof(nm), "L%d.s%d.dora_nrm", l, s);
+                ggml_set_name(pr.nrm, nm);
+                ggml_set_param(pr.m);
+                ggml_set_input(pr.nrm);
+                L->params.push_back(pr.m);
+            }
         }
     }
 
@@ -316,12 +441,108 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
             ggml_backend_tensor_set(pr.A, a.data(), 0, a.size() * sizeof(float));
             ggml_backend_tensor_set(pr.B, b.data(), 0, b.size() * sizeof(float));
             n_par += a.size() + b.size();
+            if (lo.loha && pr.A2 && pr.B2) {
+                // LyCORIS's own init, mapped (w?_b -> A, w?_a -> B): w1_b ~ N(0,1),
+                // w1_a ~ N(0,0.1), w2_b ~ N(0,1), w2_a = 0. The zero B2 makes the
+                // delta EXACTLY zero at step 0; a NON-zero B1 is what gives B2 a
+                // gradient at all, so pair 1's plain-LoRA fill above is overwritten.
+                lm_rng_fill_normal(&rng, a, 1.0f);
+                lm_rng_fill_normal(&rng, b, 0.1f);
+                ggml_backend_tensor_set(pr.A, a.data(), 0, a.size() * sizeof(float));
+                ggml_backend_tensor_set(pr.B, b.data(), 0, b.size() * sizeof(float));
+                lm_rng_fill_normal(&rng, a, 1.0f);
+                // b_sigma > 0 is the finite-difference rung asking for a non-zero
+                // B2: with B2 == 0 the whole delta is 0 and dL/dA1, dL/dB1 and
+                // dL/dA2 are exactly zero, which FD can only compare against noise.
+                if (b_sigma > 0.0f) {
+                    lm_rng_fill_normal(&rng, b, b_sigma);
+                } else {
+                    std::fill(b.begin(), b.end(), 0.0f);
+                }
+                ggml_backend_tensor_set(pr.A2, a.data(), 0, a.size() * sizeof(float));
+                ggml_backend_tensor_set(pr.B2, b.data(), 0, b.size() * sizeof(float));
+                n_par += a.size() + b.size();
+            }
         }
         lm->layers[l].lora = &L->layers[l];
     }
+    if (lo.dora) {
+        // m = nrm = ||W||_col, so the first forward is EXACTLY the plain LoRA
+        // one (B is zero, the ratio is 1) — the zero-init neutrality the DiT
+        // convention requires of every parameterization.
+        std::vector<uint8_t> raw;
+        std::vector<float>   col;
+        for (int l = layer_lo; l < layer_hi; l++) {
+            for (int s = 0; s < QW_LORA_NSLOTS; s++) {
+                QwLoraPair &  pr = L->layers[l].p[s];
+                ggml_tensor * w  = lm_slot_weight(&lm->layers[l], s);
+                if (!w) {
+                    *err = "DoRA: a trained slot has no base weight (fused projections?)";
+                    return false;
+                }
+                if (!lm_col_norms(w, &col, &raw, err)) {
+                    return false;
+                }
+                ggml_backend_tensor_set(pr.m, col.data(), 0, col.size() * sizeof(float));
+                ggml_backend_tensor_set(pr.nrm, col.data(), 0, col.size() * sizeof(float));
+                n_par += col.size();
+            }
+        }
+    }
     L->n_params = n_par;
-    fprintf(stderr, "[train-lm] LoRA layers %d..%d rank %d alpha %.0f -> %zu trainable params (%.1f MB f32)\n",
-            layer_lo, layer_hi, rank, (double) alpha, n_par, (double) n_par * 4.0 / 1048576.0);
+    fprintf(stderr, "[train-lm] %s layers %d..%d rank %d alpha %.0f -> %zu trainable params (%.1f MB f32)\n",
+            lo.dora ? "DoRA" : lo.hira ? "HiRA" : lo.loha ? "LoHa" : "LoRA", layer_lo, layer_hi, rank,
+            (double) alpha, n_par, (double) n_par * 4.0 / 1048576.0);
+    return true;
+}
+
+// ─── DoRA per-window norm refresh (the LM's DitAdapterLora::preWindow) ──────
+//
+// nrm = ||W + s*BA||_col for every DoRA site. A/B only move at optimizer steps,
+// so one refresh per optimizer window is EXACT for every micro-batch inside it.
+//
+// ONE GRAPH PER LAYER, not one for the whole bank: the scheduler is sized for
+// the training graph, and 36 layers x 7 slots x ~10 nodes would be a second
+// graph class it was never sized against. Per layer it is ~80 nodes.
+static bool lm_lora_dora_refresh(LmLora * L, ggml_backend_sched_t sched, std::string * err) {
+    if (!L->dora || !L->model) {
+        return true;
+    }
+    const size_t n_nodes = (size_t) QW_LORA_NSLOTS * 12 + 64;
+    const size_t need    = ggml_tensor_overhead() * n_nodes + ggml_graph_overhead_custom(n_nodes, false);
+    if (L->dora_arena.size() < need) {
+        L->dora_arena.resize(need);
+    }
+    for (int l = L->layer_lo; l < L->layer_hi; l++) {
+        ggml_init_params ip  = { L->dora_arena.size(), L->dora_arena.data(), true };
+        ggml_context *   ctx = ggml_init(ip);
+        if (!ctx) {
+            *err = "DoRA norm pass: cannot create context";
+            return false;
+        }
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, n_nodes, false);
+        for (int s = 0; s < QW_LORA_NSLOTS; s++) {
+            QwLoraPair &  pr = L->layers[l].p[s];
+            if (!pr.m || !pr.nrm) {
+                continue;
+            }
+            ggml_tensor * w  = lm_slot_weight(&L->model->layers[l], s);
+            ggml_tensor * wf = qwen3_f32(ctx, w);
+            // delta[in, out] = A[in, r] . B[r, out]: mul_mat contracts ne0, so
+            // the left operand is A transposed to [r, in].
+            ggml_tensor * delta = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, pr.A)), pr.B);
+            ggml_tensor * wd    = ggml_add(ctx, wf, ggml_scale(ctx, delta, pr.scale));
+            ggml_tensor * nr    = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, wd)));  // [1, out]
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, nr, ggml_reshape_2d(ctx, pr.nrm, 1, pr.nrm->ne[0])));
+        }
+        ggml_backend_sched_reset(sched);
+        const bool ok = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+        ggml_free(ctx);
+        if (!ok) {
+            *err = "DoRA norm pass: graph compute failed";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -706,13 +927,33 @@ static ggml_tensor * lm_linear(ggml_context * ctx, ggml_tensor * w, const QwLora
     // silently left on in the teacher pass, and the teacher would quietly stop
     // being the base.
     if (!opts.adapter_off) {
-        if (pr && pr->A && pr->B) {
+        if (pr && pr->A && pr->B && pr->has_loha()) {
+            // LoHa: y += (s * (A1B1) (.) (A2B2)) x. Two full [in, out] products
+            // and their Hadamard, all retained for backward — the same cost
+            // class as HiRA plus one more weight-sized tensor. Structure copied
+            // from DitAdapterLora::apply so the two trainers cannot drift.
+            ggml_tensor * d1 = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, pr->A)), pr->B);
+            ggml_tensor * d2 = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, pr->A2)), pr->B2);
+            ggml_tensor * wd = ggml_scale(ctx, ggml_mul(ctx, d1, d2), pr->scale);
+            y                = ggml_add(ctx, y, ggml_mul_mat(ctx, wd, x));
+        } else if (pr && pr->A && pr->B && pr->hira) {
+            // HiRA: y += (W (.) s*BA) x. Both mul_mat srcs need grads (A/B
+            // through delta), which ggml provides via out_prod on src0 — the
+            // same path a plain LoRA's A already uses.
+            ggml_tensor * wf    = qwen3_f32(ctx, w);
+            ggml_tensor * delta = ggml_scale(
+                ctx, ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, pr->A)), pr->B), pr->scale);
+            y = ggml_add(ctx, y, ggml_mul_mat(ctx, ggml_mul(ctx, wf, delta), x));
+        } else if (pr && pr->A && pr->B) {
             ggml_tensor * t = ggml_mul_mat(ctx, pr->A, x);  // [r, S]
             if (opts.rank_mask) {
                 t = ggml_mul(ctx, t, opts.rank_mask);       // [r,1] broadcasts over S
             }
             t               = ggml_scale(ctx, t, pr->scale);
             y               = ggml_add(ctx, y, ggml_mul_mat(ctx, pr->B, t));
+            // DoRA. Emits nothing when the pair carries no magnitude, so a plain
+            // LoRA run's node sequence is unchanged.
+            y               = qwen3_lora_dora(ctx, pr, y);
         } else if (pr && pr->has_lokr()) {
             // Shared with the inference runtime (qwen3-lora.h) on purpose: one kron
             // implementation, so the ne2 lesson cannot be learned twice.

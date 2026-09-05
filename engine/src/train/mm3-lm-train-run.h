@@ -90,6 +90,7 @@
 #include "train/mm3-lm-load.h"
 #include "train/mm3-depth-train.h"
 #include "minimax/mm3-request.h"
+#include "train/mm3-lm-verify-export.h"
 #include "minimax/mm3-tokenizer.h"
 
 #include <algorithm>
@@ -297,6 +298,29 @@ struct MM3LmTrainArgs {
     bool        artist_only  = false;
     float       artist_lr    = 0.0f;  // soft-prompt LR; 0 = same as --lr (P1b)
     float       lora_plus_ratio = 1.0f;  // LoRA+: B at ratio x A's LR (AdamW-rule tensors only)
+
+    // ── Post-LoRA parameterizations (2026-09-05) ───────────────────────────
+    //
+    // Shared with train-lm through lm-graph.h, so this backend only chooses
+    // them. All four are LoRA-type only and mutually exclusive where the DiT
+    // says so; cmd_mm3_lm_train refuses every other combination at exit 2.
+    //
+    //   rslora — alpha/sqrt(r) instead of alpha/r. At r256 that is a 16x
+    //            difference in delta strength, so it MUST also reach the file
+    //            (use_rslora) or the runtime applies a different adapter than
+    //            the one that trained.
+    //   dora   — learned per-output magnitude; runtime and merge both honour it
+    //   hira   — W (.) (s*BA): the delta is not low-rank, so MERGE MODE ONLY
+    //   loha   — (A1B1) (.) (A2B2), LyCORIS hada_w* on disk; merge mode only
+    bool        rslora   = false;
+    bool        dora     = false;
+    bool        hira     = false;
+    bool        loha     = false;
+    /** After each checkpoint export, load it straight back with the RUNTIME
+     *  loader and check that the scale, the tensors and the parameterization
+     *  flags round-trip (train/mm3-lm-verify-export.h). Off by default: it
+     *  costs one adapter reload per checkpoint. On for the gates. */
+    bool        verify_export = false;
     /** Fraction of LoRA rank components zeroed each step (survivors rescaled by
      *  1/(1-p)). 0 = off. bghira runs lora_dropout 0.1.
      *
@@ -1007,11 +1031,19 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         fd_lokr ? lm_lokr_init(&lora, &t.lm, 0, c.n_layers, a.lokr_dim, a.lokr_alpha, a.lokr_factor,
                                a.lokr_decompose_both, (uint64_t) a.seed, &err)
                 : lm_lora_init(&lora, &t.lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed,
-                               /*b_sigma=*/1e-2f, &err);
+                               /*b_sigma=*/1e-2f, &err, LmLoraOpts{ a.dora, a.hira, a.loha });
     if (!fd_init_ok) {
         fprintf(stderr, "[mm3-fd] %s init failed: %s\n", fd_lokr ? "LoKr" : "LoRA", err.c_str());
         mm3_train_lm_free(&t);
         return 1;
+    }
+    // THE GATE MUST TRAIN THE SAME GRAPH THE RUN DOES. rsLoRA changes the
+    // in-graph scale, so a gate that skipped it would validate a different
+    // function than the one the main run builds (the fd-check/main-run
+    // divergence this file's two init sites exist to make possible).
+    if (!fd_lokr && a.rslora) {
+        lm_lora_apply_rslora(&lora);
+        fprintf(stderr, "[mm3-fd] rsLoRA: in-graph scale alpha/sqrt(r) = %.4f\n", (double) lora.scale);
     }
     if (fd_lokr) {
         // The LoKr equivalent of the LoRA path's b_sigma. lm_lokr_init zeroes w2
@@ -1206,18 +1238,30 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
 
     // Probe a spread of layers, both factors and several module slots, so the
     // check also exercises the layer/slot indexing rather than one lucky spot.
-    struct Probe { int layer, slot; bool is_a; };
+    // `extra` selects the parameterization-specific tensors that are NOT the
+    // plain first/second factor. Without it a DoRA run would gate its A and B
+    // and say nothing at all about dL/dm, and a LoHa run would gate pair 1 and
+    // never touch pair 2 — a backward can be wrong in exactly the half the
+    // probes skip, which is the whole reason this gate exists.
+    enum ProbeExtra { PROBE_FACTOR = 0, PROBE_A2, PROBE_B2, PROBE_M };
+    struct Probe { int layer, slot; bool is_a; int extra; };
     // `is_a` means FIRST factor, whichever parameterization is in play:
     //   LoRA -> A / B        LoKr -> w1 / (w2 | w2_a)
     // Without this the probes address q.A and q.B, which are null on a LoKr
     // pair, and grad_vec trips GGML_ASSERT on the param_slot lookup.
-    auto probe_tensor = [&](const QwLoraPair & q, bool first) -> ggml_tensor * {
+    auto probe_tensor = [&](const QwLoraPair & q, bool first, int extra) -> ggml_tensor * {
+        if (extra == PROBE_A2) return q.A2;
+        if (extra == PROBE_B2) return q.B2;
+        if (extra == PROBE_M)  return q.m;
         if (q.has_lokr()) {
             return first ? q.w1 : (q.w2 ? q.w2 : q.w2_a);
         }
         return first ? q.A : q.B;
     };
-    auto probe_suffix = [&](const QwLoraPair & q, bool first) -> const char * {
+    auto probe_suffix = [&](const QwLoraPair & q, bool first, int extra) -> const char * {
+        if (extra == PROBE_A2) return "hada_A2";
+        if (extra == PROBE_B2) return "hada_B2";
+        if (extra == PROBE_M)  return "dora_m";
         if (q.has_lokr()) {
             return first ? "lokr_w1" : (q.w2 ? "lokr_w2" : "lokr_w2_a");
         }
@@ -1228,7 +1272,17 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         const int layers[3] = { 0, c.n_layers / 2, c.n_layers - 1 };
         const int slots[3]  = { QW_LORA_Q, QW_LORA_GATE, QW_LORA_DOWN };
         for (int i = 0; i < n_probe; i++) {
-            probes.push_back(Probe{ layers[i % 3], slots[(i / 3) % 3], (i % 2) == 0 });
+            probes.push_back(Probe{ layers[i % 3], slots[(i / 3) % 3], (i % 2) == 0, PROBE_FACTOR });
+        }
+        // Appended, never substituted: the plain-LoRA probes above still run,
+        // so a DoRA/LoHa gate is strictly a superset of the LoRA one.
+        if (lora.loha) {
+            probes.push_back(Probe{ 0, QW_LORA_Q, true, PROBE_A2 });
+            probes.push_back(Probe{ 1 % std::max(1, c.n_layers), QW_LORA_GATE, true, PROBE_B2 });
+        }
+        if (lora.dora) {
+            probes.push_back(Probe{ 0, QW_LORA_Q, true, PROBE_M });
+            probes.push_back(Probe{ 1 % std::max(1, c.n_layers), QW_LORA_DOWN, true, PROBE_M });
         }
     }
 
@@ -1248,7 +1302,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     std::vector<std::vector<float>> g_naive;
     for (const Probe & pr : probes) {
         const QwLoraPair & q = lora.layers[pr.layer].p[pr.slot];
-        g_naive.push_back(grad_vec(probe_tensor(q, pr.is_a)));
+        g_naive.push_back(grad_vec(probe_tensor(q, pr.is_a, pr.extra)));
     }
 
     // Checkpointed gradients for the same probes.
@@ -1276,7 +1330,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
             if (backward_ckpt()) {
                 for (const Probe & pr : probes) {
                     const QwLoraPair & q = lora.layers[pr.layer].p[pr.slot];
-                    g_ckpt.push_back(grad_vec(probe_tensor(q, pr.is_a)));
+                    g_ckpt.push_back(grad_vec(probe_tensor(q, pr.is_a, pr.extra)));
                 }
             } else {
                 fprintf(stderr, "[mm3-fd] checkpointed backward failed\n");
@@ -1294,7 +1348,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     for (size_t i = 0; i < probes.size(); i++) {
         const Probe &      pr  = probes[i];
         const QwLoraPair & q   = lora.layers[pr.layer].p[pr.slot];
-        ggml_tensor *      par = probe_tensor(q, pr.is_a);
+        ggml_tensor *      par = probe_tensor(q, pr.is_a, pr.extra);
 
         const std::vector<float> & g = g_naive[i];
         double norm2 = 0.0;
@@ -1319,7 +1373,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         const double rel = std::abs(num - gnorm) / std::max(1e-12, gnorm);
         char         nm[64];
         snprintf(nm, sizeof(nm), "L%d.%s.%s", pr.layer, lm_slot_peft_name(pr.slot),
-                 probe_suffix(q, pr.is_a));
+                 probe_suffix(q, pr.is_a, pr.extra));
         fprintf(stderr, "[mm3-fd] %-26s %10zu %13.6e %13.6e %8.3f\n", nm, g.size(), gnorm, num, rel);
         fd_rel.push_back(rel);
         if (!(rel < 0.15)) n_bad++;
@@ -1688,11 +1742,23 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             ? lm_lokr_init(&lora, &t.lm, 0, c.n_layers, a.lokr_dim, a.lokr_alpha, a.lokr_factor,
                            a.lokr_decompose_both, (uint64_t) a.seed, &err)
             : lm_lora_init(&lora, &t.lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed, 0.0f,
-                           &err);
+                           &err, LmLoraOpts{ a.dora, a.hira, a.loha });
     if (!init_ok) {
         fprintf(stderr, "[mm3-lm-train] %s init failed: %s\n", want_lokr ? "LoKr" : "LoRA", err.c_str());
         mm3_train_lm_free(&t);
         return 1;
+    }
+    // Identical to the fd-check site above, deliberately: the two are the one
+    // place this trainer can silently validate a graph it does not train.
+    if (!want_lokr && a.rslora) {
+        lm_lora_apply_rslora(&lora);
+        fprintf(stderr, "[mm3-lm-train] rsLoRA: in-graph scale alpha/sqrt(r) = %.4f (alpha/r would be %.4f)\n",
+                (double) lora.scale, (double) (lora.alpha / (float) lora.rank));
+        jl("{\"type\":\"adapter\",\"kind\":\"rslora\",\"scale\":%.6f}", (double) lora.scale);
+    }
+    if (!want_lokr && (a.dora || a.hira || a.loha)) {
+        fprintf(stderr, "[mm3-lm-train] parameterization: %s\n", a.dora ? "DoRA" : a.hira ? "HiRA" : "LoHa");
+        jl("{\"type\":\"adapter\",\"kind\":\"%s\"}", a.dora ? "dora" : a.hira ? "hira" : "loha");
     }
     if (want_lokr) {
         fprintf(stderr, "[mm3-lm-train] LoKr: dim %d alpha %.0f factor %d, decompose %s\n", a.lokr_dim,
@@ -2253,6 +2319,15 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         meta.samples  = (int) samples.size();
         meta.trigger  = a.trigger;
         meta.saved_loss = loss;
+        // The three facts a loader cannot infer from the tensors: rsLoRA's
+        // scale rule, DoRA's magnitude rescale, and which parameterization the
+        // hada_w*/lora_* keys belong to. Dropping any of them here is the
+        // turbo8 no-op trap in reverse — the file would load and mean something
+        // else.
+        meta.rslora       = a.rslora;
+        meta.dora         = a.dora;
+        meta.param_method = a.hira ? "hira" : a.loha ? "loha" : a.dora ? "dora" : "lora";
+        meta.adapter_type = a.adapter_type;
         LmExportResult res;
         std::string    xerr;
         // LoKr writes lokr_weights.safetensors; LoRA writes a PEFT directory
@@ -2318,6 +2393,18 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                     a.trigger_prepend ? "true" : "false", a.rank,
                     a.dataset_name.c_str(), step, a.depth_loss_weight > 0.0 ? 1.0 : 0.5, loss);
             fclose(sf);
+        }
+        // Export -> load round trip against the RUNTIME loader. A file that
+        // exports cleanly and loads as something else is the failure mode this
+        // whole parameterization family invites (rsLoRA's scale, DoRA's
+        // magnitudes, LoHa's key layout), and nothing else in the run would
+        // catch it.
+        if (a.verify_export && !lokr_out) {
+            std::string verr;
+            if (!mm3_lm_verify_export(dir, lora, &verr)) {
+                fprintf(stderr, "[mm3-lm-train] --verify-export FAILED: %s\n", verr.c_str());
+                return std::string();
+            }
         }
         fprintf(stderr, "[mm3-lm-train] saved %s (loss %.4f)\n", dir.c_str(), loss);
         jl("{\"type\":\"milestone\",\"step\":%d,\"loss\":%.6f,\"path\":\"%s\"}", step, loss,
@@ -3160,6 +3247,17 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             fprintf(stderr, "[mm3-lm-train] optimizer step failed\n");
             rc = 1;
             break;
+        }
+        // DoRA: A/B moved, so ||W + s*BA||_col is stale for the window that
+        // starts now. Nothing reads nrm between the step and the next
+        // micro-batch, so refreshing here is exactly the DiT's preWindow.
+        if (lora.dora) {
+            std::string derr;
+            if (!lm_lora_dora_refresh(&lora, sched, &derr)) {
+                fprintf(stderr, "[mm3-lm-train] %s\n", derr.c_str());
+                rc = 1;
+                break;
+            }
         }
         const double win = acc_loss / std::max(1, a.grad_accum);
         last_step_done = step;

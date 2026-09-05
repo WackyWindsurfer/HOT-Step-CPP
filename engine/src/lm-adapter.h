@@ -20,10 +20,12 @@
 // Local HOT-Step feature — not upstream acestep.cpp.
 
 #include "artist-token-runtime.h"  // the token half of a unified adapter file
+#include "qwen3-enc.h"             // Qwen3Layer + lm_slot_weight (the DoRA norm pass)
 #include "qwen3-lora.h"
 #include "safetensors.h"
 #include "yyjson.h"
 
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include <cstdio>
@@ -55,6 +57,17 @@ struct LMLora {
     int                             pfx_n  = 0;
     int                             pfx_lo = 0, pfx_hi = 0;
     int64_t                         pfx_row = 0;  // Nkv * D, as written
+
+    // ── DoRA (2026-09-05) ────────────────────────────────────────────────────
+    //
+    // The magnitudes come off disk into QwLoraPair::m. `nrm` cannot: it is
+    // ||W + s*BA||_col, which needs the BASE WEIGHTS this loader has never
+    // seen. lm_adapter_dora_prepare() fills it once, after model-store.cpp has
+    // both halves, and `dora_pending` is what says the adapter is not usable
+    // until it has run — a DoRA pair with m but no nrm would apply nothing and
+    // look like a working adapter.
+    int                             dora_n       = 0;
+    bool                            dora_pending = false;
 };
 
 // Map a module substring to a slot. Order matters: check longer names first.
@@ -86,13 +99,22 @@ static int lm_adapter_layer_for(const std::string & name) {
     return atoi(name.c_str() + p);
 }
 
-// Read lora_alpha and r from adapter_config.json. Returns alpha/r ratio
-// factor, or -1 when the config is missing/unparseable (caller falls back
-// to per-tensor alpha=r, i.e. factor 1.0, with a warning).
-static float lm_adapter_read_alpha_ratio(const std::string & dir) {
+// What adapter_config.json says about a PEFT adapter. `ratio` is -1 when the
+// file is missing or unparseable (caller falls back to alpha == r, i.e. 1.0,
+// with a warning). peft_type distinguishes LORA / HIRA / LOHA — the DiT's
+// exporter and now the LM's write the same key set, so one convention serves
+// both models.
+struct LmAdapterCfgInfo {
+    float       ratio     = -1.0f;
+    bool        use_dora  = false;
+    std::string peft_type = "LORA";
+};
+
+static LmAdapterCfgInfo lm_adapter_read_cfg(const std::string & dir) {
+    LmAdapterCfgInfo out;
     std::string  cfg_path = dir + "/adapter_config.json";
     yyjson_doc * doc      = yyjson_read_file(cfg_path.c_str(), 0, NULL, NULL);
-    if (!doc) return -1.0f;
+    if (!doc) return out;
     yyjson_val * root  = yyjson_doc_get_root(doc);
     double       alpha = 0.0, r = 0.0;
     bool         rslora = false;
@@ -100,16 +122,25 @@ static float lm_adapter_read_alpha_ratio(const std::string & dir) {
         yyjson_val * a = yyjson_obj_get(root, "lora_alpha");
         yyjson_val * rv = yyjson_obj_get(root, "r");
         yyjson_val * rs = yyjson_obj_get(root, "use_rslora");
+        yyjson_val * dv = yyjson_obj_get(root, "use_dora");
+        yyjson_val * pt = yyjson_obj_get(root, "peft_type");
         if (a && yyjson_is_num(a)) alpha = yyjson_get_num(a);
         if (rv && yyjson_is_num(rv)) r = yyjson_get_num(rv);
         if (rs && yyjson_is_true(rs)) rslora = true;
+        if (dv && yyjson_is_true(dv)) out.use_dora = true;
+        if (pt && yyjson_is_str(pt)) out.peft_type = yyjson_get_str(pt);
     }
     yyjson_doc_free(doc);
     // rsLoRA (use_rslora): the trainer applied alpha/sqrt(r) in-graph, so the
     // runtime must too, or the adapter comes in at sqrt(r) times the wrong
     // strength — 11x at r128 — with nothing in the log to say so.
-    if (alpha > 0.0 && r > 0.0) return (float) (rslora ? alpha / sqrt(r) : alpha / r);
-    return -1.0f;
+    if (alpha > 0.0 && r > 0.0) out.ratio = (float) (rslora ? alpha / sqrt(r) : alpha / r);
+    return out;
+}
+
+// Kept for callers that only want the scale factor.
+static float lm_adapter_read_alpha_ratio(const std::string & dir) {
+    return lm_adapter_read_cfg(dir).ratio;
 }
 
 static void lm_adapter_free(LMLora * l) {
@@ -310,8 +341,37 @@ static LMLora * lm_adapter_load(const char * path, float user_scale, ggml_backen
         return nullptr;
     }
 
-    float alpha_ratio = lm_adapter_read_alpha_ratio(dir);
+    const LmAdapterCfgInfo cfg_info = lm_adapter_read_cfg(dir);
+    float alpha_ratio    = cfg_info.ratio;
     bool  ratio_from_cfg = alpha_ratio > 0.0f;
+
+    // ── Parameterizations with no low-rank runtime path ──────────────────
+    //
+    // HiRA's delta is W (.) (s*BA) and LoHa's is (A1B1) (.) (A2B2). Neither is
+    // low-rank, so applying either means materialising a full [in, out] tensor
+    // per adapted module PER TOKEN. The DiT refuses both in runtime mode and
+    // defers to merge; the AS1.5 planner LM has no merge mode at all, so this
+    // is a hard refusal. It is NOT a silent skip: an adapter whose tensors are
+    // ignored is the turbo8 no-op, and the cache-key law here already forbids
+    // a base-only fallback under an adapter-bearing key.
+    {
+        bool has_hada = false;
+        for (const STEntry & e : st.entries) {
+            if (e.name.find(".hada_w") != std::string::npos) {
+                has_hada = true;
+                break;
+            }
+        }
+        if (has_hada || cfg_info.peft_type == "LOHA" || cfg_info.peft_type == "HIRA") {
+            fprintf(stderr,
+                    "[LM-Adapter] FATAL: %s is a %s adapter. Its delta is not low-rank, so the planner LM's\n"
+                    "             runtime path cannot apply it, and this model has no merge mode to fall back\n"
+                    "             on. Train --dora or --rslora instead, or use the MM3 LM (merge mode).\n",
+                    sf_path.c_str(), has_hada ? "LoHa" : cfg_info.peft_type.c_str());
+            st_close(&st);
+            return nullptr;
+        }
+    }
 
     LMLora * l = new LMLora();
     l->path = p;
@@ -473,15 +533,21 @@ static LMLora * lm_adapter_load(const char * path, float user_scale, ggml_backen
         return l;
     }
 
-    // Pass 1: count usable tensors
-    int usable = 0;
+    // Pass 1: count usable tensors. A DoRA magnitude costs TWO context slots:
+    // the m it loads plus the nrm lm_adapter_dora_prepare fills later.
+    int usable = 0, n_mag = 0;
     for (const STEntry & e : st.entries) {
         QwLoraSlot slot;
         int        layer = lm_adapter_layer_for(e.name);
         bool is_ab = e.name.find(".lora_A.") != std::string::npos ||
                      e.name.find(".lora_B.") != std::string::npos;
-        if (layer >= 0 && layer < QWEN3_LORA_MAX_LAYERS && is_ab && lm_adapter_slot_for(e.name, &slot)) {
+        bool is_mag = e.name.find(".lora_magnitude_vector.") != std::string::npos;
+        if (layer >= 0 && layer < QWEN3_LORA_MAX_LAYERS && (is_ab || is_mag) &&
+            lm_adapter_slot_for(e.name, &slot)) {
             usable++;
+            if (is_mag) {
+                n_mag++;
+            }
         } else {
             skipped++;
         }
@@ -494,23 +560,27 @@ static LMLora * lm_adapter_load(const char * path, float user_scale, ggml_backen
         return nullptr;
     }
 
-    struct ggml_init_params gp = { ggml_tensor_overhead() * (size_t) usable, NULL, true };
+    struct ggml_init_params gp = { ggml_tensor_overhead() * (size_t) (usable + n_mag + 8), NULL, true };
     l->ctx = ggml_init(gp);
 
     // Pass 2: create tensors
     struct Pending { const STEntry * e; struct ggml_tensor * t; };
     std::vector<Pending> pending;
-    pending.reserve(usable);
+    pending.reserve((size_t) usable);
     for (const STEntry & e : st.entries) {
         QwLoraSlot slot;
         int        layer = lm_adapter_layer_for(e.name);
         bool  is_a = e.name.find(".lora_A.") != std::string::npos;
         bool  is_b = e.name.find(".lora_B.") != std::string::npos;
-        if (layer < 0 || layer >= QWEN3_LORA_MAX_LAYERS || (!is_a && !is_b) ||
+        bool  is_m = e.name.find(".lora_magnitude_vector.") != std::string::npos;
+        if (layer < 0 || layer >= QWEN3_LORA_MAX_LAYERS || (!is_a && !is_b && !is_m) ||
             !lm_adapter_slot_for(e.name, &slot)) {
             continue;
         }
-        if (e.n_dims != 2) {
+        // PEFT writes the magnitude as [out]; a 2-D [out,1] / [1,out] form is
+        // accepted too, since the element count is what matters.
+        const int want_dims = is_m ? 0 : 2;
+        if (!is_m && e.n_dims != want_dims) {
             fprintf(stderr, "[LM-Adapter] FATAL: %s has %d dims (want 2)\n", e.name.c_str(), e.n_dims);
             st_close(&st);
             lm_adapter_free(l);
@@ -523,10 +593,25 @@ static LMLora * lm_adapter_load(const char * path, float user_scale, ggml_backen
             lm_adapter_free(l);
             return nullptr;
         }
-        // torch [rows, cols] row-major -> ggml ne0=cols, ne1=rows
-        struct ggml_tensor * t = ggml_new_tensor_2d(l->ctx, ty, e.shape[1], e.shape[0]);
         QwLoraPair & pair = l->layers[layer].p[slot];
-        if (is_a) pair.A = t; else pair.B = t;
+        struct ggml_tensor * t = nullptr;
+        if (is_m) {
+            int64_t n = 1;
+            for (int d = 0; d < e.n_dims; d++) {
+                n *= e.shape[d];
+            }
+            // F32 regardless of the file's dtype: nrm is computed in F32 and the
+            // two are divided elementwise in-graph, so keeping them the same
+            // type removes a cast node and a rounding question.
+            t        = ggml_new_tensor_1d(l->ctx, GGML_TYPE_F32, n);
+            pair.m   = t;
+            pair.nrm = ggml_new_tensor_1d(l->ctx, GGML_TYPE_F32, n);
+            l->dora_n++;
+        } else {
+            // torch [rows, cols] row-major -> ggml ne0=cols, ne1=rows
+            t = ggml_new_tensor_2d(l->ctx, ty, e.shape[1], e.shape[0]);
+            if (is_a) pair.A = t; else pair.B = t;
+        }
         if (layer > l->max_layer) l->max_layer = layer;
         pending.push_back({ &e, t });
     }
@@ -539,6 +624,29 @@ static LMLora * lm_adapter_load(const char * path, float user_scale, ggml_backen
         return nullptr;
     }
     for (auto & pd : pending) {
+        // The magnitude vector is forced to F32 above, so a BF16/F16 file needs
+        // widening rather than a raw copy — the byte counts do not match.
+        if (pd.t->type == GGML_TYPE_F32 && pd.e->dtype != "F32") {
+            const int64_t      n = ggml_nelements(pd.t);
+            std::vector<float> f((size_t) n);
+            if (pd.e->dtype == "BF16") {
+                const uint16_t * u = (const uint16_t *) st_data(st, *pd.e);
+                for (int64_t i = 0; i < n; i++) {
+                    const uint32_t bits = (uint32_t) u[i] << 16;
+                    memcpy(&f[(size_t) i], &bits, 4);
+                }
+            } else if (pd.e->dtype == "F16") {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) st_data(st, *pd.e), f.data(), n);
+            } else {
+                fprintf(stderr, "[LM-Adapter] FATAL: %s has unsupported dtype %s for a magnitude vector\n",
+                        pd.e->name.c_str(), pd.e->dtype.c_str());
+                st_close(&st);
+                lm_adapter_free(l);
+                return nullptr;
+            }
+            ggml_backend_tensor_set(pd.t, f.data(), 0, (size_t) n * sizeof(float));
+            continue;
+        }
         ggml_backend_tensor_set(pd.t, st_data(st, *pd.e), 0, ggml_nbytes(pd.t));
     }
     l->n_tensors = (int) pending.size();
@@ -561,6 +669,19 @@ static LMLora * lm_adapter_load(const char * path, float user_scale, ggml_backen
                 lm_adapter_free(l);
                 return nullptr;
             }
+            if (pr.m && !pr.A) {
+                fprintf(stderr, "[LM-Adapter] FATAL: layer %d slot %d has a DoRA magnitude but no lora_A/lora_B\n",
+                        i, s);
+                lm_adapter_free(l);
+                return nullptr;
+            }
+            if (pr.m && pr.m->ne[0] != pr.B->ne[1]) {
+                fprintf(stderr,
+                        "[LM-Adapter] FATAL: layer %d slot %d magnitude is %lld long but lora_B has %lld outputs\n",
+                        i, s, (long long) pr.m->ne[0], (long long) pr.B->ne[1]);
+                lm_adapter_free(l);
+                return nullptr;
+            }
             if (pr.A) {
                 pr.scale = alpha_ratio * user_scale;
                 pairs++;
@@ -568,8 +689,102 @@ static LMLora * lm_adapter_load(const char * path, float user_scale, ggml_backen
         }
     }
 
-    fprintf(stderr, "[LM-Adapter] Loaded %s: %d pairs across %d layers, alpha/r=%.3f, user scale=%.2f%s\n",
+    // use_dora in adapter_config.json and the tensors on disk must agree. Either
+    // one alone means the file was written by something that half-understood
+    // DoRA, and guessing which half is right is how an adapter silently renders
+    // at the wrong strength.
+    if (cfg_info.use_dora != (l->dora_n > 0)) {
+        fprintf(stderr,
+                "[LM-Adapter] FATAL: adapter_config.json says use_dora=%s but the file carries %d "
+                "lora_magnitude_vector tensor(s)\n",
+                cfg_info.use_dora ? "true" : "false", l->dora_n);
+        lm_adapter_free(l);
+        return nullptr;
+    }
+    // The norms need the base weights, which this loader does not have. Until
+    // lm_adapter_dora_prepare() runs, every DoRA pair carries an UNINITIALISED
+    // nrm and must not reach a graph.
+    l->dora_pending = l->dora_n > 0;
+
+    fprintf(stderr, "[LM-Adapter] Loaded %s: %d pairs across %d layers, alpha/r=%.3f, user scale=%.2f%s%s\n",
             p.c_str(), pairs, l->max_layer + 1, alpha_ratio, user_scale,
-            skipped ? " (some non-projection tensors skipped)" : "");
+            l->dora_n ? " (DoRA)" : "", skipped ? " (some non-projection tensors skipped)" : "");
     return l;
+}
+
+// ─── DoRA: the one-time norm pass (2026-09-05) ──────────────────────────────
+//
+// nrm = ||W + s*BA||_col for every DoRA site. The trainer refreshes this once
+// per optimizer window because A/B move; at inference W, A and B are ALL
+// FROZEN, so it is exact after one pass and reused for every token. That is
+// what makes DoRA correct in the unmerged runtime path, where the DiT's
+// adapter-runtime.h only warns and defers to merge mode.
+//
+// Runs on the model's own backend with a plain gallocr — the LoRA tensors were
+// staged on that same backend by lm_adapter_load, so there is nothing to
+// schedule across devices. One graph per layer, for the same node-budget reason
+// DitAdapterLora::preWindow gives.
+static bool lm_adapter_dora_prepare(LMLora * l, Qwen3Layer * layers, ggml_backend_t backend) {
+    if (!l || l->dora_n == 0) {
+        return true;
+    }
+    const size_t         n_nodes = (size_t) QW_LORA_NSLOTS * 12 + 64;
+    const size_t         need    = ggml_tensor_overhead() * n_nodes + ggml_graph_overhead_custom(n_nodes, false);
+    std::vector<uint8_t> arena(need);
+    ggml_gallocr_t       ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ga) {
+        fprintf(stderr, "[LM-Adapter] FATAL: DoRA norm pass cannot allocate\n");
+        return false;
+    }
+    bool ok = true;
+    for (int layer = 0; layer <= l->max_layer && ok; layer++) {
+        ggml_init_params ip  = { arena.size(), arena.data(), true };
+        ggml_context *   ctx = ggml_init(ip);
+        if (!ctx) {
+            ok = false;
+            break;
+        }
+        ggml_cgraph * gf   = ggml_new_graph_custom(ctx, n_nodes, false);
+        int           want = 0;
+        for (int s = 0; s < QW_LORA_NSLOTS; s++) {
+            QwLoraPair & pr = l->layers[layer].p[s];
+            if (!pr.m || !pr.nrm || !pr.A || !pr.B) {
+                continue;
+            }
+            ggml_tensor * w = lm_slot_weight(&layers[layer], s);
+            if (!w) {
+                fprintf(stderr, "[LM-Adapter] FATAL: DoRA site layer %d slot %d has no base weight\n", layer, s);
+                ok = false;
+                break;
+            }
+            // ggml_cast dequantizes: the base LM here is routinely Q8_0/Q5_K,
+            // which is the whole reason the runtime path exists.
+            ggml_tensor * wf    = (w->type == GGML_TYPE_F32) ? w : ggml_cast(ctx, w, GGML_TYPE_F32);
+            ggml_tensor * a32   = (pr.A->type == GGML_TYPE_F32) ? pr.A : ggml_cast(ctx, pr.A, GGML_TYPE_F32);
+            ggml_tensor * b32   = (pr.B->type == GGML_TYPE_F32) ? pr.B : ggml_cast(ctx, pr.B, GGML_TYPE_F32);
+            // delta[in, out] = A[in, r] . B[r, out]: mul_mat contracts ne0, so
+            // the left operand is A transposed to [r, in].
+            ggml_tensor * delta = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, a32)), b32);
+            // pr.scale already carries user_scale. The norm has to describe the
+            // delta this render will actually apply, so the dial belongs in it.
+            ggml_tensor * wd    = ggml_add(ctx, wf, ggml_scale(ctx, delta, pr.scale));
+            ggml_tensor * nr    = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, wd)));  // [1, out]
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, nr, ggml_reshape_2d(ctx, pr.nrm, 1, pr.nrm->ne[0])));
+            want++;
+        }
+        if (ok && want > 0) {
+            ok = ggml_gallocr_alloc_graph(ga, gf) &&
+                 ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+            if (!ok) {
+                fprintf(stderr, "[LM-Adapter] FATAL: DoRA norm pass failed at layer %d\n", layer);
+            }
+        }
+        ggml_free(ctx);
+    }
+    ggml_gallocr_free(ga);
+    if (ok) {
+        l->dora_pending = false;
+        fprintf(stderr, "[LM-Adapter] DoRA: ||W + s*BA||_col computed for %d site(s)\n", l->dora_n);
+    }
+    return ok;
 }

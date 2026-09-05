@@ -57,6 +57,7 @@
 #include "mm3-dit-graph.h"
 #include "mm3-imatrix.h"
 #include "mm3-lm-graph.h"
+#include "mm3-lm-dora.h"
 #include "mm3-model.h"
 #include "mm3-pipeline.h"
 #include "mm3-request.h"
@@ -1189,6 +1190,25 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
                 g_mm3_lm_adapter = mm3_lm_adapter_load(ad_path.c_str(), &aerr);
                 if (!g_mm3_lm_adapter) {
                     mm3_json_error(res, 400, aerr.empty() ? "LM adapter load failed" : aerr);
+                    return;
+                }
+            }
+            // Merge-only parameterizations have no runtime path (their delta is
+            // not low-rank), and this endpoint deliberately has no merge mode.
+            if (g_mm3_lm_adapter->is_loha || g_mm3_lm_adapter->is_hira) {
+                const std::string kind = g_mm3_lm_adapter->is_loha ? "LoHa" : "HiRA";
+                mm3_lm_adapter_drop();
+                mm3_json_error(res, 400,
+                               kind + " LM adapters have no runtime path (the delta is not low-rank); "
+                                      "this endpoint is runtime-only, so use /mm3/generate with "
+                                      "lm_adapter_mode=merge");
+                return;
+            }
+            {
+                // DoRA's denominator needs the resident base weights.
+                std::string derr;
+                if (!mm3_lm_dora_prepare(g_mm3, g_mm3_lm_adapter, &derr)) {
+                    mm3_json_error(res, 400, derr.empty() ? "DoRA norm pass failed" : derr);
                     return;
                 }
             }

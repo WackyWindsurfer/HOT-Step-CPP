@@ -460,12 +460,27 @@ static ggml_tensor * mm3_lm_mm(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
     }
     ggml_tensor * y = ggml_mul_mat(ctx, w, x);
     if (ad) {
+        // Reaching here with a merge-only parameterization, or with DoRA whose
+        // norms were never computed, would apply SOMETHING — pair 1 of a LoHa,
+        // or a division by uninitialised memory — and call it the adapter. The
+        // callers (mm3-job.h, mm3-server.h) refuse both with a message; this is
+        // the backstop that makes a missed caller loud instead of plausible.
+        GGML_ASSERT(!ad->is_loha && !ad->is_hira &&
+                    "LoHa/HiRA LM adapters are merge-mode only; the caller must refuse them");
+        GGML_ASSERT(!ad->dora_pending && "mm3_lm_dora_prepare must run before the LM graph is built");
         const MM3LmAdapterPair & p = ad->mods[layer][module];
         if (p.has_lora()) {
             const float s = ad->effective(layer, module, sc);
             if (s != 0.0f) {
                 ggml_tensor * d = ggml_mul_mat(ctx, p.b, ggml_mul_mat(ctx, p.a, x));
                 y               = ggml_add(ctx, y, ggml_scale(ctx, d, s));
+            }
+            if (p.has_dora()) {
+                // DoRA: y <- y * (m / ||W + s*BA||_col). The norm was computed
+                // once at adapter load (mm3-lm-dora.h) — W, A and B are all
+                // frozen here, so it is exact rather than an approximation.
+                // m/nrm is [out] and broadcasts over the token and batch axes.
+                y = ggml_mul(ctx, y, ggml_div(ctx, p.m, p.nrm));
             }
         } else if (p.has_lokr()) {
             const float s = ad->effective(layer, module, sc);

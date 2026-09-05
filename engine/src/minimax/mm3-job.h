@@ -988,6 +988,25 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
                 }
                 req.gen.lm_adapter = nullptr;  // baked in; no runtime deltas on top
             } else {
+                // Runtime mode cannot express a delta that is not low-rank.
+                // HiRA (W (.) s*BA) and LoHa ((A1B1) (.) (A2B2)) both need a
+                // full [in, out] tensor per module PER TOKEN. Refused by name,
+                // the way adapter-runtime.h refuses them on the DiT — merge
+                // mode understands both.
+                if (g_mm3_lm_adapter->is_loha || g_mm3_lm_adapter->is_hira) {
+                    fail(2, "lm_adapter",
+                         std::string("this is a ") + (g_mm3_lm_adapter->is_loha ? "LoHa" : "HiRA") +
+                             " adapter: its delta is not low-rank, so it cannot be applied as a runtime "
+                             "delta. Set lm_adapter_mode=merge.");
+                    return;
+                }
+                // DoRA's denominator needs the resident base weights, so it is
+                // computed here rather than at adapter load.
+                std::string derr;
+                if (!mm3_lm_dora_prepare(g_mm3, g_mm3_lm_adapter, &derr)) {
+                    fail(2, "lm_adapter", derr.empty() ? "DoRA norm pass failed" : derr);
+                    return;
+                }
                 req.gen.lm_adapter = g_mm3_lm_adapter;
             }
         } else {

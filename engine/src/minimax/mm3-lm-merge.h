@@ -32,6 +32,22 @@
 // Failure contract: a merge that dies part-way leaves the weights in a mixed
 // state, so the caller MUST drop LM residency on failure (mm3-job.h does) —
 // the tag stays clear and the next generation reloads a pristine base.
+//
+// ── Parameterizations beyond plain LoRA (2026-09-05) ────────────────────────
+//
+// Three variations ride the same per-module graph, chosen off what the adapter
+// carries rather than off a flag:
+//
+//   LoHa  delta = (A1 B1) (.) (A2 B2)          hada_w* keys present
+//   HiRA  W' = W + W (.) (s*BA)                peft_type HIRA
+//   DoRA  W' = m * (W + s*BA) / ||.||_col      lora_magnitude_vector present
+//
+// LoHa and HiRA are MERGE-ONLY: neither delta is low-rank, so a runtime apply
+// would materialise a full [in, out] tensor per module per token. The runtime
+// path refuses them by name (mm3-job.h / mm3-server.h), which is the same split
+// the DiT already makes between adapter-runtime.h and adapter-merge.h. DoRA
+// works in both — the runtime computes its denominator once at load
+// (mm3-lm-dora.h) because W, A and B are frozen there.
 
 #include "mm3-lm-adapter.h"
 #include "mm3-model.h"
@@ -142,8 +158,9 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
                 break;
             }
 
-            // Small per-module graph: merged_f32 = cast(W) + s * (Aᵀ · B).
-            const size_t         need = ggml_tensor_overhead() * 48 + ggml_graph_overhead_custom(64, false);
+            // Small per-module graph: merged_f32 = cast(W) + s * (Aáµ€ · B),
+            // with three variations that all keep that shape.
+            const size_t         need = ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(96, false);
             std::vector<uint8_t> gvec(need);
             ggml_init_params     ip  = { need, gvec.data(), /*no_alloc*/ true };
             ggml_context *       ctx = ggml_init(ip);
@@ -158,7 +175,32 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
             ggml_tensor * b32    = ggml_cast(ctx, p.b, GGML_TYPE_F32);                  // [r, out]
             ggml_tensor * delta  = ggml_mul_mat(ctx, a_t, b32);                         // [in, out] f32
             ggml_tensor * basef  = ggml_cast(ctx, w, GGML_TYPE_F32);                    // [in, out]
-            ggml_tensor * merged = ggml_add(ctx, basef, ggml_scale(ctx, delta, s));
+            ggml_tensor * merged = nullptr;
+            if (p.has_loha()) {
+                // LoHa: delta = (A1 B1) (.) (A2 B2). Both products are full
+                // [in, out] tensors; this is the reason it is merge-only.
+                ggml_tensor * a2t = ggml_cont(ctx, ggml_transpose(ctx, p.a2));
+                ggml_tensor * b2f = ggml_cast(ctx, p.b2, GGML_TYPE_F32);
+                ggml_tensor * d2  = ggml_mul_mat(ctx, a2t, b2f);
+                merged = ggml_add(ctx, basef, ggml_scale(ctx, ggml_mul(ctx, delta, d2), s));
+            } else if (ad->is_hira) {
+                // HiRA: W' = W + W (.) (s*BA). Modulating the update by the base
+                // elementwise is what makes it high-rank, and what makes it
+                // impossible to express as a runtime low-rank pair.
+                merged = ggml_add(ctx, basef, ggml_mul(ctx, basef, ggml_scale(ctx, delta, s)));
+            } else {
+                merged = ggml_add(ctx, basef, ggml_scale(ctx, delta, s));
+            }
+            if (p.m) {
+                // DoRA: W' = m * (W + s*BA) / ||W + s*BA||_col. The norm is
+                // recomputed here from the weights being written, so it is
+                // exact for this merge — not the value the trainer last held.
+                // Shapes: merged is [in, out], sum_rows gives [1, out], and
+                // m reshaped to [1, out] broadcasts back over `in`.
+                ggml_tensor * nr = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, merged)));   // [1, out]
+                ggml_tensor * mv = ggml_reshape_2d(ctx, p.m, 1, p.m->ne[0]);                    // [1, out]
+                merged           = ggml_mul(ctx, merged, ggml_div(ctx, mv, nr));
+            }
             ggml_tensor * outt   = w->type == GGML_TYPE_F16 ? ggml_cast(ctx, merged, GGML_TYPE_F16) : merged;
             ggml_set_output(outt);
 

@@ -49,6 +49,12 @@ struct LmExportMeta {
     std::string lm_path, lm_size, codes_path, tensors_dir, order;
     int         rank = 16, alpha = 32;
     bool        rslora = false;  // alpha/sqrt(r) scaling; mirrored by lm-adapter.h at load
+    // Post-LoRA parameterization (2026-09-05). `dora` writes use_dora and the
+    // lora_magnitude_vector tensors; `param_method` is the RESUME identity key
+    // ("lora"|"dora"|"hira"|"loha") and is what lm-resume.h reads back. A run
+    // that predates this records nothing and reads back as "lora".
+    bool        dora   = false;
+    std::string param_method = "lora";
     // Soft prompt provenance (2026-09-04): recorded so a run's log says what it trained.
     std::string artist_token;
     int         artist_k  = 0;
@@ -169,8 +175,14 @@ struct LmExportMeta {
 //
 // Written by hand rather than via yyjson_mut so the emitted bytes match §2.4
 // key-for-key and order-for-order (deviation noted in the handoff report).
+//
+// `dora` / `peft_type` (2026-09-05) mirror dit_write_adapter_config's own keys
+// exactly, so one loader convention serves both models: use_dora drives the
+// magnitude-vector rescale, and peft_type distinguishes LORA / HIRA / LOHA.
+// Key ORDER is unchanged — the §2.4 literal is frozen and these two keys were
+// already in it.
 static bool lm_write_adapter_config(const std::string & dir, int rank, int alpha, const std::string & base_model,
-                                    bool rslora = false) {
+                                    bool rslora = false, bool dora = false, const char * peft_type = "LORA") {
     std::string j;
     j += "{\n";
     j += "  \"alpha_pattern\": {},\n";
@@ -191,7 +203,7 @@ static bool lm_write_adapter_config(const std::string & dir, int rank, int alpha
     j += "  \"megatron_config\": null,\n";
     j += "  \"megatron_core\": \"megatron.core\",\n";
     j += "  \"modules_to_save\": null,\n";
-    j += "  \"peft_type\": \"LORA\",\n";
+    j += std::string("  \"peft_type\": \"") + peft_type + "\",\n";
     snprintf(b, sizeof(b), "  \"r\": %d,\n", rank);
     j += b;
     j += "  \"rank_pattern\": {},\n";
@@ -200,7 +212,7 @@ static bool lm_write_adapter_config(const std::string & dir, int rank, int alpha
     j += "    \"k_proj\",\n    \"gate_proj\",\n    \"up_proj\",\n    \"v_proj\",\n    \"down_proj\",\n";
     j += "    \"q_proj\",\n    \"o_proj\"\n  ],\n";
     j += "  \"task_type\": \"CAUSAL_LM\",\n";
-    j += "  \"use_dora\": false,\n";
+    j += std::string("  \"use_dora\": ") + (dora ? "true" : "false") + ",\n";
     j += std::string("  \"use_rslora\": ") + (rslora ? "true" : "false") + "\n";
     j += "}\n";
     return pm_write_atomic(lm_join(dir, "adapter_config.json"), j);
@@ -250,6 +262,11 @@ static bool lm_write_train_log(const std::string & dir, const LmExportMeta & m) 
     yyjson_mut_obj_add_strcpy(doc, cfg, "attn_mode", m.attn_mode.c_str());
     yyjson_mut_obj_add_strcpy(doc, cfg, "attn_prec", m.attn_prec.c_str());
     yyjson_mut_obj_add_strcpy(doc, cfg, "adapter_type", m.adapter_type.c_str());
+    // Always written (never omitted when "lora"): "which parameterization was
+    // this trained with" must be answerable from the log alone, and the resume
+    // path refuses on a mismatch rather than silently loading the wrong tensors.
+    yyjson_mut_obj_add_strcpy(doc, cfg, "param_method", m.param_method.c_str());
+    yyjson_mut_obj_add_bool(doc, cfg, "rslora", m.rslora);
     if (m.adapter_type == "lokr") {
         yyjson_mut_obj_add_int(doc, cfg, "lokr_dim", m.lokr_dim);
         yyjson_mut_obj_add_real(doc, cfg, "lokr_alpha", (double) m.lokr_alpha);
@@ -399,7 +416,8 @@ static bool lm_export_peft(const LmLora & L, const Qwen3LMConfig & cfg, const Lm
         *err = "cannot create " + out_dir;
         return false;
     }
-    if (!lm_write_adapter_config(out_dir, L.rank, (int) (L.alpha + 0.5f), meta.lm_path, meta.rslora)) {
+    if (!lm_write_adapter_config(out_dir, L.rank, (int) (L.alpha + 0.5f), meta.lm_path, meta.rslora, L.dora,
+                                 L.loha ? "LOHA" : L.hira ? "HIRA" : "LORA")) {
         *err = "cannot write adapter_config.json in " + out_dir;
         return false;
     }
@@ -416,6 +434,33 @@ static bool lm_export_peft(const LmLora & L, const Qwen3LMConfig & cfg, const Lm
             if (!pr.A || !pr.B) {
                 continue;
             }
+            if (pr.has_loha()) {
+                // LyCORIS LoHa layout — the one adapter-merge.h's LoHa branch and
+                // LyCORIS itself read: lycoris_layers_<l>_<site>.hada_w{1,2}_{a,b}
+                // + .alpha. Row-major w?_a = (out, dim) is our B, w?_b = (dim, in)
+                // is our A. Same stem construction as the LoKr exporter below.
+                const std::string stem    = lm_lycoris_key_stem(l, s);
+                ggml_tensor *     four[4] = { pr.B, pr.A, pr.B2, pr.A2 };
+                const char *      sfx[4]  = { "hada_w1_a", "hada_w1_b", "hada_w2_a", "hada_w2_b" };
+                for (int k = 0; k < 4; k++) {
+                    ggml_tensor * t = four[k];
+                    store.push_back(std::vector<float>((size_t) ggml_nelements(t)));
+                    std::vector<float> & buf = store.back();
+                    ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+                    STWTensor st;
+                    st.name  = stem + "." + sfx[k];
+                    st.shape = { t->ne[1], t->ne[0] };
+                    st.data  = buf.data();
+                    tensors.push_back(st);
+                }
+                store.push_back(std::vector<float>(1, L.alpha));
+                STWTensor sa;
+                sa.name  = stem + ".alpha";
+                sa.shape = { 1 };
+                sa.data  = store.back().data();
+                tensors.push_back(sa);
+                continue;
+            }
             ggml_tensor * both[2] = { pr.A, pr.B };
             const char *  suffix[2] = { "lora_A", "lora_B" };
             for (int k = 0; k < 2; k++) {
@@ -429,6 +474,21 @@ static bool lm_export_peft(const LmLora & L, const Qwen3LMConfig & cfg, const Lm
                 STWTensor st;
                 st.name  = nm;
                 st.shape = { t->ne[1], t->ne[0] };  // torch [rows, cols]
+                st.data  = buf.data();
+                tensors.push_back(st);
+            }
+            if (pr.m) {
+                // PEFT's lora_magnitude_vector — the key adapter-merge.h already
+                // reads (lora_is_magnitude) and the LM loaders now read too.
+                store.push_back(std::vector<float>((size_t) ggml_nelements(pr.m)));
+                std::vector<float> & buf = store.back();
+                ggml_backend_tensor_get(pr.m, buf.data(), 0, buf.size() * sizeof(float));
+                char nm[192];
+                snprintf(nm, sizeof(nm), "base_model.model.model.layers.%d.%s.lora_magnitude_vector.weight", l,
+                         lm_slot_peft_name(s));
+                STWTensor st;
+                st.name  = nm;
+                st.shape = { pr.m->ne[0] };
                 st.data  = buf.data();
                 tensors.push_back(st);
             }

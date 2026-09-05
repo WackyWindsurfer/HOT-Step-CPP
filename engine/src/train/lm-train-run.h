@@ -99,6 +99,15 @@ struct LmTrainArgs {
     // rsLoRA: alpha/sqrt(r). Written to adapter_config.json as use_rslora and
     // re-derived by lm-adapter.h; never set one side without the other.
     bool        rslora       = false;
+    // Post-LoRA parameterizations (2026-09-05, ported from the DiT trainer).
+    // Mutually exclusive with each other, and LoRA-type only — cmd_train_lm
+    // refuses every other combination at exit 2 rather than coercing.
+    //   dora — learned per-output magnitude over the LoRA direction
+    //   hira — W (.) (s*BA); the delta is not low-rank, so it is MERGE-ONLY
+    //   loha — (A1B1) (.) (A2B2), LyCORIS hada_w* on disk; also merge-only
+    bool        dora         = false;
+    bool        hira         = false;
+    bool        loha         = false;
     // LoRA+ (Hayou 2024): B at ratio x A's learning rate. 1 = off. Only
     // parameters on the AdamW rule honour it — Muon scales its own update.
     float       lora_plus_ratio = 1.0f;
@@ -1034,7 +1043,7 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
                 ? lm_lokr_init(&lora, &lm, 0, c.n_layers, a.lokr_dim, a.lokr_alpha, a.lokr_factor,
                                a.lokr_decompose_both, (uint64_t) a.seed, &err)
                 : lm_lora_init(&lora, &lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed, /*b_sigma=*/0.0f,
-                               &err);
+                               &err, LmLoraOpts{ a.dora, a.hira, a.loha });
         if (!init_ok) {
             lm_fatal("vram", err);
             return 1;
@@ -2177,6 +2186,19 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
                     rc = 1;
                     break;
                 }
+                // DoRA: A/B just moved, so ||W + s*BA||_col is stale for the
+                // window that starts now. Refreshing AFTER the step (rather
+                // than before the next window's first micro-batch, as the DiT
+                // does) is the same quantity — nothing reads nrm in between —
+                // and there is only one place to put it.
+                if (lora.dora) {
+                    std::string derr;
+                    if (!lm_lora_dora_refresh(&lora, sched, &derr)) {
+                        lm_fatal("vram", derr);
+                        rc = 1;
+                        break;
+                    }
+                }
                 global_step++;
                 const size_t vram_mb = tracker.sample();
                 jl("{\"type\":\"step\",\"epoch\":%d,\"step\":%d,\"totalSteps\":%d,\"micro\":%d,\"loss\":%.6f,"
@@ -2504,6 +2526,8 @@ static int lm_train_main(const LmTrainArgs & a) {
     // backend actually launched once an epoch has run.
     meta.attn_mode      = a.attn;
     meta.adapter_type   = a.adapter_type;
+    meta.dora           = a.dora;
+    meta.param_method   = a.hira ? "hira" : a.loha ? "loha" : a.dora ? "dora" : "lora";
     meta.lokr_dim       = a.lokr_dim;
     meta.lokr_alpha     = a.lokr_alpha;
     meta.lokr_factor    = a.lokr_factor;

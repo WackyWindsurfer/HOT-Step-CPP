@@ -461,6 +461,18 @@ Qwen3LM * store_require_lm(ModelStore * s, const ModelKey & k) {
             delete m;
             return nullptr;
         }
+        // DoRA needs ||W + s*BA||_col, which the adapter loader cannot compute
+        // — it never sees the base weights. Both halves are here now, so run
+        // the one-time norm pass. Same cache-key law as everything above: a
+        // failure is a refusal, never a silently-DoRA-less adapter.
+        if (m->lora->dora_pending && !lm_adapter_dora_prepare(m->lora, m->layers, m->backend)) {
+            fprintf(stderr, "[Store] LM adapter DoRA norm pass FAILED (%s) — refusing\n", k.adapter_path.c_str());
+            lm_adapter_free(m->lora);
+            m->lora = nullptr;
+            qw3lm_free(m);
+            delete m;
+            return nullptr;
+        }
         for (int i = 0; i <= m->lora->max_layer; i++) {
             m->layers[i].lora = &m->lora->layers[i];
         }
