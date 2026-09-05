@@ -184,6 +184,21 @@ test('group chat HTTP and MCP share the transcript without app access', { timeou
       });
       assert.equal(foreignHostStatus, 403);
     });
+    await t.test('human pings and research controls share state with the agents', async () => {
+      assert.equal((await write('messages', { body: '@codex check the current implementation.' })).status, 200);
+      store!.activity('review', agent.participant_id, 'researching', 'Reading the relevant source.', 120);
+      const page = await (await fetch(base + '/api/discussions/review')).json() as any;
+      assert.equal(page.coordination.research.name, 'Codex');
+      assert.equal(page.coordination.requests[0].participant_id, agent.participant_id);
+      const released = await write('coordination', { body: 'Release', action: 'release_research' });
+      assert.equal(released.status, 200);
+      assert.equal(store!.read('review', 0, 1000).coordination.research, null);
+      assert.equal((await write('coordination', { body: 'Clear pings', action: 'clear_requests' })).status, 200);
+      assert.equal(store!.read('review', 0, 1000).coordination.requests.length, 0);
+      assert.equal((await write('coordination', { body: 'Missing action' })).status, 400);
+      const script = await (await fetch(base + '/viewer.js')).text();
+      assert.match(script, /Automatic wake is not connected/);
+    });
   } finally {
     await client.close();
     server.closeAllConnections();

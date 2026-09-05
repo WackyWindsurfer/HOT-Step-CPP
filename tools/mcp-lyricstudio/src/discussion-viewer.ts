@@ -26,6 +26,7 @@ const humanWrite = z.object({
   request_id: z.string().uuid(),
   body: z.string().trim().min(1).max(24000),
   status: z.enum(['active', 'paused', 'closed']).optional(),
+  action: z.enum(['release_research', 'clear_requests']).optional(),
 });
 const humanCreate = humanWrite.pick({ participant_id: true, request_id: true }).extend({
   room: z.string().trim().min(1).max(100).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/),
@@ -72,7 +73,7 @@ export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ??
         response.writeHead(200, { 'Content-Type': `${asset.type}; charset=utf-8` });
         response.end(asset.body); return;
       }
-      const roomMatch = /^\/api\/discussions\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,99})(?:\/(messages|status|plan\.md))?$/.exec(url.pathname);
+      const roomMatch = /^\/api\/discussions\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,99})(?:\/(messages|status|coordination|plan\.md))?$/.exec(url.pathname);
       const isWrite = request.method === 'POST';
       const isCreate = isWrite && url.pathname === '/api/discussions';
       if ((!roomMatch && url.pathname !== '/api/discussions') || (roomMatch && isWrite !== Boolean(roomMatch[2] && roomMatch[2] !== 'plan.md'))) {
@@ -113,7 +114,10 @@ export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ??
       if (input) {
         try {
           const participant = store.joinViewer(room, input.participant_id);
-          if (roomMatch[2] === 'status') {
+          if (roomMatch[2] === 'coordination') {
+            if (!input.action) { send(400, { error: 'Choose a coordination action.' }); return; }
+            send(200, store.clearCoordination(room, participant, input.request_id, input.action));
+          } else if (roomMatch[2] === 'status') {
             if (!input.status) { send(400, { error: 'Choose a discussion status.' }); return; }
             send(200, store.status(room, participant, input.request_id, input.status, input.body));
           } else {

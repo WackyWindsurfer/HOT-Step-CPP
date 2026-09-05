@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { COORDINATION_SCHEMA, DiscussionCoordination, mentionHandle } from './discussion-coordination.js';
 
 export const DEFAULT_COLLAB_DB = fileURLToPath(new URL('../../../data/collaboration.db', import.meta.url));
 
@@ -16,6 +17,10 @@ Read the brief and transcript before replying. Post concrete proposals and criti
 Aim for 150 words per reply; agent messages are limited to 2400 characters. State only new evidence, disagreements, or the next decision. Do not repeat a peer's proposal or announce that you will reply later.
 One agent contribution per turn, including a decision. After posting, wait for a different speaker (another agent or the human) before posting again. Do not send an acknowledgement followed by a proposal or decision. Combine them into one contribution. Rejoining or relaying user_direction does not bypass this rule.
 Once agreement is reached, one agent records the plan as its contribution. Others need not repeat it. Stop when the requested discussion is complete.
+An @mention requests a reply from that participant. Read coordination.requests and wait if another agent was asked. Requests are queued, not proof that an idle VSCode chat was woken.
+Before investigating, use collab_set_activity(researching, reason). It reserves the room for 120 seconds, renewable up to 300 seconds per call, without consuming your reply. Other agents may read but must hold proposals and decisions. Human steering stays open. Do not post a separate "please hold" message.
+Before answering from research, read all new messages and pass next_after_id as read_after_id with your reply or decision. The answer releases the hold and resolves your pending mentions. Use activity=idle to release without answering; the human can also clear a hold or unanswered mention. Renew before expiry if more time is needed.
+If a ping needs no substantive answer, use collab_decline_request with a short reason after reading it. Activity changes and coordination events are not invitations to reply.
 Check new user_direction messages before continuing the plan; the user can post directly from the group chat as You. Address their questions and constraints in the room so every participant can follow.
 Relay user instructions that affect the shared plan as kind=user_direction, clearly identifying them as the user's words or a paraphrase. Never invent user approval.
 Each join returns a participant_id for this chat; retain it and identify yourself honestly. These IDs prevent accidental mixups, not malicious impersonation by trusted local clients.
@@ -39,12 +44,13 @@ function compactPage(page: ReturnType<DiscussionStore['read']>, after: number) {
   return {
     discussion: { id: page.discussion.id, status: page.discussion.status, revision: page.discussion.revision,
       ...(after === 0 ? { brief: page.discussion.brief } : {}) },
-    messages: page.messages.map(({ id, author, kind, body, reply_to }) => {
+    coordination: page.coordination,
+    messages: page.messages.map(({ id, author, kind, body, reply_to, mentions }) => {
       if (kind === 'decision') {
         try { body = JSON.stringify({ revision: JSON.parse(body).expected_revision + 1, superseded: id !== decision?.message_id }); }
         catch { /* Preserve unrecognised historical events. */ }
       }
-      return { id, author, kind, body, ...(reply_to !== null ? { reply_to } : {}) };
+      return { id, author, kind, body, ...(reply_to !== null ? { reply_to } : {}), ...(mentions.length ? { mentions } : {}) };
     }),
     has_more: page.has_more, next_after_id: page.next_after_id,
     ...(after === 0 ? { participants: page.participants } : {}),
@@ -54,10 +60,12 @@ function compactPage(page: ReturnType<DiscussionStore['read']>, after: number) {
 
 export class DiscussionStore {
   private db: Database.Database;
+  private coordination: DiscussionCoordination;
 
   constructor(dbPath: string, options: { readonly?: boolean } = {}) {
     if (!options.readonly) mkdirSync(dirname(resolve(dbPath)), { recursive: true });
     this.db = new Database(dbPath, { timeout: 5000, readonly: options.readonly ?? false, fileMustExist: options.readonly ?? false });
+    this.coordination = new DiscussionCoordination(this.db);
     if (options.readonly) return;
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
@@ -85,6 +93,7 @@ export class DiscussionStore {
         disagreements TEXT NOT NULL, PRIMARY KEY(room, revision)
       );
     `);
+    this.db.exec(COORDINATION_SCHEMA);
   }
 
   close() { this.db.close(); }
@@ -152,12 +161,13 @@ export class DiscussionStore {
     return this.db.transaction(() => {
       const discussion = this.room(room);
       const rows = this.db.prepare('SELECT * FROM messages WHERE room = ? AND id > ? ORDER BY id LIMIT ?').all(room, after, limit + 1) as Message[];
-      const messages = rows.slice(0, limit);
+      const messages = rows.slice(0, limit).map(m => ({ ...m, mentions: this.coordination.mentions(m.id) }));
       return {
         discussion, messages, has_more: rows.length > limit,
         next_after_id: messages.at(-1)?.id ?? after,
-        participants: this.db.prepare('SELECT id, name, joined_at FROM participants WHERE room = ? ORDER BY joined_at').all(room),
+        participants: (this.db.prepare('SELECT id, name, joined_at FROM participants WHERE room = ? ORDER BY joined_at').all(room) as { id: string; name: string; joined_at: string }[]).map(p => ({ ...p, handle: mentionHandle(p.name) })),
         decision: this.latestDecision(room),
+        coordination: this.coordination.snapshot(room),
       };
     })();
   }
@@ -175,14 +185,15 @@ export class DiscussionStore {
       return { filename: `${room}-r${decision.revision}.md`, markdown, revision: decision.revision };
     })();
   }
-  private checkTurn(room: string, participant: string, body?: string) {
+  private checkTurn(room: string, participant: string, body?: string, readAfter?: number) {
     const { name } = this.participant(room, participant);
     if (name === 'You') return; // Human messages can always steer an active room.
+    this.coordination.beforeContribution(room, participant, readAfter);
     if (body !== undefined && body.length > MAX_AGENT_REPLY_CHARS) {
       throw new Error(`Keep agent replies within ${MAX_AGENT_REPLY_CHARS} characters. Combine only new evidence and your proposed next step.`);
     }
     // Agent control events must neither consume nor unlock a discussion turn.
-    const last = this.db.prepare("SELECT author FROM messages WHERE room = ? AND (kind != 'status' OR author = 'You') ORDER BY id DESC LIMIT 1").get(room) as { author: string } | undefined;
+    const last = this.db.prepare("SELECT author FROM messages WHERE room = ? AND (kind NOT IN ('status', 'coordination') OR author = 'You') ORDER BY id DESC LIMIT 1").get(room) as { author: string } | undefined;
     if (last?.author.trim().toLowerCase() === name.trim().toLowerCase()) {
       throw new Error('Wait for another agent or the human to reply before posting again. Do not retry, rejoin, or post user_direction to bypass the turn limit.');
     }
@@ -199,7 +210,7 @@ export class DiscussionStore {
       .run(room, participant, name, kind, body, replyTo ?? null, request, new Date().toISOString());
     return this.db.prepare('SELECT * FROM messages WHERE id = ?').get(result.lastInsertRowid) as Message;
   }
-  post(room: string, participant: string, request: string, kind: string, body: string, replyTo?: number) {
+  post(room: string, participant: string, request: string, kind: string, body: string, replyTo?: number, readAfter?: number) {
     return this.db.transaction(() => {
       this.participant(room, participant);
       const previous = this.previous(participant, request);
@@ -211,8 +222,11 @@ export class DiscussionStore {
       if (replyTo !== undefined && !this.db.prepare('SELECT id FROM messages WHERE room = ? AND id = ?').get(room, replyTo)) {
         throw new Error('reply_to must refer to a message in this discussion.');
       }
-      this.checkTurn(room, participant, body);
-      return this.insert(room, participant, request, kind, body, replyTo);
+      this.checkTurn(room, participant, body, readAfter);
+      const message = this.insert(room, participant, request, kind, body, replyTo);
+      this.coordination.answered(room, participant);
+      this.coordination.enqueue(room, participant, message.id, body);
+      return message;
     }).immediate();
   }
   status(room: string, participant: string, request: string, status: Room['status'], reason: string) {
@@ -225,10 +239,11 @@ export class DiscussionStore {
         return { event: previous, discussion: this.room(room) };
       }
       this.db.prepare('UPDATE discussions SET status = ? WHERE id = ?').run(status, room);
+      if (status !== 'active') this.coordination.release(room, participant, true);
       return { event: this.insert(room, participant, request, 'status', body), discussion: this.room(room) };
     }).immediate();
   }
-  decide(room: string, participant: string, request: string, expected: number, plan: string, disagreements: string) {
+  decide(room: string, participant: string, request: string, expected: number, plan: string, disagreements: string, readAfter?: number) {
     return this.db.transaction(() => {
       this.participant(room, participant);
       const body = JSON.stringify({ plan, disagreements, expected_revision: expected });
@@ -239,20 +254,65 @@ export class DiscussionStore {
       }
       const current = this.active(room);
       if (current.revision !== expected) throw new Error(`Decision changed: expected revision ${expected}, current ${current.revision}. Read it before revising.`);
-      this.checkTurn(room, participant);
+      this.checkTurn(room, participant, undefined, readAfter);
       const message = this.insert(room, participant, request, 'decision', body);
       const revision = expected + 1;
       this.db.prepare('INSERT INTO decisions VALUES (?, ?, ?, ?, ?)').run(room, revision, message.id, plan, disagreements);
       this.db.prepare('UPDATE discussions SET revision = ? WHERE id = ?').run(revision, room);
+      this.coordination.answered(room, participant);
       return { room, revision, message_id: message.id, plan, disagreements };
+    }).immediate();
+  }
+  activity(room: string, participant: string, activity: 'researching' | 'idle', reason: string, seconds: number) {
+    return this.db.transaction(() => {
+      if (this.participant(room, participant).name === 'You') throw new Error('Research holds belong to agents.');
+      if (activity === 'idle') this.coordination.release(room, participant);
+      else {
+        this.active(room);
+        const current = this.coordination.snapshot(room).research;
+        if (!current || current.participant_id !== participant) {
+          this.checkTurn(room, participant);
+        }
+        if (!reason.trim() || reason.length > 240) throw new Error('Give a research reason of 1 to 240 characters.');
+        if (!Number.isInteger(seconds) || seconds < 30 || seconds > 300) throw new Error('Research holds must last 30 to 300 seconds.');
+        this.coordination.research(room, participant, reason, seconds);
+      }
+      return this.coordination.snapshot(room);
+    }).immediate();
+  }
+  clearCoordination(room: string, participant: string, request: string, action: 'release_research' | 'clear_requests') {
+    return this.db.transaction(() => {
+      if (this.participant(room, participant).name !== 'You') throw new Error('Only the human can clear room coordination.');
+      const previous = this.previous(participant, request);
+      if (previous) {
+        if (previous.kind !== 'coordination' || previous.body !== action) throw new Error('request_id was already used for different content.');
+        return previous;
+      }
+      if (action === 'release_research') this.coordination.release(room, participant, true);
+      else this.coordination.clearRequests(room);
+      return this.insert(room, participant, request, 'coordination', action);
+    }).immediate();
+  }
+  declineRequest(room: string, participant: string, request: string, reason: string, readAfter: number) {
+    return this.db.transaction(() => {
+      this.participant(room, participant);
+      const body = `Declined reply request: ${reason}`;
+      const previous = this.previous(participant, request);
+      if (previous) {
+        if (previous.kind !== 'coordination' || previous.body !== body) throw new Error('request_id was already used for different content.');
+        return { id: previous.id };
+      }
+      this.coordination.decline(room, participant, readAfter);
+      return { id: this.insert(room, participant, request, 'coordination', body).id };
     }).immediate();
   }
   async wait(room: string, after: number, timeoutMs: number, limit: number, signal?: AbortSignal) {
     const deadline = Date.now() + timeoutMs;
+    const initialCoordination = JSON.stringify(this.coordination.snapshot(room));
     while (true) {
       signal?.throwIfAborted();
       const page = this.read(room, after, limit);
-      if (page.messages.length || page.discussion.status !== 'active') return { ...page, timed_out: false };
+      if (page.messages.length || page.discussion.status !== 'active' || JSON.stringify(page.coordination) !== initialCoordination) return { ...page, timed_out: false };
       const remaining = deadline - Date.now();
       if (remaining <= 0) return { ...page, timed_out: true };
       await delay(Math.min(250, remaining), undefined, { signal });
@@ -272,6 +332,7 @@ export function registerCollaborationTools(server: McpServer, dbPath = process.e
   const identity = { room, participant_id: z.string().uuid().describe('ID returned by your join call'), request_id: z.string().min(1).max(100).describe('Unique ID for this write. Reuse it only when retrying identical content.') };
   const cursor = { room, after_id: z.number().int().min(0).default(0).describe('Last message ID actually read, initially 0'), limit: z.number().int().min(1).max(100).default(50), compact: z.boolean().default(true).describe('Omit repeated metadata and old decision bodies; false returns the full transcript format.') };
   const body = z.string().trim().min(1).max(24000);
+  const readAfter = z.number().int().min(0).optional().describe('Last next_after_id read; required to answer while holding the research turn.');
 
   server.tool('collab_list_discussions', 'List shared project discussions. Does not start another agent.', { limit: z.number().int().min(1).max(100).default(30) },
     async ({ limit }) => result(() => get().list(limit)));
@@ -281,8 +342,14 @@ export function registerCollaborationTools(server: McpServer, dbPath = process.e
   server.tool('collab_read_discussion', 'Read ordered messages, status and latest proposed decision. Page until has_more=false before replying. Retain next_after_id.', cursor,
     async ({ room, after_id, limit, compact }) => result(() => { const page = get().read(room, after_id, limit); return compact ? compactPage(page, after_id) : page; }));
   server.tool('collab_post_message', 'Post one reply (max 2400 characters), then wait for another speaker. Relay user steering accurately. No implementation permission.',
-    { ...identity, kind: z.enum(['proposal', 'critique', 'question', 'reply', 'user_direction', 'summary']).default('reply'), body, reply_to: z.number().int().positive().optional() },
-    async ({ room, participant_id, request_id, kind, body, reply_to }) => result(() => { const message = get().post(room, participant_id, request_id, kind, body, reply_to); return { id: message.id, kind: message.kind }; }));
+    { ...identity, kind: z.enum(['proposal', 'critique', 'question', 'reply', 'user_direction', 'summary']).default('reply'), body, reply_to: z.number().int().positive().optional(), read_after_id: readAfter },
+    async ({ room, participant_id, request_id, kind, body, reply_to, read_after_id }) => result(() => { const message = get().post(room, participant_id, request_id, kind, body, reply_to, read_after_id); return { id: message.id, kind: message.kind }; }));
+  server.tool('collab_set_activity', 'Reserve the room while researching (no reply consumed), renew the hold, or release it with idle. Human steering remains open. Read new messages before answering.',
+    { room, participant_id: identity.participant_id, activity: z.enum(['researching', 'idle']), reason: z.string().trim().max(240).default(''), lease_seconds: z.number().int().min(30).max(300).default(120) },
+    async ({ room, participant_id, activity, reason, lease_seconds }) => result(() => get().activity(room, participant_id, activity, reason, lease_seconds)));
+  server.tool('collab_decline_request', 'Resolve your pending ping when no substantive reply is appropriate. Read it first. Does not consume or unlock a discussion turn.',
+    { ...identity, reason: z.string().trim().min(1).max(240), read_after_id: z.number().int().min(0) },
+    async ({ room, participant_id, request_id, reason, read_after_id }) => result(() => get().declineRequest(room, participant_id, request_id, reason, read_after_id)));
   server.tool('collab_wait_for_message', 'Wait for new messages in this active turn; does not wake idle chats. Retain next_after_id; stop after 3 consecutive timeouts or when paused/closed. Never post filler on timeout.',
     { ...cursor, timeout_ms: z.number().int().min(0).max(25000).default(20000) },
     async ({ room, after_id, limit, timeout_ms, compact }, extra) => result(async () => { const page = await get().wait(room, after_id, timeout_ms, limit, extra.signal); return compact ? { ...compactPage(page, after_id), timed_out: page.timed_out } : page; }));
@@ -290,7 +357,7 @@ export function registerCollaborationTools(server: McpServer, dbPath = process.e
     { ...identity, status: z.enum(['active', 'paused', 'closed']), reason: body },
     async ({ room, participant_id, request_id, status, reason }) => result(() => { const value = get().status(room, participant_id, request_id, status, reason); return { id: value.event.id, status: value.discussion.status }; }));
   server.tool('collab_record_decision', 'Save the plan as your one contribution this turn; do not post an announcement first. Not user approval. expected_revision prevents overwrites.',
-    { ...identity, expected_revision: z.number().int().min(0), plan: body, disagreements: z.string().max(24000).default('') },
-    async ({ room, participant_id, request_id, expected_revision, plan, disagreements }) => result(() => { const value = get().decide(room, participant_id, request_id, expected_revision, plan, disagreements) as Decision; return { revision: value.revision, message_id: value.message_id }; }));
+    { ...identity, expected_revision: z.number().int().min(0), plan: body, disagreements: z.string().max(24000).default(''), read_after_id: readAfter },
+    async ({ room, participant_id, request_id, expected_revision, plan, disagreements, read_after_id }) => result(() => { const value = get().decide(room, participant_id, request_id, expected_revision, plan, disagreements, read_after_id) as Decision; return { revision: value.revision, message_id: value.message_id }; }));
   return { close: () => { store?.close(); store = undefined; } };
 }

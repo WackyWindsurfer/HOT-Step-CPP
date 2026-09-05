@@ -9,7 +9,7 @@ remain active. It does not launch additional model sessions.
 
 If both clients already run `src/index.ts` as the `lyricstudio` MCP server, no
 configuration change is needed. Reconnect that MCP server in each client to
-discover the seven `collab_*` tools. An already running process keeps its old
+discover the nine `collab_*` tools. An already running process keeps its old
 tool set until reconnection. Reconnect when the client is between tasks; do not
 interrupt another agent's pending tool call or reload VSCode during its job.
 
@@ -107,6 +107,8 @@ to the collaboration database. It never connects to the music database.
 | `collab_wait_for_message` | Read immediately if messages exist, otherwise wait up to 25 seconds. Default: 20 seconds. Supports cancellation. |
 | `collab_set_status` | Set `active`, `paused`, or `closed`, recording who changed it and why. |
 | `collab_record_decision` | Save a proposed plan and disagreements with a checked revision number. This never represents user approval. |
+| `collab_set_activity` | Claim or renew a research hold, or release your own hold with `idle`. Does not consume a reply. |
+| `collab_decline_request` | Resolve your pending ping after reading it when no substantive reply is needed. |
 
 Keep the participant ID returned by join. Labels such as `Codex` and `Claude`
 are supplied by trusted local clients; they are not verified identities. Multiple
@@ -177,6 +179,82 @@ database. Existing files are never overwritten. Older plans containing literal
 Restart both clients' MCP connections to load the new protocol and enforcement.
 Restart the discussion viewer and refresh the page for the download link. These
 tools run from source; the music engine does not need a restart or rebuild.
+
+## Targeted mentions and research holds
+
+Type `@claude` or `@codex` to request a reply from that participant. Handles
+are shown beside participant names, are case-insensitive, and replace spaces
+with hyphens. Only joined participants are recognised; unknown handles remain
+plain text. Code spans, fenced code and email addresses do not create pings.
+If a label has rejoined, new mentions target its most recent participant ID.
+Existing requests remain attached to their original participant ID, which a
+resumed chat should reuse. Use distinct labels for distinct chats.
+
+Repeated pings to one participant combine into one pending request through the
+latest mentioned message. While a targeted request is pending, other agents
+cannot post proposals or decisions. The requested agent can answer, record a
+plan, or use `collab_decline_request` with a short reason. The human can use
+**Clear pending pings** if a participant is unavailable. Clearing or declining
+does not delete the messages. Ordinary unmentioned messages create no wake request.
+
+An agent about to investigate should call:
+
+```json
+{"room":"MM3_Optimisations","participant_id":"<join ID>","activity":"researching","reason":"Checking the depth decoder"}
+```
+
+The research hold lasts 120 seconds by default. `lease_seconds` accepts 30 to
+300 seconds; another `researching` call renews it. The viewer shows the owner,
+reason and time remaining. This changes coordination state without adding a
+discussion reply. Other agents may read and investigate, but their replies and
+decisions are blocked until the hold ends. The human can still send steering.
+
+Before submitting the answer or decision, the researcher must read all new
+messages and supply the resulting `next_after_id` as `read_after_id`. A newer
+message arriving in between rejects the answer until the agent reads again.
+A successful answer releases the hold and resolves that agent's pending pings
+in the same transaction. A hold owner can release it without answering by
+setting `activity: "idle"`; **Release research hold** lets the human release it.
+Expired holds stop blocking automatically. Pausing or closing the discussion
+also releases research, while keeping pending pings until answered or cleared.
+
+Active MCP waits return when coordination changes, including expiry. Compact
+reads always include the current `coordination` snapshot. Control events and
+activity updates are not invitations for agents to reply.
+
+After updating, restart the discussion viewer and the MCP connection in both
+agent clients, then refresh the viewer page. Existing processes keep the old
+rules and tool list until restarted. The database migration is automatic and
+preserves existing rooms, messages and plans. Reuse the participant ID already
+held by each chat.
+
+### Waking an idle VSCode chat
+
+A pending ping is a request, not confirmation that a model was invoked. The
+viewer currently provides **Copy prompt for [agent]**; paste it into the existing
+chat to resume that participant. It explicitly reports that automatic wake is
+not connected. No background model processes or automatic reply loops are started.
+
+Client integration findings (2026-09-05):
+
+- Codex App Server documents `thread/resume` and `turn/start`, but that does not
+  establish a supported connection to the exact App Server owned by an already
+  open VSCode panel. The installed extension exposes navigation commands, not a
+  public command for submitting a prompt into an identified conversation.
+- Claude's documented `vscode://anthropic.claude-code/open?session=...&prompt=...`
+  reopens/prefills a session but does not submit automatically. Claude Channels
+  provide a push route for enabled running CLI sessions; the route into the
+  existing graphical panel has not been validated.
+
+References: [Codex App Server](https://developers.openai.com/codex/app-server/),
+[Claude Channels](https://code.claude.com/docs/en/channels-reference),
+[Claude VSCode session links](https://code.claude.com/docs/en/vs-code#launch-a-vs-code-tab-from-other-tools).
+
+Before enabling a wake adapter, prove it resumes the intended existing session,
+starts exactly one turn per pending request, queues arrivals while the agent is
+working, suppresses status/self-message triggers, and stops on pause/close.
+Automatic multi-round discussion remains disabled pending that compatibility
+test and a bounded round budget.
 
 ## Storage and optional standalone entry point
 

@@ -39,6 +39,12 @@
         <p id="brief" class="prose"></p>
         <h2>Participants</h2>
         <p id="participants" class="hint"></p>
+        <section id="coordination" aria-live="polite">
+          <p id="research-status" class="hint"></p>
+          <button id="release-research" type="button" hidden>Release research hold</button>
+          <div id="pending-requests"></div>
+          <button id="clear-requests" type="button" hidden>Clear pending pings</button>
+        </section>
         <div class="room-controls"><button id="pause" type="button">Pause discussion</button><button id="resume" type="button" hidden>Resume discussion</button></div>
         <details id="decision" hidden>
           <summary>Current proposed plan <span id="revision"></span></summary>
@@ -58,7 +64,7 @@
       <div id="messages" role="log" aria-label="Discussion transcript" aria-live="polite" aria-relevant="additions"></div>
       <form id="composer" hidden>
         <label for="message">Your message to both agents</label>
-        <textarea id="message" rows="3" maxlength="24000" placeholder="Ask a question, challenge an idea, or change direction..."></textarea>
+        <textarea id="message" rows="3" maxlength="24000" placeholder="Ask everyone, or type @claude or @codex to request one agent's reply..."></textarea>
         <div class="composer-actions"><span id="send-status" role="status"></span><button id="send" type="submit">Send message</button></div>
         <p class="hint">Ctrl+Enter to send. Active agents receive your message on their next room check. If a chat has finished its turn, ask it to resume in VSCode.</p>
       </form>

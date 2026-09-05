@@ -43,7 +43,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
 
     await t.test('tools load without music database; concurrent joins share one room', async () => {
       const tools = await codex.listTools();
-      assert.equal(tools.tools.length, 7);
+      assert.equal(tools.tools.length, 9);
       await assert.rejects(call(codex, 'collab_join_discussion', { room: 'missing', name: 'Codex' }), /brief is required/);
       const joined = await Promise.all([
         call(codex, 'collab_join_discussion', { room, name: 'Codex', brief: 'Review cache design without touching running jobs.' }),
@@ -210,6 +210,18 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
       assert.ok((await codex.listTools()).tools.length);
     });
 
+    await t.test('MCP research activity is visible to the peer and the answer releases it', async () => {
+      const a = await call(codex, 'collab_join_discussion', { room: 'research', name: 'Codex', brief: 'Investigate before replying.' });
+      const b = await call(claude, 'collab_join_discussion', { room: 'research', name: 'Claude' });
+      await call(codex, 'collab_set_activity', { room: 'research', participant_id: a.participant_id, activity: 'researching', reason: 'Checking actual graph allocation.' });
+      const page = await call(claude, 'collab_read_discussion', { room: 'research' });
+      assert.equal(page.coordination.research.name, 'Codex');
+      assert.equal(page.messages.length, 0);
+      await assert.rejects(call(claude, 'collab_post_message', { room: 'research', participant_id: b.participant_id, request_id: 'too-soon', body: 'My proposal' }), /researching/);
+      await call(codex, 'collab_post_message', { room: 'research', participant_id: a.participant_id, request_id: 'answer', body: 'Graph allocation is cached.', read_after_id: page.next_after_id });
+      assert.equal((await call(claude, 'collab_read_discussion', { room: 'research' })).coordination.research, null);
+    });
+
     await t.test('restart preserves transcript, identities, decisions, and closed state', async () => {
       await call(codex, 'collab_set_status', { room, participant_id: codexId, request_id: 'close', status: 'closed', reason: 'Review completed.' });
       const before = await call(codex, 'collab_read_discussion', { room });
@@ -217,7 +229,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
       const restarted = await connect('test-restarted');
       assert.deepEqual(await call(restarted, 'collab_read_discussion', { room }), before);
       const listed = await call(restarted, 'collab_list_discussions', {});
-      assert.equal(listed.length, 3);
+      assert.equal(listed.length, 4);
       await assert.rejects(post(restarted, codexId, 'closed-post', 'Must fail'), /closed/);
     });
   } finally {

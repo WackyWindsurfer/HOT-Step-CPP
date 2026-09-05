@@ -35,6 +35,8 @@ function updateControls() {
   byId('resume').hidden = roomStatus === 'active';
   byId('pause').disabled = sending;
   byId('resume').disabled = sending;
+  byId('release-research').disabled = sending;
+  byId('clear-requests').disabled = sending;
   for (const id of ['create', 'new-room-name', 'new-room-brief']) byId(id).disabled = sending;
   byId('invite').hidden = !selectedRoom;
   const invitation = `Join MCP discussion room "${selectedRoom}" as this chat's agent. Read the brief and discussion with compact reads. Aim for 150 words: only new evidence, disagreements or the next decision. Post once, then wait for another speaker; a plan revision counts as your turn. Stop at consensus. Planning only.`;
@@ -133,17 +135,19 @@ byId('composer').addEventListener('submit', event => {
 });
 byId('pause').addEventListener('click', () => void write('status', 'User paused the discussion from the group chat.', 'paused'));
 byId('resume').addEventListener('click', () => void write('status', 'User resumed the discussion from the group chat.', 'active'));
+byId('release-research').addEventListener('click', () => void write('coordination', 'User released the research hold.', undefined, 'release_research'));
+byId('clear-requests').addEventListener('click', () => void write('coordination', 'User cleared the pending pings.', undefined, 'clear_requests'));
 
-async function write(endpoint, body, status) {
+async function write(endpoint, body, status, action) {
   if (sending || !selectedRoom || !body) return;
   sending = true;
   updateControls();
   const room = selectedRoom;
   const key = `hotstep-pending:${room}:${endpoint}`;
-  const content = { participant_id: identity(room), body, ...(status ? { status } : {}) };
+  const content = { participant_id: identity(room), body, ...(status ? { status } : {}), ...(action ? { action } : {}) };
   let pending;
   try { pending = JSON.parse(saved(key) || 'null'); } catch { /* Replace an invalid saved request. */ }
-  if (!pending || pending.body !== body || pending.status !== status || pending.participant_id !== content.participant_id) {
+  if (!pending || pending.body !== body || pending.status !== status || pending.action !== action || pending.participant_id !== content.participant_id) {
     pending = { ...content, request_id: crypto.randomUUID() };
   }
   saved(key, JSON.stringify(pending));
@@ -158,10 +162,10 @@ async function write(endpoint, body, status) {
     if (endpoint === 'messages') {
       byId('message').value = '';
       saved(`hotstep-draft:${room}`, '');
-    } else {
+    } else if (endpoint === 'status') {
       roomStatus = result.discussion.status;
     }
-    byId('send-status').textContent = endpoint === 'messages' ? 'Posted to the room.' : `Discussion ${roomStatus}.`;
+    byId('send-status').textContent = endpoint === 'messages' ? 'Posted to the room.' : endpoint === 'coordination' ? 'Room controls updated.' : `Discussion ${roomStatus}.`;
     // Keep the read cursor unchanged so concurrent agent posts are not skipped.
     clearTimeout(timer);
     void poll();
@@ -198,6 +202,7 @@ function renderMessage(message) {
   const author = node('span', 'author', message.author);
   author.title = `Participant ${message.participant_id}`;
   meta.append(author, node('span', 'badge', message.kind.replaceAll('_', ' ')));
+  if (message.mentions?.length) meta.append(node('span', 'badge', `For ${message.mentions.map(p => p.name).join(', ')}`));
   const permalink = node('a', 'message-id', `#${message.id}`);
   permalink.href = `#message-${message.id}`;
   meta.append(permalink);
@@ -229,6 +234,34 @@ async function get(url) {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
+}
+
+let coordinationSignature = '';
+function renderCoordination(value) {
+  const { research, requests = [] } = value || {};
+  byId('research-status').textContent = research
+    ? `${research.name} is researching: ${research.reason} (${Math.max(0, Math.ceil((research.expires_at - Date.now()) / 1000))}s remaining). Agent replies are on hold; you can still send directions.`
+    : 'No research hold.';
+  byId('release-research').hidden = !research;
+  byId('clear-requests').hidden = !requests.length;
+  const signature = JSON.stringify([selectedRoom, requests, roomStatus]);
+  if (signature === coordinationSignature) return;
+  coordinationSignature = signature;
+  const list = byId('pending-requests');
+  list.replaceChildren();
+  for (const request of requests) {
+    const box = node('div', 'pending-request');
+    box.append(node('p', 'hint', `Reply requested from ${request.name} through message #${request.message_id}. ${roomStatus !== 'active' ? 'Room is paused or closed.' : 'Automatic wake is not connected; resume its chat if idle.'}`));
+    const button = node('button', '', `Copy prompt for ${request.name}`);
+    button.type = 'button';
+    const prompt = `Resume your participation in MCP room "${selectedRoom}". You were requested at message #${request.message_id}. Read all unread messages and coordination state, respect research holds, then make at most one concise contribution if appropriate. Reuse your participant ID if this chat has one. This requests discussion only.`;
+    button.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(prompt); button.textContent = 'Copied'; }
+      catch { const field = node('textarea'); field.value = prompt; field.readOnly = true; box.append(field); field.focus(); field.select(); }
+    });
+    box.append(button);
+    list.append(box);
+  }
 }
 
 async function poll() {
@@ -263,7 +296,8 @@ async function poll() {
       }
       roomStatus = page.discussion.status;
       updateControls();
-      byId('participants').textContent = page.participants.map(p => p.name).join(', ') || 'No participants';
+      byId('participants').textContent = [...new Set(page.participants.map(p => p.name === 'You' ? 'You' : `${p.name} (@${p.handle})`))].join(', ') || 'No participants';
+      renderCoordination(page.coordination);
       byId('decision').hidden = !page.decision;
       if (page.decision) {
         byId('export-plan').href = `/api/discussions/${encodeURIComponent(room)}/plan.md`;
