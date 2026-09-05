@@ -513,16 +513,6 @@ export const TrainLmForm: React.FC<Props> = ({
               onChange={(e) => onChange({ prefixN: num(e.target.value, 0) })} className={FIELD} />
           </label>
         </div>
-        <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300 mt-1">
-          <input type="checkbox" checked={value.rslora} disabled={lock} className="accent-amber-500"
-            onChange={(e) => onChange({ rslora: e.target.checked })} />
-          {P('rslora', 'Default off', CHECK_LABEL)}
-        </label>
-        <label className="flex flex-col gap-1.5">
-          {P('loraPlusRatio', 'Default 1 = off · paper 16 · AdamW/Prodigy only')}
-          <input type="number" min={1} max={64} step={1} value={value.loraPlusRatio} disabled={lock}
-            onChange={(e) => onChange({ loraPlusRatio: Math.max(1, num(e.target.value, 1)) })} className={FIELD} />
-        </label>
         <span className="text-[11px] text-zinc-500">{t('trainingStudio.train.softPromptGroupHelp')}</span>
       </div>
       )}
@@ -665,7 +655,7 @@ export const TrainLmForm: React.FC<Props> = ({
           )}
 
           <div className="flex flex-col gap-1.5">
-            {P('lm.adapterType', 'Default LoKr · LoRA remains fully supported')}
+            {P('lm.adapterType', 'Default LoRA')}
             <StyledSelect
               accent="amber"
               value={value.adapterType}
@@ -678,6 +668,24 @@ export const TrainLmForm: React.FC<Props> = ({
             />
             <span className="text-[11px] text-zinc-500">{t('trainingStudio.train.lm.adapterTypeHint')}</span>
           </div>
+
+          {/* LoRA-family options next to the type they modify (moved out of the
+              soft-prompt group, 2026-09-05). The LM trainer has LoRA and LoKr
+              only; DoRA / HiRA / LoHa / HRA / PiSSA exist for the DiT. */}
+          {value.adapterType === 'lora' && (
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-zinc-200 dark:border-white/5 px-3 py-2">
+              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+                <input type="checkbox" checked={value.rslora} disabled={lock} className="accent-amber-500"
+                  onChange={(e) => onChange({ rslora: e.target.checked })} />
+                {P('rslora', 'Default off', CHECK_LABEL)}
+              </label>
+              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+                {P('loraPlusRatio', 'Default 1 = off · paper 16 · AdamW/Prodigy only', CHECK_LABEL)}
+                <input type="number" min={1} max={64} step={1} value={value.loraPlusRatio} disabled={lock}
+                  onChange={(e) => onChange({ loraPlusRatio: Math.max(1, num(e.target.value, 1)) })} className={`${FIELD} w-20`} />
+              </label>
+            </div>
+          )}
 
           {value.adapterType === 'lokr' && (
             <label className="flex flex-col gap-1.5">

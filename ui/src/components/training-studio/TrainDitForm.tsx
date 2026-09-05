@@ -290,6 +290,26 @@ export const TRAIN_DIT_LOKR_DEFAULTS: TrainDitFormState = {
 /** Which unit to show `crop` in. State, not a pure derivation: once the box holds
  *  a number, seconds and frames are the same value and only the user's last
  *  choice distinguishes them. This is the seed for that state. */
+/** What the adapter-type row offers. LoKR is its own adapter type; the other
+ *  five are the LoRA type with one parameterization flag set, so the wire
+ *  format is unchanged (adapterType 'lora' + dora/hira/loha/hra) and every
+ *  existing preset, route and loader keeps working. Rob, 2026-09-05: "they
+ *  should all be available" — as first-class choices, not checkboxes under
+ *  Advanced. */
+export type DitMethod = 'lokr' | 'lora' | 'dora' | 'hira' | 'loha' | 'hra';
+const methodOf = (s: TrainDitFormState): DitMethod =>
+  s.adapterType === 'lokr' ? 'lokr' : s.dora ? 'dora' : s.hira ? 'hira' : s.loha ? 'loha' : s.hra ? 'hra' : 'lora';
+/** i18n suffixes under trainingStudio.train.dit.* for each method's button
+ *  label and hover text. */
+const METHOD_KEYS: Record<DitMethod, { label: string; info: string }> = {
+  lokr: { label: 'adapterTypeLokr', info: 'adapterTypeInfo' },
+  lora: { label: 'adapterTypeLora', info: 'adapterTypeInfo' },
+  dora: { label: 'dora', info: 'doraInfo' },
+  hira: { label: 'hira', info: 'hiraInfo' },
+  loha: { label: 'loha', info: 'lohaInfo' },
+  hra:  { label: 'hra',  info: 'hraInfo' },
+};
+
 const deriveCropMode = (state: TrainDitFormState): CropMode => {
   if (state.crop === 0) return 'auto';
   // The LoKR window is authored in seconds, so show it in seconds.
@@ -440,6 +460,27 @@ export const TrainDitForm: React.FC<Props> = ({
     onChange({ ...defaults, adapterName: value.adapterName });
   };
 
+  // The five LoRA-family methods differ by one flag; hopping in from LoKR is
+  // the same whole-form reset pickType does, then the flag. PiSSA is a
+  // plain-LoRA init and rsLoRA has no meaning for reflections, so both drop
+  // when the method they cannot apply to is picked.
+  const method = methodOf(value);
+  const pickMethod = (m: DitMethod) => {
+    if (m === method) return;
+    if (m === 'lokr') { pickType('lokr'); return; }
+    const flags = {
+      dora: m === 'dora', hira: m === 'hira', loha: m === 'loha', hra: m === 'hra',
+      pissa: m === 'lora' ? value.pissa : false,
+      rslora: m === 'hra' ? false : value.rslora,
+    };
+    if (value.adapterType === 'lokr') {
+      setCropMode(deriveCropMode(TRAIN_DIT_DEFAULTS));
+      onChange({ ...TRAIN_DIT_DEFAULTS, adapterName: value.adapterName, ...flags });
+    } else {
+      onChange(flags);
+    }
+  };
+
   const pickCropMode = (mode: CropMode) => {
     setCropMode(mode);
     if (mode === 'auto') {
@@ -492,30 +533,60 @@ export const TrainDitForm: React.FC<Props> = ({
 
   return (
     <div className="flex flex-col gap-4">
-      {/* ── Adapter type (K1: LoKR is the default) ──────────────────────── */}
+      {/* ── Adapter type / method (K1: LoKR is the default) ──────────────
+          One row for everything the trainer can build. LoKR is its own type;
+          DoRA, HiRA, LoHa and HRA are LoRA + one parameterization flag (see
+          DitMethod). PiSSA, rsLoRA and LoRA+ modify a LoRA-family method and
+          sit underneath. Measurements behind each hover text:
+          docs/plans/adapter-parameterizations-roadmap.md. */}
       <div className="flex flex-col gap-1.5">
         {P('adapterType', 'Default LoKR')}
-        <div className="flex items-center gap-1.5">
-          {(['lokr', 'lora'] as DitAdapterType[]).map(ty => {
-            const active = value.adapterType === ty;
+        <div className="flex flex-wrap items-center gap-1.5">
+          {(['lokr', 'lora', 'dora', 'hira', 'loha', 'hra'] as DitMethod[]).map(m => {
+            const active = method === m;
             return (
               <button
-                key={ty}
+                key={m}
                 type="button"
                 disabled={lock}
-                onClick={() => pickType(ty)}
+                onClick={() => pickMethod(m)}
+                title={t(`trainingStudio.train.dit.${METHOD_KEYS[m].info}`)}
                 className={`px-4 py-1.5 rounded-lg text-xs font-bold border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
                   active
                     ? 'text-amber-500 bg-amber-500/10 border-amber-500/30'
                     : 'text-zinc-500 border-zinc-300 dark:border-white/10 hover:text-zinc-700 dark:hover:text-zinc-300'
                 }`}
               >
-                {ty === 'lokr' ? t('trainingStudio.train.dit.adapterTypeLokr') : t('trainingStudio.train.dit.adapterTypeLora')}
+                {t(`trainingStudio.train.dit.${METHOD_KEYS[m].label}`)}
               </button>
             );
           })}
         </div>
         <span className="text-[11px] text-zinc-500">{t('trainingStudio.train.dit.adapterTypeHelp')}</span>
+        {!isLokr && (
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-zinc-200 dark:border-white/5 px-3 py-2 mt-1">
+            <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+              <input type="checkbox" checked={value.pissa} disabled={lock || method !== 'lora'} className="accent-amber-500"
+                onChange={(e) => onChange({ pissa: e.target.checked })} />
+              {P('pissa', method === 'lora' ? 'Default off' : 'Plain LoRA only', CHECK_LABEL)}
+            </label>
+            <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+              <input type="checkbox" checked={value.rslora} disabled={lock || method === 'hra'} className="accent-amber-500"
+                onChange={(e) => onChange({ rslora: e.target.checked })} />
+              {P('rslora', method === 'hra' ? 'Not with HRA' : 'Default off', CHECK_LABEL)}
+            </label>
+            <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+              {P('loraPlusRatio', 'Default 1 = off · paper 16 · AdamW/Prodigy only', CHECK_LABEL)}
+              <input
+                type="number" min={1} max={64} step={1}
+                value={value.loraPlusRatio} disabled={lock}
+                onChange={(e) => onChange({ loraPlusRatio: Math.max(1, num(e.target.value, 1)) })}
+                className={`${FIELD} w-20`}
+              />
+            </label>
+            <span className="basis-full text-[11px] text-zinc-500">{t('trainingStudio.train.dit.paramGroupHelp')}</span>
+          </div>
+        )}
       </div>
 
       {/* ── Base model (read-only) ────────────────────────────────────── */}
@@ -720,7 +791,7 @@ export const TrainDitForm: React.FC<Props> = ({
           ) : (
             <>
               <label className="flex flex-col gap-1.5">
-                {P('rank', 'Default 128 · 1–256')}
+                {P('rank', method === 'hra' ? 'Reflections · even · 2–256' : 'Default 128 · 1–256')}
                 <input
                   type="number" min={1} max={256} step={1}
                   value={value.rank} disabled={lock}
@@ -1202,56 +1273,6 @@ export const TrainDitForm: React.FC<Props> = ({
             {P('targetMlp', 'Default on', CHECK_LABEL)}
           </label>
           <span className="text-[11px] text-zinc-500 pl-6">{t('trainingStudio.train.dit.targetMlpHelp')}</span>
-
-          {/* ── Parameterization (2026-09-04) ── DoRA / HiRA / LoHa reshape the
-              update and exclude each other; rsLoRA and LoRA+ stack with any.
-              Each is gated by finite differences (T4) and a merge check, not
-              by ear — docs/plans/adapter-parameterizations-roadmap.md. */}
-          {!isLokr && (
-            <div className="flex flex-col gap-2 rounded-lg border border-zinc-200 dark:border-white/5 px-3 py-2.5 mt-1">
-              <span className="text-[11px] uppercase tracking-wide text-zinc-500">{t('trainingStudio.train.dit.paramGroup')}</span>
-              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
-                <input type="checkbox" checked={value.dora} disabled={lock} className="accent-amber-500"
-                  onChange={(e) => onChange({ dora: e.target.checked, hira: false, loha: false, hra: false })} />
-                {P('dora', 'Default off', CHECK_LABEL)}
-              </label>
-              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
-                <input type="checkbox" checked={value.hira} disabled={lock} className="accent-amber-500"
-                  onChange={(e) => onChange({ hira: e.target.checked, dora: false, loha: false, hra: false })} />
-                {P('hira', 'Default off · merge mode only', CHECK_LABEL)}
-              </label>
-              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
-                <input type="checkbox" checked={value.loha} disabled={lock} className="accent-amber-500"
-                  onChange={(e) => onChange({ loha: e.target.checked, dora: false, hira: false, hra: false })} />
-                {P('loha', 'Default off · merge mode only', CHECK_LABEL)}
-              </label>
-              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
-                <input type="checkbox" checked={value.hra} disabled={lock} className="accent-amber-500"
-                  onChange={(e) => onChange({ hra: e.target.checked, dora: false, hira: false, loha: false, pissa: false, rslora: false })} />
-                {P('hra', 'Default off · rank = reflections, even', CHECK_LABEL)}
-              </label>
-              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
-                <input type="checkbox" checked={value.pissa} disabled={lock || value.dora || value.hira || value.loha} className="accent-amber-500"
-                  onChange={(e) => onChange({ pissa: e.target.checked })} />
-                {P('pissa', 'Default off · plain LoRA only', CHECK_LABEL)}
-              </label>
-              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
-                <input type="checkbox" checked={value.rslora} disabled={lock} className="accent-amber-500"
-                  onChange={(e) => onChange({ rslora: e.target.checked })} />
-                {P('rslora', 'Default off', CHECK_LABEL)}
-              </label>
-              <label className="flex flex-col gap-1.5">
-                {P('loraPlusRatio', 'Default 1 = off · paper 16 · AdamW/Prodigy only')}
-                <input
-                  type="number" min={1} max={64} step={1}
-                  value={value.loraPlusRatio} disabled={lock}
-                  onChange={(e) => onChange({ loraPlusRatio: Math.max(1, num(e.target.value, 1)) })}
-                  className={FIELD}
-                />
-              </label>
-              <span className="text-[11px] text-zinc-500">{t('trainingStudio.train.dit.paramGroupHelp')}</span>
-            </div>
-          )}
 
           <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
             <input
