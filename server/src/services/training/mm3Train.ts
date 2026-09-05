@@ -564,10 +564,16 @@ export const MM3_LM_DEFAULTS = {
    *  never arrives on the slow ones — which is what the 1000-step cap is for.
    *  It sits just above the ~0.05 mark where runs had demonstrably memorised
    *  their songs, and for an ALBUM CLONE that is the intended end of the range.
-   *  It is still not a checkpoint picker: the ear ladder decides that, and the
-   *  checkpoint that sounds right has landed 1-8x later than the held-out
-   *  minimum every time it has been walked. */
-  targetLoss: 0.1,
+   *
+   *  1.0 since 2026-09-05 (Rob), from a blind depth ladder on alk3_crimson:
+   *  the step-250 checkpoint (5-epoch mean ~1.06) beat the step-500 one
+   *  (0.25 at the save, 0.08 at the best step) on every one of three songs,
+   *  and the step-500 checkpoint emitted an empty plan (EOS at once) on one
+   *  of them — the same likeness-up-then-coherence-collapse curve the AS1.5
+   *  planner shows below ~1. 0.1 trained straight past the crossover. The
+   *  every-50 checkpoints still give the ear ladder; this just stops the run
+   *  where the ladder has been landing. */
+  targetLoss: 1.0,
   /** 'train' is available on every run. 'eval' is the number that means the
    *  adapter GENERALISES rather than memorised, but it only lands on eval
    *  steps, so with the default evalEvery of 250 it fires at most once in a

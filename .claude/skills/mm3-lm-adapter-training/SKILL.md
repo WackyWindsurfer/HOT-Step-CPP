@@ -447,8 +447,14 @@ rank. Do not assume the rank-64 optimum transfers.
 the Training Studio exposes it as **Train until: Target loss**. `--steps` stays
 the hard cap in that mode, so a target that never arrives still ends the run.
 
-**Defaults as of 2026-08-27: target loss 0.1 on the training metric, cap 1000
-steps.** Measured trajectories at the shipped recipe (5-epoch mean):
+**Defaults as of 2026-09-05: target loss 1.0 on the training metric, cap 1000
+steps.** It was 0.1 from 2026-08-27 until a blind depth ladder on alk3_crimson
+(3 songs, base + checkpoints 100/250/500) showed the step-250 checkpoint
+(5-epoch mean ~1.06) beating step 500 (0.25 saved, 0.08 best) on every song,
+with the step-500 checkpoint emitting an empty plan on one of them. Below ~1
+the planner memorises and its plans degenerate (early EOS, droning intros),
+exactly as the AS1.5 planner does. Measured trajectories at the shipped recipe
+(5-epoch mean):
 
 | step | 25 | 100 | 250 | 500 |
 |---|---|---|---|---|

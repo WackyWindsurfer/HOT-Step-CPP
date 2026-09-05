@@ -170,7 +170,7 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
   const form: FormState | null = status ? {
     steps: status.defaults.steps ?? 800,
     stopMode: status.defaults.stopMode ?? 'steps',
-    targetLoss: status.defaults.targetLoss ?? 0.4,
+    targetLoss: status.defaults.targetLoss ?? 1.0,
     targetLossMetric: status.defaults.targetLossMetric ?? 'train',
     targetLossEpochs: status.defaults.targetLossEpochs ?? 5,
     saveEvery: status.defaults.saveEvery ?? 100,
