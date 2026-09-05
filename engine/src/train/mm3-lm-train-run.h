@@ -641,6 +641,12 @@ struct MM3EmbedCtx {
     // caption long enough to be cut.
     ggml_tensor *      t_art = nullptr;
     int                art_k = 0;
+    // Stream position of this embedding's first prompt id. 0 for the training
+    // window and the FD check; the KV prefill sets it per chunk, because a
+    // prompt longer than --prefix-chunk is embedded in pieces and the token
+    // span [0, art_k) may fall in a later piece, be split across two, or be
+    // absent from a chunk altogether.
+    int64_t            art_off = 0;
 };
 
 static ggml_tensor * mm3_lm_build_embed(ggml_context * ctx, const MM3EmbedCtx & e) {
@@ -673,8 +679,19 @@ static ggml_tensor * mm3_lm_build_embed(ggml_context * ctx, const MM3EmbedCtx & 
     // sources still need no gradient and it is never differentiated.
     if (e.t_art && e.art_k > 0 && e.P > 0) {
         GGML_ASSERT(e.t_art->ne[0] == H && e.t_art->ne[1] == e.art_k);
-        GGML_ASSERT(e.P >= e.art_k && "the prompt was clipped shorter than the artist token span");
-        out = ggml_acc(ctx, out, e.t_art, out->nb[1], out->nb[2], out->nb[3], 0);
+        // The part of the token span [0, art_k) that lies inside this
+        // embedding's prompt ids [art_off, art_off + P). Whole span at
+        // offset 0 is the common case (the window, the FD check, and a
+        // prefill whose first chunk holds the whole prompt); the slices are
+        // the prefill chunks of a long prompt.
+        const int64_t lo = std::min<int64_t>(e.art_off, e.art_k);
+        const int64_t hi = std::min<int64_t>(e.art_k, e.art_off + e.P);
+        if (lo == 0 && hi == e.art_k) {
+            out = ggml_acc(ctx, out, e.t_art, out->nb[1], out->nb[2], out->nb[3], 0);
+        } else if (hi > lo) {
+            ggml_tensor * span = ggml_view_2d(ctx, e.t_art, H, hi - lo, e.t_art->nb[1], (size_t) lo * e.t_art->nb[1]);
+            out = ggml_acc(ctx, out, span, out->nb[1], out->nb[2], out->nb[3], 0);
+        }
     }
     return out;
 }
@@ -735,6 +752,7 @@ static ggml_tensor * mm3_lm_prefix_embed(ggml_context * ctx, void * user, int64_
     e.t_ac        = c.t_ac;
     e.P           = p_n;
     e.Fin         = f_n;
+    e.art_off     = i0;   // this chunk's first prompt id sits at stream position i0
     return mm3_lm_build_embed(ctx, e);
 }
 
