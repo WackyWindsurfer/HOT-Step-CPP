@@ -81,10 +81,23 @@ Nothing on the LM side has been rendered at all — every gate that ran here is
 a finite-difference probe or an export/load round trip through the runtime
 loader, never audio. Do not read "passed its gate" as "sounds better".
 
-Two open bugs, neither fixed as of this writing: HiRA's finite-difference gate
-fails at the CLI's default epsilon on a full 36-layer graph (worst relative
-error 3.3e-2 against a 2e-2 bar; passes at `--fd-eps 0.05`, which is not the
-default); and a full-depth 10-step HiRA run at the default rank (64) crashes
+HiRA used to fail its finite-difference gate at the CLI's default epsilon
+(worst relative error 3.3e-2 against a 2e-2 bar, passing only at `--fd-eps
+0.05`). That was the ESTIMATOR, not the gradient, and it is fixed: `--fd-eps`
+is now a floor on the step rather than the step itself, and any probe whose
+loss change `2*eps*||g||` would land under 256 F32 ULPs of the loss gets a
+bigger one — the rule `train-dit`'s own T4 gate has always used. HiRA's delta
+is `W (.) (s B A)`, so its factor gradients come out 16x to 68x smaller than a
+plain LoRA's on the same sites, and the forward's fixed quantisation floor
+(~3.5e-7 on the loss, measured) showed up in its relative error 50x magnified.
+Sweeping eps from 0.005 to 2.0 on the failing probe moved it 0.059 -> 0.0001:
+an error that shrinks as the step grows is arithmetic, not a wrong backward,
+and the checkpointed-vs-naive route comparison passed at 4.2e-7 throughout.
+All seven arms now pass `--fd-check 8 --f32-layers 2` at the default epsilon
+(worst 0.0070, PiSSA); LoRA, rsLoRA, DoRA and PiSSA are unchanged to the last
+printed digit, because the floor only raises a step that was under it.
+
+One open bug: a full-depth 10-step HiRA run at the default rank (64) crashes
 before step 1 with a ggml `cgraph->n_nodes < cgraph->size` assert — the
 finite-difference gate only ever exercised a 2-layer, F32-isolated slice, so
 it never saw the full graph's node count.

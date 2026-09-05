@@ -180,10 +180,12 @@ DoRA/HiRA/LoHa; HRA excludes everything including rsLoRA and needs an even
 `--rank`) — plus two soft-prompt flags that now reach MM3 generation as well
 as training: `--artist-token`/`--artist-token-k`/`--artist-token-lr` and
 `--prefix-n` (a **trained** KV prefix, distinct from `--prefix-frames` above,
-which is frozen history with no gradient). All of it passes its
-finite-difference gate except HiRA, which needs `--fd-eps 0.05` to clear the
-default bar on a full 36-layer graph; a default-rank (64) HRA run separately
-crashes before step 1 on the full graph (`ggml` `cgraph->n_nodes <
+which is frozen history with no gradient). All seven arms pass their
+finite-difference gate at the default epsilon since 2026-09-05, when `--fd-eps`
+became a floor on the step rather than the step (HiRA's gradients are 16-68x
+smaller than a plain LoRA's, so a fixed step measured it at 50x worse
+signal-to-noise — the estimator, not the backward). A default-rank (64) HRA run
+separately crashes before step 1 on the full graph (`ggml` `cgraph->n_nodes <
 cgraph->size` assert) despite passing its FD gate on an isolated 2-layer
 slice. `--prefix-n` and prior preservation (`--reg-*`) are mutually
 exclusive — a trained prefix is non-zero from init, and prior capture needs

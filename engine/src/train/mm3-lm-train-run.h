@@ -965,6 +965,12 @@ static bool mm3_lm_load_samples(const MM3LmTrainArgs & a, const MM3TrainLm & t,
 // catches every failure that matters: a wrong sign flips the numeric value
 // negative, a wrong scale shows up directly in the ratio, and a structurally
 // zero gradient gives ||g|| = 0 with a non-zero measured change.
+//
+// "Thousands of times the noise floor" is true of a plain LoRA and NOT of every
+// parameterization — HiRA's gradients are 50x smaller on the same sites, which
+// put its loss change ~30x above the floor and failed the gate on arithmetic.
+// `--fd-eps` is therefore a FLOOR on the step, not the step: see the step-floor
+// block by the probe loop for the measurement and the rule.
 static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps, int64_t frames,
                                int64_t prompt_cap, int f32_layers) {
 #ifdef _WIN32
@@ -1530,11 +1536,72 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         }
     }
 
+    // ── THE STEP IS PER PROBE, and `eps` is only its floor ─────────────────
+    //
+    // What has to clear the forward's own resolution is not the step on the
+    // PARAMETER, it is the LOSS CHANGE that step produces — and along the unit
+    // gradient direction that is exactly `2 * eps * ||g||`. So a fixed eps
+    // measures every probe at a different signal-to-noise ratio, in direct
+    // proportion to its gradient norm.
+    //
+    // That is not a theoretical worry, it is what broke the HiRA gate. HiRA's
+    // delta is `W (.) (s B A)`, i.e. a plain LoRA's delta scaled entrywise by
+    // the frozen weight, so its factor gradients come out 16x to 68x smaller
+    // than the same site's under plain LoRA (measured, this fixture, all eight
+    // probes). Same graph, same data, same probe list — only the parameter
+    // scale differs.
+    //
+    // The forward here is bit-deterministic (|l1 - l0| is exactly 0 above), so
+    // its floor is not variance, it is QUANTISATION: the logits come back as
+    // F32 and no amount of repeating moves them. Central-differencing divides
+    // that fixed floor by 2*eps, which puts a fixed ABSOLUTE error on `num` —
+    // and a fixed absolute error is a relative failure only where ||g|| is
+    // small. Measured on the oasis_morningglory fixture, rank 4, 2 F32 layers,
+    // eight probes per arm, at the CLI's default eps 1e-2:
+    //
+    //   |num - ||g|||   plain LoRA 2.6e-6 .. 2.9e-5   HiRA 1.2e-6 .. 1.8e-5
+    //
+    // The same band for both. Only `rel` differs, because HiRA divides it by a
+    // gradient norm 50x smaller. Sweeping eps over 0.005 .. 2.0 on HiRA's worst
+    // probe (||g|| 5.5e-4) settles it:
+    //
+    //   eps    0.005  0.01   0.02   0.05   0.1    0.2    0.5    1.0    2.0
+    //   rel    0.059  0.033  0.007  0.000  0.003  0.003  0.000  0.000  0.000
+    //
+    // The error SHRINKS as the step grows and flips sign along the way. A wrong
+    // backward does neither: it misses by a factor, the same factor at every
+    // eps. Plain LoRA on the same probes runs the other way — flat to eps 0.2,
+    // then 0.021 / 0.076 / 0.202 at 0.5 / 1.0 / 2.0, the eps^2 truncation the
+    // 2e-2 bar was set against. Both arms collapse onto one curve in the loss
+    // change: rel ~ 3.5e-7 / (2*eps*||g||) on the rounding side, for every
+    // parameterization. So HiRA's 3.3e-2 was the ESTIMATOR, and the fix belongs
+    // in the estimator.
+    //
+    // Hence a floor on the loss change rather than a bigger bar for HiRA. It is
+    // the rule train-dit's own T4 gate already uses ("steps are chosen so the
+    // loss moves by a target amount, not by a fixed h", dit-selftest.h) in its
+    // cheapest form: raise eps only for a probe whose loss change would sit
+    // under `dl_min`, and leave every other probe on exactly the step it had —
+    // so the LoRA, DoRA, LoHa and PiSSA numbers are untouched, bit for bit.
+    //
+    // dl_min = 256 F32 ULPs of the loss. The measured floor is ~3.5e-7 on a
+    // loss of 11.5, i.e. ~0.4 ULP, so 256 ULPs caps the rounding term at ~1.5e-3
+    // — an order of magnitude inside the 2e-2 bar — while staying far below the
+    // ~2e-2 loss change where truncation starts to bite. Expressed in ULPs
+    // rather than as an absolute so it follows a fixture whose loss sits
+    // somewhere else.
+    const double l_ulp =
+        (double) std::nextafterf((float) std::abs(l0), 3.4e38f) - (double) (float) std::abs(l0);
+    const double dl_min = 256.0 * l_ulp;
+    fprintf(stderr, "[mm3-fd] step floor: dL >= %.2e (256 F32 ULPs of the loss); a probe whose "
+                    "2*eps*||g|| clears it keeps eps %.3g\n", dl_min, eps);
+
     // ── numeric: directional derivative along v = g/||g|| ──
-    fprintf(stderr, "\n[mm3-fd] %-26s %10s %13s %13s %8s\n", "probe (whole tensor)", "n", "||g||",
-            "numeric", "rel");
+    fprintf(stderr, "\n[mm3-fd] %-26s %10s %13s %9s %13s %8s\n", "probe (whole tensor)", "n", "||g||",
+            "step", "numeric", "rel");
     int                 n_bad = 0;
     double              worst = 0.0;
+    int                 n_raised = 0;
     std::vector<double> fd_rel;
     bool                gate_fd_ran = false, gate_fd_pass = false;
     for (size_t i = 0; i < probes.size(); i++) {
@@ -1546,25 +1613,32 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         for (float x : g) norm2 += (double) x * (double) x;
         const double gnorm = std::sqrt(norm2);
 
+        // The whole of the adaptive rule.
+        double h = eps;
+        if (gnorm > 0.0 && 2.0 * eps * gnorm < dl_min) {
+            h = dl_min / (2.0 * gnorm);
+            n_raised++;
+        }
+
         std::vector<float> w0((size_t) ggml_nelements(par)), wtmp(w0.size());
         ggml_backend_tensor_get(par, w0.data(), 0, w0.size() * sizeof(float));
 
         double num = std::nan("");
         if (gnorm > 0.0) {
-            for (size_t k = 0; k < w0.size(); k++) wtmp[k] = (float) (w0[k] + eps * g[k] / gnorm);
+            for (size_t k = 0; k < w0.size(); k++) wtmp[k] = (float) (w0[k] + h * g[k] / gnorm);
             ggml_backend_tensor_set(par, wtmp.data(), 0, wtmp.size() * sizeof(float));
             const double lp = forward_loss();
-            for (size_t k = 0; k < w0.size(); k++) wtmp[k] = (float) (w0[k] - eps * g[k] / gnorm);
+            for (size_t k = 0; k < w0.size(); k++) wtmp[k] = (float) (w0[k] - h * g[k] / gnorm);
             ggml_backend_tensor_set(par, wtmp.data(), 0, wtmp.size() * sizeof(float));
             const double lmn = forward_loss();
-            num = (lp - lmn) / (2.0 * eps);
+            num = (lp - lmn) / (2.0 * h);
         }
         ggml_backend_tensor_set(par, w0.data(), 0, w0.size() * sizeof(float));
 
         const double rel = std::abs(num - gnorm) / std::max(1e-12, gnorm);
         char         nm[64];
         probe_label(pr, nm, sizeof(nm));
-        fprintf(stderr, "[mm3-fd] %-26s %10zu %13.6e %13.6e %8.3f\n", nm, g.size(), gnorm, num, rel);
+        fprintf(stderr, "[mm3-fd] %-26s %10zu %13.6e %9.3g %13.6e %8.3f\n", nm, g.size(), gnorm, h, num, rel);
         fd_rel.push_back(rel);
         if (!(rel < 0.15)) n_bad++;
         worst = std::max(worst, rel);
@@ -1579,12 +1653,15 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     // rather than against another backward, so it catches a defect that both
     // gradient routes could share.
     //
-    // The bar is 2e-2, not tighter. This is a central difference with eps 1e-2,
-    // so it carries a genuine O(eps^2 * third-derivative) truncation error that
-    // no amount of precision removes; 2e-2 is ~10x the worst observed (2e-3 at
-    // 2 layers), which leaves room for probe-to-probe variation without
-    // admitting a real scale error — a wrong gradient scale misses by a FACTOR,
-    // not by a percent.
+    // The bar is 2e-2, not tighter, and it is the SAME bar for every
+    // parameterization. This is a central difference, so it carries a genuine
+    // O(h^2 * third-derivative) truncation error that no amount of precision
+    // removes; 2e-2 is ~10x the worst observed (2e-3 at 2 layers), which leaves
+    // room for probe-to-probe variation without admitting a real scale error —
+    // a wrong gradient scale misses by a FACTOR, not by a percent. The step
+    // floor above is what keeps that one bar honest across parameterizations
+    // whose gradient norms differ by 50x; raising the bar for the awkward one
+    // would have hidden exactly the defect the bar exists to catch.
     const double fd_bar = isolated ? 2e-2 : 0.15;
     n_bad = 0;
     for (double r : fd_rel) {
@@ -1596,9 +1673,9 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         gate_fd_pass = fd_ok;
         fprintf(stderr,
                 "\n[mm3-fd] GATE %s: finite differences, F32-isolated, --attn %s, bar %.0e, %d/%zu probes, "
-                "worst %.4f\n",
+                "worst %.4f (step raised on %d)\n",
                 fd_ok ? "PASS" : "FAIL", a.attn.c_str(), fd_bar, (int) probes.size() - n_bad, probes.size(),
-                worst);
+                worst, n_raised);
         if (!fd_ok) {
             fprintf(stderr,
                     "[mm3-fd]   The analytic gradient disagrees with the measured loss change. Unlike the\n"
@@ -1606,8 +1683,8 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
                     "[mm3-fd]   — a wrong scale on the chunked CE, or a missing term.\n");
         }
         jl("{\"type\":\"gate\",\"check\":\"finite-difference-f32\",\"pass\":%s,\"worst\":%.6e,"
-           "\"bar\":%.6e,\"probes\":%d,\"attn\":\"%s\",\"attnPrec\":\"%s\"}",
-           fd_ok ? "true" : "false", worst, fd_bar, (int) probes.size(), a.attn.c_str(),
+           "\"bar\":%.6e,\"probes\":%d,\"dlMin\":%.6e,\"stepRaised\":%d,\"attn\":\"%s\",\"attnPrec\":\"%s\"}",
+           fd_ok ? "true" : "false", worst, fd_bar, (int) probes.size(), dl_min, n_raised, a.attn.c_str(),
            fd_flash ? dit_flash_prec_label(t.lm.backend).c_str() : "n/a");
     } else {
         fprintf(stderr, "\n[mm3-fd] %d/%zu probes within 15%% (worst %.3f) — INDICATIVE ONLY\n",
