@@ -2,6 +2,19 @@
 
 Orientation map for agents, and the **single source of truth** for project rules. Claude Code reads it through `CLAUDE.md` (a one-line `@AGENTS.md` import); Codex reads it directly. Edit this file only. Keep it short and navigational — point at the deep docs, don't duplicate them.
 
+## Shared skills
+
+Project skills live in `.claude/skills/`. On this Windows checkout,
+`.agents/skills` is a directory junction to that folder, so Codex discovers the
+same files Claude Code uses. Edit or add skills in `.claude/skills/`; do not
+create a separate copy for another agent. Each skill needs a `SKILL.md` with
+`name` and `description` frontmatter for discovery. Keep mandatory project rules
+in this file, since skill selection depends on the task.
+
+The junction and skill folders are local and gitignored. A new checkout needs
+the skills and discovery link installed separately. Refresh the client's skill
+list after changes, or restart it if the changes do not appear.
+
 ## What this is
 
 A desktop app for **local AI music generation** — a heavily-extended superset of [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp) (a C++/GGML port of ACE-Step 1.5). Caption + lyrics in → stereo 48 kHz audio out, fully local. Ships as portable releases (Windows CUDA/Vulkan/CPU, Linux, macOS Metal). GitHub: `scragnog/HOT-Step-CPP`.
