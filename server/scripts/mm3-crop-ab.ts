@@ -172,7 +172,14 @@ async function computeWholeTrackFrames(ds: DatasetInfo): Promise<number> {
   const durations = (detail.samples ?? [])
     .filter(s => !s.excluded && !s.fileMissing && Number.isFinite(s.duration) && s.duration > 0)
     .map(s => s.duration);
-  if (!durations.length) throw new Error(`${ds.slug}: no samples with a known duration — build the dataset first`);
+  if (!durations.length) {
+    // The dataset API reports duration 0 for tracks that were never probed
+    // (alk3_crimson does, 2026-09-05). The engine caps the crop at the longest
+    // track anyway, so the route's ceiling is a safe stand-in for "whole track".
+    log(`${ds.slug}: the dataset API reports no track durations — using the route ceiling of 9000 frames; ` +
+      'mm3-lm-train clamps the crop to the longest track itself');
+    return 9000;
+  }
   const longestSec = Math.max(...durations);
   const frames = Math.round(longestSec * MM3_FPS);
   const clamped = Math.min(9000, Math.max(64, frames));
