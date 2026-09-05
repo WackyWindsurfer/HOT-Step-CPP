@@ -184,10 +184,13 @@ which is frozen history with no gradient). All seven arms pass their
 finite-difference gate at the default epsilon since 2026-09-05, when `--fd-eps`
 became a floor on the step rather than the step (HiRA's gradients are 16-68x
 smaller than a plain LoRA's, so a fixed step measured it at 50x worse
-signal-to-noise — the estimator, not the backward). A default-rank (64) HRA run
-separately crashes before step 1 on the full graph (`ggml` `cgraph->n_nodes <
-cgraph->size` assert) despite passing its FD gate on an isolated 2-layer
-slice. `--prefix-n` and prior preservation (`--reg-*`) are mutually
+signal-to-noise — the estimator, not the backward). `--hra` is the one arm whose
+graph and activations scale with `--rank`: its default-rank (64) crash is fixed
+(graph budgets now come from the bank), but rank 64 still does not FIT at crop
+750 on 32 GB and is refused with the arithmetic rather than crashing. Rank 8
+peaks at 17.6 GiB and ~6.8 s/step, rank 32 at ~30.0 GiB and ~27 s/step, against
+a plain rank-64 LoRA's 18.2 GiB and ~2.4 s/step. `--prefix-n` and prior
+preservation (`--reg-*`) are mutually
 exclusive — a trained prefix is non-zero from init, and prior capture needs
 an inert model — and so are `--hra`/`--rslora`; the training routes 400 on
 both pairs rather than letting the job fail after the model loads.

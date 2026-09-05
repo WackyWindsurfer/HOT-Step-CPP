@@ -97,10 +97,52 @@ All seven arms now pass `--fd-check 8 --f32-layers 2` at the default epsilon
 (worst 0.0070, PiSSA); LoRA, rsLoRA, DoRA and PiSSA are unchanged to the last
 printed digit, because the floor only raises a step that was under it.
 
-One open bug: a full-depth 10-step HiRA run at the default rank (64) crashes
-before step 1 with a ggml `cgraph->n_nodes < cgraph->size` assert — the
-finite-difference gate only ever exercised a 2-layer, F32-isolated slice, so
-it never saw the full graph's node count.
+### HRA scales the graph with `--rank`, and rank 64 does not fit
+
+A full-depth `--hra` run at the default rank (64) used to die before step 1 on
+a ggml `cgraph->n_nodes < cgraph->size` assert. Two separate things were wrong
+and both are fixed (2026-09-05).
+
+The crash was graph SIZING. `lm_hra_reflect` emits 13 ggml nodes per
+reflection, so the node count is proportional to `--rank`: 5,824 forward nodes
+per layer at rank 64, where a plain LoRA emits about 35. Every builder on the
+LM training path allocated its `cgraph` from a constant chosen against a LoRA,
+and the 8,192-node segment probe overran first. The budgets now come from the
+bank (`lm_site_extra_nodes` and friends in `engine/src/train/lm-graph.h`), and
+so does the host arena behind them. Measured segment size: 221 nodes for a
+plain rank-64 LoRA, 2,132 / 8,180 / 16,244 for HRA at rank 8 / 32 / 64 — a
+slope of exactly 2.769 backward-graph nodes per forward reflection node, which
+is what the 5x budget multiplier is sized against. With no rank-proportional
+arm in play every graph is emitted at exactly the size it always had; the
+`train-lm --self-test` T22 anchor (naive trunk 396 nodes, P7 segment 221, both
+hashes) is unmoved, and a plain-LoRA 10-step MM3 run is loss-identical to six
+decimals before and after.
+
+What was left after that was arithmetic, not a bug: rank 64 genuinely does not
+fit. Each reflection retains its running `x`, its broadcast `v` and its
+correction, all `[in, S]` F32 and all backward inputs, so the activation cost
+is linear in rank AND in the crop with no allocator trick to remove it. On a
+32 GB card at crop 750 (`mm3-lm-q8_0` + `mm3-depth-f16`, `oasis_morningglory`,
+36 layers, checkpointed, AdamW, acoustic loss on, seed 42, mean over 10 steps):
+
+| `--hra --rank` | trainable params | worst segment | peak VRAM | ms/step |
+|---|---|---|---|---|
+| 8  | 10.6M | 2,132 nodes  | 18,062 MiB | ~6,800 (6.6-6.8 s) |
+| 32 | 42.5M | 8,180 nodes  | ~30,700 MiB (30,551-30,730) | ~27,000 (25.7-28.9 s) |
+| 64 | 84.9M | 16,244 nodes | refused: needs >= 33.6 GiB | — |
+| plain LoRA, rank 64 (reference) | 174.6M | 221 nodes | 18,626 MiB | ~2,400 (2.3-2.4 s) |
+
+Ranges are three runs of the same command; peak VRAM is device-wide, so it
+carries a little noise. Rank 32 fits with under 2 GB to spare and costs 11x a
+plain LoRA's step time for a quarter of its parameter count; rank
+64 asks the allocator for a 29.4 GiB compute buffer on its own. `mm3-lm-train`
+now estimates that term before allocating and refuses with a message naming the
+rank, the crop and the arithmetic, rather than letting `cudaMalloc` fail and
+`ggml_gallocr` segfault. The estimate deliberately leaves out the baseline
+compute buffer, so it under-reads and only ever refuses what could not have
+started. **`train-lm` (AS1.5) got the graph sizing but not the refusal** — its
+VRAM auto-fit does not know about HRA either, and no high-rank AS1.5 HRA run
+has been measured.
 
 MM3's binary resume format is now v4 and refuses a checkpoint whose
 parameterization or rsLoRA bit disagrees with the run being continued

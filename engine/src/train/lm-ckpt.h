@@ -290,7 +290,7 @@ struct LmCkptState {
     ggml_tensor *              t_codemask  = nullptr;  // [1, V] 0 in range, -1e30 outside
     ggml_tensor *              t_teach_sel = nullptr;  // [1, chunk] 1 at code positions, 0 elsewhere
 
-    std::vector<uint8_t>       arena;  // one reused 32 MiB graph arena
+    std::vector<uint8_t>       arena;  // one reused graph arena, sized in lm_ckpt_alloc
     std::vector<ggml_tensor *> gacc;
     std::vector<int32_t>       pos_scratch;
     int                        last_mask_S = 0;
@@ -306,6 +306,21 @@ struct LmCkptState {
         return b;
     }
 };
+
+// ─── graph node budgets ─────────────────────────────────────────────────────
+//
+// Every graph below builds AT MOST ONE LAYER (that is the whole point of the
+// checkpointed path), so the adapter term is the widest single layer's, not the
+// trunk's. The two constants are the pre-2026-09-05 budgets, kept exactly as
+// they were: with no rank-proportional arm in play both helpers return them
+// unchanged and every graph is emitted with the size it always had.
+static int lm_ckpt_forward_graph_nodes(const LmCkptState & st) {
+    return 2048 + lm_max_layer_extra_nodes(st.lm, st.cfg.layer_lo, st.cfg.layer_hi);
+}
+
+static int lm_ckpt_segment_graph_nodes(const LmCkptState & st) {
+    return 8192 + LM_GRAPH_BWD_NODE_MULT * lm_max_layer_extra_nodes(st.lm, st.cfg.layer_lo, st.cfg.layer_hi);
+}
 
 static void lm_ckpt_free(LmCkptState * st) {
     ggml_backend_buffer_t bufs[6] = { st->buf_ckpt, st->buf_gh0, st->buf_gh1, st->buf_misc, st->buf_embt, st->buf_labc };
@@ -546,7 +561,13 @@ static bool lm_ckpt_alloc(LmCkptState * st, Qwen3LM * lm, const LmCkptCfg & cfg,
                 (double) V * 4.0 / 1048576.0);
     }
 
-    st->arena.resize((size_t) 32 << 20);
+    // Graph arena. 32 MiB carried every shipped parameterization, because they
+    // all emit a few dozen nodes per site — and then HRA arrived, whose forward
+    // is `rank` reflections at 13 nodes each (lm-graph.h). At rank 64 one
+    // backward segment wants ~30k nodes, which is both more than the old 8,192
+    // node budget and more tensor structs than 32 MiB holds. Both now come from
+    // the same count, so the budget and the memory behind it cannot disagree.
+    st->arena.resize(std::max<size_t>((size_t) 32 << 20, lm_graph_arena_bytes(lm_ckpt_segment_graph_nodes(*st))));
     st->pos_scratch.resize((size_t) S);
 
     fprintf(stderr,
@@ -1230,7 +1251,7 @@ static int lm_ckpt_probe_segment_nodes(LmCkptRun & r, int S, LmBf16Counts * coun
     }
     ggml_init_params  ip   = { st.arena.size(), st.arena.data(), true };
     ggml_context *    ctx  = ggml_init(ip);
-    ggml_cgraph *     gf   = ggml_new_graph_custom(ctx, 8192, /*grads=*/true);
+    ggml_cgraph *     gf   = ggml_new_graph_custom(ctx, lm_ckpt_segment_graph_nodes(st), /*grads=*/true);
 
     ggml_tensor * pos_v = ggml_view_1d(ctx, r.t_pos, S, 0);
     // Worst case is a FULL prefix: it adds the splice nodes to every segment.
@@ -1345,7 +1366,7 @@ static bool lm_ckpt_micro_step(LmCkptRun & r, const LmSample & s, bool count_los
     for (int l = Lo; l < Hi - 1; l++) {
         ggml_init_params ip  = { st.arena.size(), st.arena.data(), true };
         ggml_context *   ctx = ggml_init(ip);
-        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 2048, /*grads=*/false);
+        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, lm_ckpt_forward_graph_nodes(st), /*grads=*/false);
         ggml_tensor *    pv  = ggml_view_1d(ctx, r.t_pos, S, 0);
         ggml_tensor *    mv  = ggml_view_2d(ctx, r.t_msk, NKV, S, (size_t) NKV * ggml_element_size(r.t_msk), 0);
         ggml_tensor *    X   = ggml_view_2d(ctx, st.C[(size_t) l], H, S, st.C[(size_t) l]->nb[1], 0);
@@ -1364,7 +1385,7 @@ static bool lm_ckpt_micro_step(LmCkptRun & r, const LmSample & s, bool count_los
     {
         ggml_init_params ip  = { st.arena.size(), st.arena.data(), true };
         ggml_context *   ctx = ggml_init(ip);
-        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 2048, /*grads=*/false);
+        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, lm_ckpt_forward_graph_nodes(st), /*grads=*/false);
         ggml_tensor *    pv  = ggml_view_1d(ctx, r.t_pos, S, 0);
         ggml_tensor *    mv  = ggml_view_2d(ctx, r.t_msk, NKV, S, (size_t) NKV * ggml_element_size(r.t_msk), 0);
         ggml_tensor *    X   = ggml_view_2d(ctx, st.C[(size_t) (Hi - 1)], H, S, st.C[(size_t) (Hi - 1)]->nb[1], 0);
@@ -1427,7 +1448,7 @@ static bool lm_ckpt_micro_step(LmCkptRun & r, const LmSample & s, bool count_los
 
         ggml_init_params ip  = { st.arena.size(), st.arena.data(), true };
         ggml_context *   ctx = ggml_init(ip);
-        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 8192, /*grads=*/true);
+        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, lm_ckpt_segment_graph_nodes(st), /*grads=*/true);
 
         // Lever A: a FRESH collect per segment. The transposes are in-graph and
         // gallocr frees them with the segment (S4), so nothing survives the loop.

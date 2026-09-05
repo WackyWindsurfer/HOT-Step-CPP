@@ -1136,6 +1136,133 @@ static ggml_tensor * lm_linear(ggml_context * ctx, ggml_tensor * w, const QwLora
     return y;
 }
 
+// ─── graph SIZE, because one parameterization multiplies it ─────────────────
+//
+// Every builder that runs lm_linear() has to allocate its cgraph up front
+// (ggml_new_graph_custom takes a node budget), and until 2026-09-05 they all
+// did it with a constant sized against a plain LoRA. That is right for every
+// arm whose delta is a fixed handful of ops. It is wrong by two orders of
+// magnitude for HRA, whose forward is `rank` Householder reflections and so
+// SCALES WITH RANK: lm_hra_reflect() emits 13 nodes per reflection, so a
+// rank-64 bank puts 832 nodes on each of the 7 slots in a layer — 5,824 per
+// layer, where a plain LoRA puts about 35. A default-rank HRA run therefore
+// died in the segment-size probe before step 1, on ggml.c's
+// GGML_ASSERT(cgraph->n_nodes < cgraph->size), with nothing to say why.
+//
+// So the builders size themselves from the bank. Only the rank-proportional
+// term is counted: every other arm adds at most a dozen nodes per site, which
+// the existing budgets already carry with room to spare, and pretending to
+// count them exactly would just be a second thing to get quietly wrong.
+//
+// Counted from the emitting code, not measured — a new rank-proportional arm in
+// lm_linear() has to be added here or it is not sized. View nodes count:
+// ggml_view_2d has op GGML_OP_VIEW and lands in the graph like any other.
+static int lm_site_extra_nodes(const QwLoraPair * pr) {
+    if (pr && pr->hra && pr->A) {
+        // lm_hra_reflect, per reflection: view, mul, sum_rows, sqr, sum, log,
+        // neg, exp, mul, repeat_4d, mul, scale, sub.
+        return 13 * (int) pr->A->ne[1];
+    }
+    return 0;
+}
+
+// One layer's worth, over every adapted slot.
+static int lm_layer_extra_nodes(const QwLoraLayer * ll) {
+    if (!ll) {
+        return 0;
+    }
+    int n = 0;
+    for (int s = 0; s < QW_LORA_NSLOTS; s++) {
+        n += lm_site_extra_nodes(&ll->p[s]);
+    }
+    return n;
+}
+
+// The widest single layer in [lo, hi). Segment graphs build ONE layer, so that
+// is what they must be sized against; whole-trunk graphs multiply by the layer
+// count themselves.
+static int lm_max_layer_extra_nodes(const Qwen3LM * lm, int lo, int hi) {
+    if (!lm) {
+        return 0;
+    }
+    int n = 0;
+    for (int l = std::max(0, lo); l < std::min(hi, lm->cfg.n_layers); l++) {
+        n = std::max(n, lm_layer_extra_nodes(lm->layers[(size_t) l].lora));
+    }
+    return n;
+}
+
+// Every layer's worth, for the whole-trunk (non-checkpointed) builders, which
+// pay the per-layer term L times over.
+static int lm_trunk_extra_nodes(const Qwen3LM * lm, int lo, int hi) {
+    if (!lm) {
+        return 0;
+    }
+    int n = 0;
+    for (int l = std::max(0, lo); l < std::min(hi, lm->cfg.n_layers); l++) {
+        n += lm_layer_extra_nodes(lm->layers[(size_t) l].lora);
+    }
+    return n;
+}
+
+// Host bytes a no_alloc ggml context needs to hold one graph of `nodes`: the
+// cgraph itself plus a tensor struct per node, with slack for leafs and for the
+// input views a builder makes outside the count. Host RAM, not VRAM — the
+// arenas below were fixed constants until a rank-proportional parameterization
+// made the node count a variable, and a too-small arena is a null context and a
+// crash rather than a diagnosis.
+static size_t lm_graph_arena_bytes(int nodes, bool grads = true) {
+    const size_t n = (size_t) std::max(1, nodes);
+    return n * (ggml_tensor_overhead() + 96) + ggml_graph_overhead_custom(n, grads) + ((size_t) 16 << 20);
+}
+
+// Backward blow-up factor for the forward nodes counted above.
+// ggml_build_backward_expand emits one to three nodes per differentiable
+// forward node, plus the accumulation adds. MEASURED on the reflection chain at
+// the shipped MM3 geometry (one P7 backward segment, 36 layers, crop 750): the
+// segment came to 2,132 / 8,180 / 16,244 nodes at rank 8 / 32 / 64, a slope of
+// exactly 2.769 backward-graph nodes per forward reflection node at both
+// intervals. 5 is that with 1.8x of margin, and the budget buys host arena
+// bytes rather than VRAM, so the margin is close to free.
+#define LM_GRAPH_BWD_NODE_MULT 5
+
+// Device bytes ONE backward segment retains for HRA's reflections — the term
+// that makes a rank impossible rather than merely slow. lm_hra_reflect keeps
+// the running x, the broadcast v and the correction for EVERY reflection, all
+// [in, S] F32 and all live until the backward has consumed them, so the cost is
+// linear in --rank and in the crop and no allocator trick removes it.
+//
+// The 1.9 is calibrated, not derived. Peak device use on the 36-layer MM3 LM at
+// crop 750 (S = 1861, q8_0 base, checkpointed) measured 18,062 MiB at rank 8
+// and 30,551 MiB at rank 32 — 520 MiB per rank, of which 20 MiB is parameters,
+// AdamW moments and gradients, against a per-rank activation footprint of
+// sum(in) * S * 4 = 262 MiB. Two points, so a calibration and not a law, which
+// is why the caller refuses only on what this term ALONE cannot fit and never
+// on a margin.
+// `whole_trunk` is the non-checkpointed arm, which holds every layer at once
+// instead of one segment at a time.
+static size_t lm_hra_segment_bytes(const Qwen3LM * lm, int lo, int hi, int64_t S, bool whole_trunk = false) {
+    if (!lm) {
+        return 0;
+    }
+    double total = 0.0;
+    for (int l = std::max(0, lo); l < std::min(hi, lm->cfg.n_layers); l++) {
+        const QwLoraLayer * ll = lm->layers[(size_t) l].lora;
+        if (!ll) {
+            continue;
+        }
+        double b = 0.0;
+        for (int s = 0; s < QW_LORA_NSLOTS; s++) {
+            const QwLoraPair & p = ll->p[s];
+            if (p.hra && p.A) {
+                b += 1.9 * (double) p.A->ne[0] * (double) p.A->ne[1] * (double) S * 4.0;
+            }
+        }
+        total = whole_trunk ? total + b : std::max(total, b);
+    }
+    return (size_t) total;
+}
+
 static ggml_tensor * lm_rms(ggml_context * ctx, ggml_tensor * x, ggml_tensor * w, float eps) {
     return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), qwen3_f32(ctx, w));
 }

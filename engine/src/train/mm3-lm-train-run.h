@@ -1281,7 +1281,15 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         fd_opts.pfx_n     = fd_pfx.n;
     }
 
-    std::vector<uint8_t> arena((size_t) 512 << 20);
+    // HRA's forward is `rank` reflections per site, so the trunk's node count
+    // scales with --rank (lm-graph.h). Both graphs below build the WHOLE trunk,
+    // so they and the arena behind them come from the bank rather than from a
+    // constant that assumed a plain LoRA. With no such arm in play both are the
+    // 65,536 and 512 MiB they always were.
+    const int fd_trunk_extra = lm_trunk_extra_nodes(&t.lm, 0, c.n_layers);
+    const int fd_fwd_nodes   = 65536 + fd_trunk_extra;
+    const int fd_bwd_nodes   = 65536 + LM_GRAPH_BWD_NODE_MULT * fd_trunk_extra;
+    std::vector<uint8_t> arena(std::max<size_t>((size_t) 512 << 20, lm_graph_arena_bytes(fd_bwd_nodes)));
     BackendPair          bp;
     bp.backend = t.lm.backend; bp.cpu_backend = t.lm.cpu_backend;
     bp.has_gpu = t.lm.backend != t.lm.cpu_backend;
@@ -1303,7 +1311,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     auto forward_loss = [&]() -> double {
         ggml_init_params gip = { arena.size(), arena.data(), true };
         ggml_context *   ctx = ggml_init(gip);
-        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 65536, false);
+        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, fd_fwd_nodes, false);
         ggml_tensor *    h_in = mm3_lm_build_embed(ctx, embed_ctx);
         ggml_tensor *    hid =
             lm_build_trunk_embeds(ctx, &t.lm, h_in, t_pos, t_msk, (int) S, 0, c.n_layers, fd_opts);
@@ -1336,7 +1344,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         ggml_backend_buffer_clear(opt.buf_grad, 0);
         ggml_init_params gip = { arena.size(), arena.data(), true };
         ggml_context *   ctx = ggml_init(gip);
-        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 65536, true);
+        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, fd_bwd_nodes, true);
         ggml_tensor *    h_in = mm3_lm_build_embed(ctx, embed_ctx);
         ggml_tensor *    hid =
             lm_build_trunk_embeds(ctx, &t.lm, h_in, t_pos, t_msk, (int) S, 0, c.n_layers, fd_opts);
@@ -2535,7 +2543,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     // whichever graph is larger. This bit a real 4B Muon run: Muon's optimizer
     // graph is ~7-9k nodes while a segmented training graph was ~569, and ggml
     // asserts hash_set.size >= n_nodes + n_leafs mid-run. Do not "simplify".
-    std::vector<uint8_t> arena((size_t) 512 << 20);
+    // Same rank-proportional term as the FD arm above: the naive (non-`--ckpt`)
+    // graphs build every layer, so their budget follows the parameterization.
+    // The checkpointed path sizes its own segment graphs in lm-ckpt.h.
+    const int naive_nodes = 65536 + LM_GRAPH_BWD_NODE_MULT * lm_trunk_extra_nodes(&t.lm, 0, c.n_layers);
+    std::vector<uint8_t> arena(std::max<size_t>((size_t) 512 << 20, lm_graph_arena_bytes(naive_nodes)));
     int                  graph_nodes = 0;
 
     auto build_graph = [&](ggml_context * ctx, ggml_cgraph * gf, int64_t P, int64_t Fin, int64_t n_sup,
@@ -2573,7 +2585,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     } else {
         ggml_init_params gip = { arena.size(), arena.data(), true };
         ggml_context *   ctx = ggml_init(gip);
-        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 65536, true);
+        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, naive_nodes, true);
         ggml_tensor *    loss = nullptr;
         build_graph(ctx, gf, max_prompt, F_max, K_max + 1, &loss);
         std::vector<ggml_tensor *> gacc;
@@ -2584,6 +2596,59 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     }
     fprintf(stderr, "[mm3-lm-train] %s graph: %d nodes\n",
             a.ckpt ? "worst backward segment" : "fwd+bwd", graph_nodes);
+
+    // ── --hra: refuse a rank that cannot start, rather than crash on it ─────
+    //
+    // HRA is the one parameterization whose ACTIVATION cost scales with --rank,
+    // and at the default rank of 64 it does not fit a 32 GB card at the shipped
+    // crop: the allocator asks for a 30 GiB compute buffer, cudaMalloc says no,
+    // and ggml_gallocr's failure path takes the process down with a segfault
+    // three lines after saying so. There is nothing to diagnose in that, and
+    // nothing the caller can catch, so the arithmetic happens here instead.
+    //
+    // Deliberately compared against the terms we KNOW — the reflection
+    // activations, the checkpoint state and the adapter's own four buffers
+    // (weights, two AdamW moments, gradients). The baseline compute buffer is
+    // left out, which makes this an UNDER-estimate on purpose: it refuses only
+    // what could not have started under any accounting, and never a
+    // configuration that would have run.
+    if (lora.hra) {
+        size_t vfree = 0, vtotal = 0;
+        lm_vram_query(t.lm.backend, &vfree, &vtotal);
+        const size_t hra_b  = lm_hra_segment_bytes(&t.lm, 0, c.n_layers, S_max, /*whole_trunk=*/!a.ckpt);
+        const size_t ckpt_b = a.ckpt ? ckpt_st.fixed_bytes() : 0;
+        const size_t par_b  = 4 * lora.n_params * sizeof(float);
+        const double gib    = 1024.0 * 1024.0 * 1024.0;
+        if (vfree > 0 && (double) (hra_b + ckpt_b + par_b) > (double) vfree) {
+            fprintf(stderr,
+                    "[mm3-lm-train] --hra rank %d does not fit at --max-frames %lld (sequence %d).\n"
+                    "  The %s retains ~%.1f GiB of reflection activations (r x sum(in) x S x 4,\n"
+                    "  every reflection's running x, broadcast v and correction are backward inputs), and with\n"
+                    "  %.1f GiB of checkpoint state and %.1f GiB of adapter + AdamW + gradient buffers that is\n"
+                    "  %.1f GiB against %.1f GiB free — before the baseline compute buffer, which is not counted.\n"
+                    "  Reference, 36-layer MM3 LM on a q8_0 base at crop 750: rank 8 peaks at 17.6 GiB, rank 32\n"
+                    "  at 30.0 GiB, and rank 64 asks the allocator for 29.4 GiB of compute buffer alone. Lower\n"
+                    "  --rank or --max-frames. Refusing here rather than letting the allocator fail, which\n"
+                    "  segfaults inside ggml_gallocr with nothing to diagnose.\n",
+                    a.rank, (long long) a.max_frames, (int) S_max,
+                    a.ckpt ? "worst backward segment" : "whole-trunk graph", (double) hra_b / gib,
+                    (double) ckpt_b / gib, (double) par_b / gib, (double) (hra_b + ckpt_b + par_b) / gib,
+                    (double) vfree / gib);
+            jl("{\"type\":\"fatal\",\"message\":\"--hra rank %d does not fit at max-frames %lld: needs at least "
+               "%.1f GiB, %.1f GiB free\"}",
+               a.rank, (long long) a.max_frames, (double) (hra_b + ckpt_b + par_b) / gib, (double) vfree / gib);
+            lm_lora_detach(&lora, &t.lm);
+            lm_lora_free(&lora);
+            lm_ckpt_free(&ckpt_st);
+            lm_optim_free(&opt);
+            mm3_train_lm_free(&t);
+            return 1;
+        }
+        fprintf(stderr, "[mm3-lm-train] --hra rank %d: ~%.1f GiB of reflection activations in the %s "
+                        "at sequence %d, %.1f GiB free\n",
+                a.rank, (double) hra_b / gib, a.ckpt ? "worst backward segment" : "whole-trunk graph",
+                (int) S_max, (double) vfree / gib);
+    }
 
     BackendPair bp;
     bp.backend     = t.lm.backend;
@@ -3647,7 +3712,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             } else {
                 ggml_init_params gip = { arena.size(), arena.data(), true };
                 ggml_context *   ctx = ggml_init(gip);
-                ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 65536, true);
+                ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, naive_nodes, true);
                 ggml_tensor *    loss = nullptr;
                 build_graph(ctx, gf, P, Finw, n_sup, &loss);
                 std::vector<ggml_tensor *> gacc;

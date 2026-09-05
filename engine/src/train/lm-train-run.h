@@ -1410,7 +1410,11 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
     }
 
     // ── graph arena + scheduler sized from a real node count ─────────────
-    std::vector<uint8_t> arena((size_t) 128 << 20);
+    // The naive arm builds the whole trunk, and HRA's forward is `rank`
+    // reflections per site, so its node count scales with --rank (lm-graph.h).
+    // Constant again for every other parameterization.
+    const int naive_nodes = 65536 + LM_GRAPH_BWD_NODE_MULT * lm_trunk_extra_nodes(&lm, 0, c.n_layers);
+    std::vector<uint8_t> arena(std::max<size_t>((size_t) 128 << 20, lm_graph_arena_bytes(naive_nodes)));
 
     // The naive trunk's layer options. EVERY field is at its default when
     // --attn exact, so lm_build_trunk's opts overload emits exactly the node
@@ -1457,7 +1461,7 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
     } else {
         ggml_init_params ip  = { arena.size(), arena.data(), true };
         ggml_context *   ctx = ggml_init(ip);
-        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 65536, /*grads=*/true);
+        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, naive_nodes, /*grads=*/true);
 
         const LmSample & s      = samples[0];
         artp.off                = s.artist_off;
@@ -1524,7 +1528,7 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
 
         ggml_init_params gip = { arena.size(), arena.data(), true };
         ggml_context *   ctx = ggml_init(gip);
-        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 65536, /*grads=*/true);
+        ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, naive_nodes, /*grads=*/true);
 
         // Per sample: a regularisation row carries no trigger, so its
         // artist_off is -1 and the token is simply absent from that graph —
