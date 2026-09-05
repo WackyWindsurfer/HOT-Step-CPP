@@ -165,6 +165,19 @@ static void print_usage(void) {
             "                at factor 16: every w2 goes monolithic there and LyCORIS\n"
             "                forces alpha == dim, so lokr_scale is exactly 1.\n"
             "                [--lokr-w1-only] keep w2 monolithic-only (no w2_a/w2_b).\n"
+            "                [--attn exact|flash|flash-f32] default exact. flash swaps\n"
+            "                the manual attention chain for the fused\n"
+            "                FLASH_ATTN_TRAIN/_BACK pair, so the [S_kv,S,Nh] softmax is\n"
+            "                never materialised and attention memory is LINEAR in S\n"
+            "                instead of quadratic — the term that caps --max-frames on\n"
+            "                MM3's long crops. Refuses to start rather than fall back\n"
+            "                when the backend cannot run the ops (a CPU split is\n"
+            "                correct, unusably slow, and looks like a pass). NOT with\n"
+            "                --prefix-frames > 0: a frozen KV prefix makes the mask\n"
+            "                rectangular (exit 2). flash-f32 pins the same ops to strict\n"
+            "                f32 (the v1 scalar kernels) — slower, and the mode\n"
+            "                --fd-check should use. Gradients under flash are NOT\n"
+            "                bit-identical to exact.\n"
             "  mm3-lm-loss   Teacher-forced training forward, scored. --lm --depth --codes\n"
             "                --caption [--lyrics] [--max-frames N] [--crop-offset N]\n"
             "                [--target-shift N] [--no-prompt]  (falsification diagnostics).\n"
@@ -1669,7 +1682,7 @@ static int cmd_detok_table(int argc, char ** argv) {
 //       [--caption-dropout 0.2] [--rank-dropout 0.1] [--caption-file <txt>]
 //       [--seed 42]
 //       [--crop-anchor song|zero] [--prefix-frames N] [--prefix-chunk N]
-//       [--prefix-selftest]
+//       [--prefix-selftest] [--attn exact|flash|flash-f32]
 //       [--target-loss <f>] [--target-loss-epochs 5] [--target-loss-metric train|eval]
 //       [--resume <state>] [--pause-file <path>] [--no-final-state]
 //       [--no-pause]
@@ -1687,6 +1700,17 @@ static int cmd_detok_table(int argc, char ** argv) {
 // the middle third of the stack to fake long-horizon behaviour from a
 // short-horizon view. Costs one forward pass over the prefix per micro-step
 // plus ~288 KB of K/V per prefix frame; needs --crop-anchor song. 0 = off.
+//
+// --attn flash swaps the manual attention chain for the fused
+// GGML_OP_FLASH_ATTN_TRAIN / _BACK pair, so the [S_kv, S, Nh] softmax is never
+// materialised and attention memory is linear in the sequence rather than
+// quadratic. MM3 crops are long — S is the caption prompt (~1.1k tokens) plus
+// 1500-4096 frames — which is exactly where that term dominates. Aborts rather
+// than falls back when the backend cannot run the ops: a CPU split would be
+// correct, unusably slow, and look like a pass. Cannot be combined with
+// --prefix-frames > 0 (exit 2). flash-f32 pins the same ops to strict f32, which
+// is the mode --fd-check should use. Gradients under flash are NOT bit-identical
+// to exact; default is exact.
 //
 // --reg-* turns on PRIOR PRESERVATION: every --reg-every'th step trains on an
 // unrelated corpus against the FROZEN BASE MODEL'S OWN next-token distribution
@@ -1795,6 +1819,7 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--artist-token-only")) a.artist_only  = true;
         else if (!strcmp(argv[i], "--artist-token-lr"))   a.artist_lr    = (float) atof(next("--artist-token-lr"));
         else if (!strcmp(argv[i], "--lora-plus-ratio"))   a.lora_plus_ratio = (float) atof(next("--lora-plus-ratio"));
+        else if (!strcmp(argv[i], "--attn"))              a.attn         = next("--attn");
         else if (!strcmp(argv[i], "--fd-eps"))        fd_eps         = atof(next("--fd-eps"));
         else if (!strcmp(argv[i], "--fd-frames"))     fd_frames      = atoll(next("--fd-frames"));
         else if (!strcmp(argv[i], "--fd-prompt"))     fd_prompt      = atoll(next("--fd-prompt"));
@@ -1826,6 +1851,32 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         a.codes_dir.empty() || a.out_dir.empty()) {
         fprintf(stderr, "ace-train mm3-lm-train: --lm, --depth, --manifest, --captions, --codes and --out "
                         "are all required\n");
+        return 2;
+    }
+    // --attn is validated BEFORE the --fd-check early return, not with the rest
+    // of the validation below it: the gate runs the same graphs under the same
+    // flag, so a typo that silently fell through to "exact" there would report a
+    // PASS for a formulation the run never used.
+    if (a.attn != "exact" && a.attn != "flash" && a.attn != "flash-f32") {
+        fprintf(stderr, "ace-train mm3-lm-train: --attn must be exact|flash|flash-f32\n");
+        return 2;
+    }
+    // COLLISION, refused rather than coerced — the shape train-lm uses for
+    // --attn flash + --attn-head-block.
+    //
+    // The frozen KV prefix (train/lm-kvprefix.h) puts `n` stored history columns
+    // in front of the window, so the mask becomes rectangular ([n + S, S]) and
+    // S_kv != S. That is outside what the capability probe asks about and what
+    // lm_build_trunk_embeds' flash arm accepts — it carries a GGML_ASSERT on the
+    // pair. Caught here, before the model load, rather than as an assert forty
+    // minutes into a run.
+    if (a.attn != "exact" && a.prefix_frames > 0) {
+        fprintf(stderr,
+                "ace-train mm3-lm-train: --attn %s cannot be combined with --prefix-frames %lld.\n"
+                "  A frozen KV prefix makes the attention mask rectangular (S_kv = n_pfx + S), which is\n"
+                "  outside both the fused-op capability probe and the flash arm of the trunk builder.\n"
+                "  Drop --prefix-frames (or pass 0), or use --attn exact.\n",
+                a.attn.c_str(), (long long) a.prefix_frames);
         return 2;
     }
     if (fd_probes > 0) {

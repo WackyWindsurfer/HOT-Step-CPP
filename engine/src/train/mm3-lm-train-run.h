@@ -351,6 +351,37 @@ struct MM3LmTrainArgs {
     bool        ckpt       = true;
     int         ckpt_chunk = 128;
 
+    // ── Attention formulation (--attn, R3 of the flash-attn roadmap) ───────
+    //
+    // Same three values, same meanings and the same shared code as
+    // `train-lm` — lm-graph.h routes the whole-head attention site through
+    // lm_attn_flash when LmLayerOpts::attn_flash is set, and lm-ckpt.h copies
+    // LmCkptCfg::attn_flash/attn_prec into every segment's opts. This trainer
+    // was the one caller of that machinery that never set the fields (D12);
+    // this flag is that wiring, not a new primitive.
+    //
+    //   "exact"     = the shipped manual chain (mul_mat -> soft_max_ext ->
+    //                 mul_mat), which retains an [S_kv,S,Nh] softmax per layer.
+    //                 THE DEFAULT, and byte-identical to pre-flag runs.
+    //   "flash"     = fused GGML_OP_FLASH_ATTN_TRAIN / _BACK, so the softmax is
+    //                 never materialised and attention memory is linear in S.
+    //                 MM3 crops are long (S = prompt + 1500..4096 frames), which
+    //                 is exactly where the quadratic term dominates.
+    //   "flash-f32" = the same fused ops pinned to GGML_PREC_F32, i.e. the v1
+    //                 scalar kernels instead of the TF32 tensor-core ones
+    //                 "flash" selects. Slower; it separates "did fusion move the
+    //                 training" from "did TF32 move it", and it is the mode the
+    //                 --fd-check gate should use.
+    //
+    // NOT combinable with --prefix-frames: the frozen KV prefix makes the mask
+    // rectangular (S_kv = n_pfx + S), which is outside both the capability probe
+    // below and lm_build_trunk_embeds' flash arm (it asserts). Refused at the
+    // CLI, exit 2, rather than coerced.
+    //
+    // Flash gradients are NOT bit-identical to exact — same drift family as
+    // --weights bf16 — so the default stays the shipped arithmetic.
+    std::string attn       = "exact";
+
     // ── Held-out evaluation ────────────────────────────────────────────────
     //
     // The reason this exists: a training loss measured on a RANDOM CROP cannot
@@ -931,6 +962,45 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     fprintf(stderr, "[mm3-fd] %s: prompt %lld (of %zu, truncated) + %lld frames = seq %lld, rank %d, eps %.3g\n",
             smp.id.c_str(), (long long) P, smp.prompt.size(), (long long) K, (long long) S, a.rank, eps);
 
+    // ── --attn (R3): the SAME gate, run against the fused ops ─────────────
+    //
+    // Both arms of this check honour the flag, which is the point: with
+    // `--attn flash-f32` the numeric side measures the FUSED forward and the
+    // analytic side is the FUSED backward, so the finite-difference rung
+    // validates GGML_OP_FLASH_ATTN_TRAIN_BACK on its own terms rather than
+    // diffing it against the exact arm. Under isolation that is a verdict.
+    const bool      fd_flash    = (a.attn == "flash" || a.attn == "flash-f32");
+    const ggml_prec fd_prec_req = (a.attn == "flash-f32") ? GGML_PREC_F32 : GGML_PREC_DEFAULT;
+    LmLayerOpts     fd_opts;
+    fd_opts.attn_flash = fd_flash;
+    fd_opts.attn_prec  = fd_prec_req;
+    if (fd_flash) {
+        // Same refusal-not-fallback discipline as train-lm: a `false` here would
+        // otherwise make the scheduler split the fused ops onto the CPU, which
+        // is correct, unusably slow, and looks like a pass on every number this
+        // command prints. Nkv is the NATIVE GQA width — nothing on this path
+        // expands heads before lm_attn_flash.
+        const float ascale = 1.0f / sqrtf((float) c.head_dim);
+        bool        pf = false, pb = false;
+        dit_flash_probe(t.lm.backend, c.head_dim, c.n_heads, c.n_kv_heads, (int) S, (int) S, /*B=*/1, ascale, &pf,
+                        &pb);
+        if (!(pf && pb)) {
+            fprintf(stderr,
+                    "[mm3-fd] --attn %s: backend %s does not support the fused attention ops at this geometry "
+                    "(D %d, Nh %d, Nkv %d, S %lld, B 1) — fwd %s / bwd %s. Refusing: a CPU split would look "
+                    "like a pass. Use --attn exact.\n",
+                    a.attn.c_str(), ggml_backend_name(t.lm.backend), c.head_dim, c.n_heads, c.n_kv_heads,
+                    (long long) S, pf ? "yes" : "NO", pb ? "yes" : "NO");
+            mm3_f32_isolate_free(&iso);
+            mm3_train_lm_free(&t);
+            return 1;
+        }
+        fprintf(stderr, "[mm3-fd] --attn %s: %s runs FLASH_ATTN_TRAIN and _BACK at D %d, Nh %d, Nkv %d, S %lld "
+                        "— no CPU split. Requested arithmetic: %s\n",
+                a.attn.c_str(), ggml_backend_name(t.lm.backend), c.head_dim, c.n_heads, c.n_kv_heads,
+                (long long) S, fd_prec_req == GGML_PREC_F32 ? "strict f32" : "tf32 where available");
+    }
+
     LmLora     lora;
     const bool fd_lokr = a.is_lokr();
     const bool fd_init_ok =
@@ -988,7 +1058,9 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     ggml_tensor * t_sem    = ggml_new_tensor_1d(ctx_static, GGML_TYPE_I32, Fin);
     ggml_tensor * t_ac     = ggml_new_tensor_1d(ctx_static, GGML_TYPE_I32, Fin * NC);
     ggml_tensor * t_pos    = ggml_new_tensor_1d(ctx_static, GGML_TYPE_I32, S);
-    ggml_tensor * t_msk    = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, S * S);
+    // F32 under --attn exact (the shipped allocation, byte for byte), F16 under
+    // flash: ggml_flash_attn_train asserts mask->type == GGML_TYPE_F16.
+    ggml_tensor * t_msk    = lm_mask_alloc(ctx_static, S * S, fd_flash);
     ggml_tensor * t_lab    = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, SL, n_sup);
     ggml_tensor * t_lg     = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
     ggml_tensor * t_clip   = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
@@ -1025,7 +1097,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     ggml_backend_tensor_set(t_sem, sem_in.data(), 0, sem_in.size() * sizeof(int32_t));
     ggml_backend_tensor_set(t_ac, ac_in.data(), 0, ac_in.size() * sizeof(int32_t));
     ggml_backend_tensor_set(t_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
-    ggml_backend_tensor_set(t_msk, msk.data(), 0, msk.size() * sizeof(float));
+    lm_mask_set(t_msk, msk);   // converts to F16 when the buffer is F16 (--attn flash)
 
     MM3EmbedCtx embed_ctx{ &t, t_prompt, t_sem, t_ac, P, Fin };
 
@@ -1053,7 +1125,8 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         ggml_context *   ctx = ggml_init(gip);
         ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 65536, false);
         ggml_tensor *    h_in = mm3_lm_build_embed(ctx, embed_ctx);
-        ggml_tensor *    hid  = lm_build_trunk_embeds(ctx, &t.lm, h_in, t_pos, t_msk, (int) S);
+        ggml_tensor *    hid =
+            lm_build_trunk_embeds(ctx, &t.lm, h_in, t_pos, t_msk, (int) S, 0, c.n_layers, fd_opts);
         ggml_tensor *    hd   = ggml_cont(
             ctx, ggml_view_2d(ctx, hid, H, n_sup, hid->nb[1], (size_t) (P - 1) * hid->nb[1]));
         ggml_tensor * lg = ggml_mul_mat(ctx, mm3_lm_train_out_slice(ctx, t), hd);   // [SL, n_sup]
@@ -1085,7 +1158,8 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         ggml_context *   ctx = ggml_init(gip);
         ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 65536, true);
         ggml_tensor *    h_in = mm3_lm_build_embed(ctx, embed_ctx);
-        ggml_tensor *    hid  = lm_build_trunk_embeds(ctx, &t.lm, h_in, t_pos, t_msk, (int) S);
+        ggml_tensor *    hid =
+            lm_build_trunk_embeds(ctx, &t.lm, h_in, t_pos, t_msk, (int) S, 0, c.n_layers, fd_opts);
         ggml_tensor *    hd   = ggml_cont(
             ctx, ggml_view_2d(ctx, hid, H, n_sup, hid->nb[1], (size_t) (P - 1) * hid->nb[1]));
         ggml_tensor * lg   = ggml_mul_mat(ctx, mm3_lm_train_out_slice(ctx, t), hd);
@@ -1182,6 +1256,10 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     {
         LmCkptCfg cc;
         cc.chunk     = 64;
+        // lm_ckpt_layer_opts copies these into every P2/P3/P7 segment graph, so
+        // both arms of the comparison below run the same attention formulation.
+        cc.attn_flash = fd_flash;
+        cc.attn_prec  = fd_prec_req;
         cc.s_max     = (int) S;
         cc.layer_lo  = 0;
         cc.layer_hi  = c.n_layers;
@@ -1273,8 +1351,10 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         gate_fd_ran  = true;
         gate_fd_pass = fd_ok;
         fprintf(stderr,
-                "\n[mm3-fd] GATE %s: finite differences, F32-isolated, bar %.0e, %d/%zu probes, worst %.4f\n",
-                fd_ok ? "PASS" : "FAIL", fd_bar, (int) probes.size() - n_bad, probes.size(), worst);
+                "\n[mm3-fd] GATE %s: finite differences, F32-isolated, --attn %s, bar %.0e, %d/%zu probes, "
+                "worst %.4f\n",
+                fd_ok ? "PASS" : "FAIL", a.attn.c_str(), fd_bar, (int) probes.size() - n_bad, probes.size(),
+                worst);
         if (!fd_ok) {
             fprintf(stderr,
                     "[mm3-fd]   The analytic gradient disagrees with the measured loss change. Unlike the\n"
@@ -1282,8 +1362,9 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
                     "[mm3-fd]   — a wrong scale on the chunked CE, or a missing term.\n");
         }
         jl("{\"type\":\"gate\",\"check\":\"finite-difference-f32\",\"pass\":%s,\"worst\":%.6e,"
-           "\"bar\":%.6e,\"probes\":%d}",
-           fd_ok ? "true" : "false", worst, fd_bar, (int) probes.size());
+           "\"bar\":%.6e,\"probes\":%d,\"attn\":\"%s\",\"attnPrec\":\"%s\"}",
+           fd_ok ? "true" : "false", worst, fd_bar, (int) probes.size(), a.attn.c_str(),
+           fd_flash ? dit_flash_prec_label(t.lm.backend).c_str() : "n/a");
     } else {
         fprintf(stderr, "\n[mm3-fd] %d/%zu probes within 15%% (worst %.3f) — INDICATIVE ONLY\n",
                 (int) probes.size() - n_bad, probes.size(), worst);
@@ -1322,8 +1403,8 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
             // distinction the f16 run could not make.
             gate_ran  = true;
             gate_pass = wc < 2e-3;
-            fprintf(stderr, "[mm3-fd] GATE %s: F32-isolated (%d layers), bar 2e-3, worst %.2e\n",
-                    gate_pass ? "PASS" : "FAIL", f32_layers, wc);
+            fprintf(stderr, "[mm3-fd] GATE %s: F32-isolated (%d layers), --attn %s, bar 2e-3, worst %.2e\n",
+                    gate_pass ? "PASS" : "FAIL", f32_layers, a.attn.c_str(), wc);
             if (!gate_pass) {
                 fprintf(stderr,
                         "[mm3-fd]   The checkpointed path disagrees with whole-graph autodiff by more than\n"
@@ -1332,8 +1413,9 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
                         "[mm3-fd]   frame-embedding entry (embed_build/embed_user), or the chunked-CE scale.\n");
             }
             jl("{\"type\":\"gate\",\"check\":\"ckpt-vs-naive-f32\",\"pass\":%s,\"worst\":%.6e,"
-               "\"bar\":2.0e-03,\"layers\":%d}",
-               gate_pass ? "true" : "false", wc, f32_layers);
+               "\"bar\":2.0e-03,\"layers\":%d,\"attn\":\"%s\",\"attnPrec\":\"%s\"}",
+               gate_pass ? "true" : "false", wc, f32_layers, a.attn.c_str(),
+               fd_flash ? dit_flash_prec_label(t.lm.backend).c_str() : "n/a");
         }
     } else if (isolated) {
         // A verdict was asked for and one arm never produced gradients: that is
@@ -1341,6 +1423,14 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         gate_ran  = true;
         gate_pass = false;
         fprintf(stderr, "[mm3-fd] GATE FAIL: one of the two gradient routes did not run\n");
+    }
+
+    // What the fused kernels ACTUALLY ran, read back from the backend rather
+    // than restated from the flag: a tf32 request silently drops to the v1
+    // scalar kernels at D != 128, on pre-Ampere, and on an unaligned view.
+    if (fd_flash) {
+        fprintf(stderr, "[mm3-fd] --attn %s resolved to %s\n", a.attn.c_str(),
+                dit_flash_prec_label(t.lm.backend).c_str());
     }
 
     ggml_backend_sched_free(sched);
@@ -1528,6 +1618,68 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
        (long long) K_max, (long long) S_max, a.rank, a.alpha, a.optimizer.c_str(),
        a.optimizer == "muon" ? (double) a.muon_lr_scale : 1.0);
 
+    // ── --attn: resolve the mode, then PROVE the backend can run it ────────
+    //
+    // Resolved here because everything downstream depends on it: the mask's
+    // dtype (F16 vs F32), the LmCkptCfg the segment graphs read, and the naive
+    // graph's opts. The probe is asked at the run's real geometry (S_max, the
+    // native GQA width) and BEFORE the first buffer, because a `false` from
+    // ggml_backend_supports_op is not something this trainer would otherwise
+    // notice: backend_sched_new registers the CPU backend alongside CUDA, so the
+    // scheduler would quietly split the fused ops onto the CPU — Q/K/V and the
+    // F16 mask over PCIe, 36 layers deep, every micro-step. Correct, unusably
+    // slow, LOW on VRAM, i.e. indistinguishable from a pass on every number
+    // this run reports. So: refuse, never fall back.
+    //
+    // ONE attention shape, as in train-lm: no cross-attention, so S_kv == S ==
+    // S_max. Nkv is the NATIVE GQA width — lm_train_layer never expands heads on
+    // the way to lm_attn_flash, so probing Nh would ask about a geometry that is
+    // never built.
+    const bool      attn_flash    = (a.attn == "flash" || a.attn == "flash-f32");
+    const ggml_prec attn_prec_req = (a.attn == "flash-f32") ? GGML_PREC_F32 : GGML_PREC_DEFAULT;
+    // Belt to the CLI's braces (cmd_mm3_lm_train exits 2 on this pair). A frozen
+    // KV prefix makes the mask rectangular, which lm_build_trunk_embeds asserts
+    // against under flash and the probe above does not cover.
+    if (attn_flash && a.prefix_frames > 0) {
+        fprintf(stderr, "[mm3-lm-train] --attn %s cannot be combined with --prefix-frames %lld\n",
+                a.attn.c_str(), (long long) a.prefix_frames);
+        jl("{\"type\":\"fatal\",\"message\":\"--attn flash cannot be combined with --prefix-frames\"}");
+        mm3_train_lm_free(&t);
+        return 1;
+    }
+    if (attn_flash) {
+        const float ascale = 1.0f / sqrtf((float) c.head_dim);
+        bool        pf = false, pb = false;
+        dit_flash_probe(t.lm.backend, c.head_dim, c.n_heads, c.n_kv_heads, (int) S_max, (int) S_max, /*B=*/1,
+                        ascale, &pf, &pb);
+        if (!(pf && pb)) {
+            fprintf(stderr,
+                    "[mm3-lm-train] --attn %s: backend %s does not support the fused attention ops at this "
+                    "geometry (D %d, Nh %d, Nkv %d, S %lld, S_kv %lld, B 1) — fwd %s / bwd %s. Refusing to "
+                    "start: the scheduler would silently run them on the CPU instead, which is correct, "
+                    "unusably slow, and looks like a pass on every number this run reports. Use --attn exact.\n",
+                    a.attn.c_str(), ggml_backend_name(t.lm.backend), c.head_dim, c.n_heads, c.n_kv_heads,
+                    (long long) S_max, (long long) S_max, pf ? "yes" : "NO", pb ? "yes" : "NO");
+            jl("{\"type\":\"fatal\",\"message\":\"--attn %s unsupported by %s at D %d Nh %d Nkv %d S %lld\"}",
+               a.attn.c_str(), ggml_backend_name(t.lm.backend), c.head_dim, c.n_heads, c.n_kv_heads,
+               (long long) S_max);
+            mm3_train_lm_free(&t);
+            return 1;
+        }
+        fprintf(stderr,
+                "[mm3-lm-train] --attn %s: %s supports FLASH_ATTN_TRAIN and FLASH_ATTN_TRAIN_BACK at D %d, "
+                "Nh %d, Nkv %d, S %lld, B 1 — no CPU split. Requested arithmetic: %s (the backend resolves it "
+                "per launch; the attn event after step 1 records what actually ran)\n",
+                a.attn.c_str(), ggml_backend_name(t.lm.backend), c.head_dim, c.n_heads, c.n_kv_heads,
+                (long long) S_max, attn_prec_req == GGML_PREC_F32 ? "strict f32" : "tf32 where available");
+    }
+    // The REQUESTED arithmetic. GGML_PREC_DEFAULT is 0, which is also what a
+    // zero-initialised op_params gives, and on sm_80+ it resolves to the TF32
+    // kernels — so "flash" already means TF32 unless asked otherwise. What ran
+    // is a separate event, emitted after step 1.
+    jl("{\"type\":\"attn\",\"mode\":\"%s\",\"prec\":\"%s\"}", a.attn.c_str(),
+       attn_flash ? (attn_prec_req == GGML_PREC_F32 ? "f32" : "tf32-where-available") : "n/a");
+
     // ── LoRA (attaches to the model) + optimizer ──
     LmLora     lora;
     const bool want_lokr = a.is_lokr();
@@ -1679,7 +1831,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     const int64_t PFX_Q   = a.prefix_frames > 0 ? max_prompt + a.prefix_frames : 0;
     const int64_t MSK_CAP = (PFX_Q + S_max) * S_max;
     ggml_tensor * t_pos    = ggml_new_tensor_1d(ctx_static, GGML_TYPE_I32, S_max);
-    ggml_tensor * t_msk    = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, MSK_CAP);
+    // F32 under --attn exact — the shipped allocation, byte for byte — and F16
+    // under flash, where ggml_flash_attn_train asserts mask->type == F16. The
+    // flag refuses --prefix-frames, so PFX_Q is 0 whenever this is F16 and
+    // MSK_CAP collapses to the square S_max*S_max the probe above covered.
+    ggml_tensor * t_msk    = lm_mask_alloc(ctx_static, MSK_CAP, attn_flash);
     // Prefill inputs, one chunk wide. SEPARATE from the window's, and not an
     // optimisation to undo: the prefill embeds its chunks while the window's
     // own ids are already uploaded, so sharing a buffer means the prefill
@@ -1871,6 +2027,12 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         cc.kv           = kv_on ? &kvpfx : nullptr;
         cc.chunk        = a.ckpt_chunk;
         cc.weights_bf16 = weights_bf16;                 // Lever A
+        // lm_ckpt_layer_opts is the ONLY place the segment graphs get their
+        // options, so P2 (forward collect), P3 (tail) and P7 (backward) cannot
+        // disagree about the attention formulation — which is what D13's
+        // "recompute must match collect" already depended on.
+        cc.attn_flash   = attn_flash;
+        cc.attn_prec    = attn_prec_req;
         cc.rank_mask = t_rankmask;
         cc.s_max     = (int) S_max;
         cc.layer_lo  = 0;
@@ -1937,7 +2099,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         MM3EmbedCtx   ec{ &t, t_prompt, t_sem, t_ac, P, Fin, t_art, art_k };
         ggml_tensor * h_in = mm3_lm_build_embed(ctx, ec);
 
-        ggml_tensor * hidden = lm_build_trunk_embeds(ctx, &t.lm, h_in, t_pos, t_msk, (int) S);
+        LmLayerOpts   nopts;
+        nopts.attn_flash = attn_flash;
+        nopts.attn_prec  = attn_prec_req;
+        ggml_tensor * hidden =
+            lm_build_trunk_embeds(ctx, &t.lm, h_in, t_pos, t_msk, (int) S, 0, c.n_layers, nopts);
         // Supervised positions are a contiguous tail starting at P-1.
         ggml_tensor * hd = ggml_cont(
             ctx, ggml_view_2d(ctx, hidden, H, n_sup, hidden->nb[1], (size_t) (P - 1) * hidden->nb[1]));
@@ -2223,7 +2389,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             }
             if ((int) S != last_mask_S) {
                 lm_causal_mask((int) S, &msk);
-                ggml_backend_tensor_set(t_msk, msk.data(), 0, msk.size() * sizeof(float));
+                lm_mask_set(t_msk, msk);   // F16 under --attn flash, same bytes under exact
                 last_mask_S = (int) S;
             }
             // Same anchoring as training — an eval measured under a different
@@ -2662,7 +2828,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             }
             if ((int) S != last_mask_S) {
                 lm_causal_mask((int) S, &msk);
-                ggml_backend_tensor_set(t_msk, msk.data(), 0, msk.size() * sizeof(float));
+                lm_mask_set(t_msk, msk);   // F16 under --attn flash, same bytes under exact
                 last_mask_S = (int) S;
             }
             pos.resize((size_t) S);
@@ -2860,7 +3026,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
 
             if ((int) S != last_mask_S) {
                 lm_causal_mask((int) S, &msk);
-                ggml_backend_tensor_set(t_msk, msk.data(), 0, msk.size() * sizeof(float));
+                lm_mask_set(t_msk, msk);   // F16 under --attn flash, same bytes under exact
                 last_mask_S = (int) S;
             }
             // Prompt at 0..P-1; frames at their TRUE position in the track
@@ -3038,6 +3204,17 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                             used_mb, tot_mb, (long long) (vfree / (1024 * 1024)));
                 }
             }
+        }
+        // WHAT ACTUALLY RAN, once a real fused launch has happened. Not a
+        // restatement of --attn: the CUDA dispatch drops to the v1 scalar
+        // kernels on pre-Ampere devices, at D != 128 and on an 8-byte-unaligned
+        // view, so two runs whose logs both say "flash" can differ in
+        // arithmetic. Read from the backend registry, once.
+        if (attn_flash && step == 1) {
+            const std::string prec = dit_flash_prec_label(t.lm.backend);
+            jl("{\"type\":\"attnResolved\",\"mode\":\"%s\",\"prec\":\"%s\"}", a.attn.c_str(),
+               json_escape(prec).c_str());
+            fprintf(stderr, "[mm3-lm-train] --attn %s resolved to %s\n", a.attn.c_str(), prec.c_str());
         }
         // ── epoch boundary ────────────────────────────────────────────────
         // One pass over the training songs. With 13 songs that is 13 steps, so
