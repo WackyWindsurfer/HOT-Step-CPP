@@ -9,8 +9,11 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
+export const DEFAULT_COLLAB_DB = fileURLToPath(new URL('../../../data/collaboration.db', import.meta.url));
+
 export const DISCUSSION_PROTOCOL = `You are participating as the current chat agent, not launching another model.
 Read the brief and transcript before replying. Post concrete proposals and critiques with code references where useful.
+Check new user_direction messages before continuing the plan; the user can post directly from the group chat as You. Address their questions and constraints in the room so every participant can follow.
 Relay user instructions that affect the shared plan as kind=user_direction, clearly identifying them as the user's words or a paraphrase. Never invent user approval.
 Each join returns a participant_id for this chat; retain it and identify yourself honestly. These IDs prevent accidental mixups, not malicious impersonation by trusted local clients.
 After reading a page, retain next_after_id. If has_more is true, read the next page before replying. Never use your posted message ID as the read cursor: other messages may have arrived before it.
@@ -27,9 +30,10 @@ type Message = { id: number; room: string; participant_id: string; author: strin
 export class DiscussionStore {
   private db: Database.Database;
 
-  constructor(dbPath: string) {
-    mkdirSync(dirname(resolve(dbPath)), { recursive: true });
-    this.db = new Database(dbPath, { timeout: 5000 });
+  constructor(dbPath: string, options: { readonly?: boolean } = {}) {
+    if (!options.readonly) mkdirSync(dirname(resolve(dbPath)), { recursive: true });
+    this.db = new Database(dbPath, { timeout: 5000, readonly: options.readonly ?? false, fileMustExist: options.readonly ?? false });
+    if (options.readonly) return;
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
     this.db.exec(`
@@ -87,6 +91,18 @@ export class DiscussionStore {
       const id = randomUUID();
       this.db.prepare('INSERT INTO participants VALUES (?, ?, ?, ?)').run(id, room, name, new Date().toISOString());
       return { discussion: this.room(room), participant_id: id, protocol: DISCUSSION_PROTOCOL, next_step: 'Read from after_id=0 before replying. Joining never overwrites an existing brief or resumes a room.' };
+    }).immediate();
+  }
+  joinViewer(room: string, participantId: string) {
+    return this.db.transaction(() => {
+      this.room(room);
+      const existing = this.db.prepare('SELECT room, name FROM participants WHERE id = ?').get(participantId) as { room: string; name: string } | undefined;
+      if (existing) {
+        if (existing.room !== room || existing.name !== 'You') throw new Error('Viewer identity belongs to another participant. Reload the page with a fresh viewer identity.');
+      } else {
+        this.db.prepare('INSERT INTO participants VALUES (?, ?, ?, ?)').run(participantId, room, 'You', new Date().toISOString());
+      }
+      return participantId;
     }).immediate();
   }
   read(room: string, after: number, limit: number) {
@@ -170,7 +186,7 @@ export class DiscussionStore {
   }
 }
 
-export function registerCollaborationTools(server: McpServer, dbPath = process.env.HOTSTEP_COLLAB_DB ?? fileURLToPath(new URL('../../../data/collaboration.db', import.meta.url))) {
+export function registerCollaborationTools(server: McpServer, dbPath = process.env.HOTSTEP_COLLAB_DB ?? DEFAULT_COLLAB_DB) {
   // Lazy opening keeps existing lyric-only clients independent of collaboration storage.
   let store: DiscussionStore | undefined;
   const get = () => store ??= new DiscussionStore(dbPath);

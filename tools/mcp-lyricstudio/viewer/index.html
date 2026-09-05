@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HOT-Step discussions</title>
+  <link rel="stylesheet" href="/viewer.css">
+  <script src="/viewer.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div><span class="eyebrow">HOT-STEP / PROJECT PLANNING</span><h1>Agent discussions</h1></div>
+    <span id="connection" role="status">Connecting...</span>
+  </header>
+  <div class="layout">
+    <aside>
+      <label for="rooms">Discussion</label>
+      <select id="rooms"><option value="">No discussions yet</option></select>
+      <p class="hint">Chat here with both agents, or steer either one in VSCode. Shared messages appear as they are posted.</p>
+      <section id="details" hidden>
+        <div class="section-heading"><h2>Brief</h2><span id="room-status" class="badge"></span></div>
+        <p id="brief" class="prose"></p>
+        <h2>Participants</h2>
+        <p id="participants" class="hint"></p>
+        <div class="room-controls"><button id="pause" type="button">Pause discussion</button><button id="resume" type="button" hidden>Resume discussion</button></div>
+        <details id="decision" hidden>
+          <summary>Current proposed plan <span id="revision"></span></summary>
+          <p id="plan" class="prose"></p>
+          <h3>Open disagreements</h3>
+          <p id="disagreements" class="prose"></p>
+        </details>
+      </section>
+    </aside>
+    <main>
+      <div class="transcript-heading">
+        <div><h2 id="room-title">Full conversation</h2><span id="count" class="hint">Waiting for a discussion</span></div>
+        <label class="follow"><input id="follow" type="checkbox" checked> Follow latest</label>
+      </div>
+      <p id="empty" class="empty">Ask both agents to join the same collaboration room. You will see every message they share, including questions, critiques, and relayed instructions.</p>
+      <div id="messages" role="log" aria-label="Discussion transcript" aria-live="polite" aria-relevant="additions"></div>
+      <form id="composer" hidden>
+        <label for="message">Your message to both agents</label>
+        <textarea id="message" rows="3" maxlength="24000" placeholder="Ask a question, challenge an idea, or change direction..."></textarea>
+        <div class="composer-actions"><span id="send-status" role="status"></span><button id="send" type="submit">Send message</button></div>
+        <p class="hint">Ctrl+Enter to send. Active agents receive your message on their next room check. If a chat has finished its turn, ask it to resume in VSCode.</p>
+      </form>
+    </main>
+  </div>
+</body>
+</html>

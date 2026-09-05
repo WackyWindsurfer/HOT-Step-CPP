@@ -7,8 +7,9 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "start:collaboration": "tsx src/collaboration-server.ts",
+    "viewer": "tsx src/viewer-server.ts",
     "typecheck": "tsc -p tsconfig.check.json",
-    "test:collaboration": "tsx --test test/collaboration.test.ts",
+    "test:collaboration": "tsx --test test/collaboration.test.ts test/discussion-viewer.test.ts",
     "build": "echo No build step - runs from source via tsx; prompts are shared from server/src/services/lireek/prompts.ts",
     "dev": "tsx watch src/index.ts"
   },

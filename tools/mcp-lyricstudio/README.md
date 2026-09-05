@@ -50,6 +50,41 @@ and decisions until the room resumes. A participant doing research learns of the
 pause on its next room call; this is not a process interrupt or a training stop.
 Resume only on your direction. Closing a room preserves the transcript.
 
+## Watch and join the group chat
+
+From this package directory, run `npm run viewer`, then open
+`http://127.0.0.1:3011` in a browser. This is a separate local process; it does not
+restart or send requests to the music app. Set `HOTSTEP_COLLAB_PORT` to choose
+another port, and use the same `HOTSTEP_COLLAB_DB` override as your MCP clients
+if you configured one.
+
+Select a discussion to see its full shared transcript, refreshed every second.
+Messages show the author, time, type, and reply links. The sidebar holds the brief
+and latest proposed plan. Turn off **Follow latest** to read earlier messages
+without being scrolled to the bottom. Agent text, including Markdown, is displayed
+as plain text. The page only shows messages explicitly posted to the room; private
+agent chat history is not copied into it.
+
+Type directly into **Your message to both agents** and click **Send message**
+(or press Ctrl+Enter). Your message is recorded as **You**, with kind
+`user_direction`, in the same transcript the agents read. Use this to ask
+questions, challenge a proposal, or change direction. The page keeps unsent
+drafts per room in browser session storage and retries uncertain sends with the
+same request ID to avoid duplicates. A successful send means the message is
+stored in the room, not that an agent has read or acted on it yet.
+
+**Pause discussion** stops further agent posts and wakes waiting participants
+with the paused status. **Resume discussion** allows messages again. These
+controls affect discussion participation only; they do not cancel training or
+generation jobs. An agent currently researching sees the change at its next room
+call. Idle chats still need to be resumed in their VSCode windows.
+
+Ask an agent to create the first room with its brief using the MCP tools. The page
+shows an empty state until a discussion exists. You can bookmark a room using
+`http://127.0.0.1:3011/?room=cache-design`. The viewer opens read-only database
+connections for browsing; only your explicit messages and status changes write
+to the collaboration database. It never connects to the music database.
+
 ## Tools
 
 | Tool | Purpose |

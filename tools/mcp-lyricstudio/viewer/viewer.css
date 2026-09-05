@@ -1,0 +1,58 @@
+:root { color-scheme: dark; font: 15px/1.6 system-ui, sans-serif; background: #101419; color: #e5eaf0; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+.topbar { padding: 26px 36px; border-bottom: 1px solid #2b3440; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.eyebrow { color: #86bea8; font-size: 11px; letter-spacing: .14em; }
+h1 { margin: 2px 0 0; font-size: 25px; font-weight: 600; letter-spacing: -.03em; }
+h2 { font-size: 15px; margin: 0 0 10px; font-weight: 600; }
+h3 { font-size: 13px; color: #aebdcc; }
+#connection { color: #9eacba; font-size: 12px; max-width: 380px; text-align: right; }
+#connection[data-state="live"] { color: #91cdb2; }
+#connection[data-state="error"] { color: #e3b381; }
+.layout { max-width: 1500px; margin: auto; display: grid; grid-template-columns: 310px minmax(0, 1fr); }
+aside { padding: 30px 26px; border-right: 1px solid #2b3440; align-self: start; position: sticky; top: 0; max-height: 100vh; overflow: auto; }
+label { font-size: 13px; font-weight: 500; }
+select { width: 100%; margin: 9px 0 4px; padding: 11px; background: #1b232d; color: #e5eaf0; border: 1px solid #3b4857; border-radius: 7px; font: inherit; }
+:focus-visible { outline: 2px solid #9bccff; outline-offset: 3px; }
+.hint { color: #9eacba; font-size: 13px; }
+.prose { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
+#details { border-top: 1px solid #2b3440; margin-top: 25px; padding-top: 22px; }
+.section-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.badge { font-size: 11px; padding: 2px 7px; border: 1px solid #435165; border-radius: 4px; color: #b5c6d9; }
+details { border-top: 1px solid #2b3440; padding-top: 18px; margin-top: 22px; }
+summary { cursor: pointer; font-size: 13px; }
+main { min-width: 0; padding: 30px 38px 60px; }
+.transcript-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 15px; margin-bottom: 28px; }
+.transcript-heading h2 { font-size: 19px; margin: 0; overflow-wrap: anywhere; }
+.follow { white-space: nowrap; color: #b6c4d2; }
+input { accent-color: #86bea8; vertical-align: middle; }
+.empty { color: #9eacba; max-width: 540px; margin: 50px auto; padding: 30px; border: 1px dashed #3b4857; border-radius: 10px; }
+.message { background: #171e27; border: 1px solid #303b49; border-left: 3px solid #88b9a5; border-radius: 8px; padding: 18px 22px; margin: 0 0 16px; scroll-margin: 20px; }
+.message[data-agent="claude"] { border-left-color: #d4a782; }
+.message[data-agent="codex"] { border-left-color: #88b9d2; }
+.message[data-kind="user_direction"] { background: #222337; border-left-color: #b8a2e5; }
+.message[data-kind="status"] { background: #151a20; }
+.message:target { outline: 2px solid #b8a2e5; }
+.message-meta { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 12px; }
+.author { font-weight: 600; }
+.message time, .message-id { color: #94a4b6; font-size: 12px; }
+.message time { margin-left: auto; }
+.message-body { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+.message a { color: #b4cef0; }
+.reply-link { display: block; font-size: 12px; margin-top: 12px; }
+#composer { position: sticky; bottom: 0; background: #101419; padding: 18px 0 0; border-top: 1px solid #384556; margin-top: 24px; }
+textarea { display: block; resize: vertical; width: 100%; min-height: 88px; max-height: 40vh; margin: 8px 0; padding: 12px; border: 1px solid #435165; border-radius: 7px; background: #1b232d; color: #e5eaf0; font: inherit; }
+button { border: 1px solid #435165; border-radius: 6px; padding: 8px 12px; background: #253b33; color: #d8ece2; font: inherit; cursor: pointer; }
+button:hover { background: #335044; }
+button:disabled { opacity: .5; cursor: default; }
+.composer-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+#send-status { color: #d8b98e; font-size: 13px; }
+.room-controls button { font-size: 12px; background: #232d38; }
+[hidden] { display: none !important; }
+@media (max-width: 800px) {
+  .topbar { padding: 20px; align-items: start; }
+  .layout { display: block; }
+  aside { position: static; max-height: none; border-right: 0; border-bottom: 1px solid #2b3440; padding: 20px; }
+  main { padding: 24px 20px; }
+  .transcript-heading { align-items: start; }
+}

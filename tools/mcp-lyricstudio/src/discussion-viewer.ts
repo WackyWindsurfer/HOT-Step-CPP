@@ -1,0 +1,122 @@
+import { createServer, type IncomingMessage } from 'node:http';
+import { existsSync, readFileSync } from 'node:fs';
+import { z } from 'zod';
+import { DEFAULT_COLLAB_DB, DiscussionStore } from './collaboration.js';
+
+async function readJson(request: IncomingMessage) {
+  return new Promise<unknown>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    request.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size <= 128000) chunks.push(chunk);
+    });
+    request.on('error', reject);
+    request.on('aborted', () => reject(new Error('Request cancelled.')));
+    request.on('end', () => {
+      if (size > 128000) { reject(new Error('Message is too large.')); return; }
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+      catch { reject(new Error('Invalid JSON.')); }
+    });
+  });
+}
+
+const humanWrite = z.object({
+  participant_id: z.string().uuid(),
+  request_id: z.string().uuid(),
+  body: z.string().trim().min(1).max(24000),
+  status: z.enum(['active', 'paused', 'closed']).optional(),
+});
+
+// Local group chat. Reads use read-only SQLite connections; explicit human
+// posts and status changes write only to the separate collaboration database.
+export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ?? DEFAULT_COLLAB_DB) {
+  const assetFiles: Record<string, { type: string; file: string }> = {
+    '/': { type: 'text/html', file: 'index.html' },
+    '/viewer.js': { type: 'text/javascript', file: 'viewer.js' },
+    '/viewer.css': { type: 'text/css', file: 'viewer.css' },
+  };
+  const assets = new Map(Object.entries(assetFiles).map(([url, asset]) => [
+    url, { type: asset.type, body: readFileSync(new URL(`../viewer/${asset.file}`, import.meta.url)) },
+  ]));
+  const server = createServer(async (request, response) => {
+    response.setHeader('Cache-Control', 'no-store');
+    response.setHeader('X-Content-Type-Options', 'nosniff');
+    response.setHeader('Content-Security-Policy', "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+    const send = (status: number, value: unknown) => {
+      response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+      response.end(JSON.stringify(value));
+    };
+    const address = server.address();
+    const port = address && typeof address !== 'string' ? address.port : 0;
+    const hosts = [`127.0.0.1:${port}`, `localhost:${port}`];
+    if (!hosts.includes(request.headers.host ?? '') || (request.headers.origin && request.headers.origin !== `http://${request.headers.host}`)) {
+      send(403, { error: 'Open this room from its localhost address.' }); return;
+    }
+    if (request.method !== 'GET' && request.method !== 'POST') {
+      response.setHeader('Allow', 'GET, POST');
+      send(405, { error: 'Method not allowed.' }); return;
+    }
+    if (request.method === 'POST' && (request.headers.origin !== `http://${request.headers.host}` || !request.headers['content-type']?.startsWith('application/json'))) {
+      send(403, { error: 'Send messages from the local discussion page.' }); return;
+    }
+    let store: DiscussionStore | undefined;
+    try {
+      const url = new URL(request.url ?? '/', `http://127.0.0.1:${port}`);
+      const asset = assets.get(url.pathname);
+      if (asset && request.method === 'GET') {
+        response.writeHead(200, { 'Content-Type': `${asset.type}; charset=utf-8` });
+        response.end(asset.body); return;
+      }
+      const roomMatch = /^\/api\/discussions\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,99})(?:\/(messages|status))?$/.exec(url.pathname);
+      const isWrite = request.method === 'POST';
+      if ((!roomMatch && (url.pathname !== '/api/discussions' || isWrite)) || (roomMatch && isWrite !== Boolean(roomMatch[2]))) {
+        send(404, { error: 'Not found.' }); return;
+      }
+      const after = url.searchParams.get('after_id') ?? '0';
+      if (!/^\d+$/.test(after) || !Number.isSafeInteger(Number(after))) {
+        send(400, { error: 'after_id must be a nonnegative safe integer.' }); return;
+      }
+      if (!existsSync(dbPath)) {
+        send(roomMatch ? 404 : 200, roomMatch ? { error: 'Discussion not found. Ask an agent to create it first.' } : { discussions: [] }); return;
+      }
+      // Parse before opening a connection; a slow browser must not hold a DB handle.
+      let input: z.infer<typeof humanWrite> | undefined;
+      if (isWrite) {
+        try { input = humanWrite.parse(await readJson(request)); }
+        catch { send(400, { error: 'Enter a message between 1 and 24,000 characters with valid request and participant IDs.' }); return; }
+      }
+      store = new DiscussionStore(dbPath, { readonly: !isWrite });
+      if (!roomMatch) { send(200, { discussions: store.list(100) }); return; }
+      const room = roomMatch[1];
+      try { store.room(room); }
+      catch (error) {
+        if (error instanceof Error && error.message.startsWith('Unknown discussion:')) {
+          send(404, { error: 'Discussion not found.' }); return;
+        }
+        throw error;
+      }
+      if (input) {
+        try {
+          const participant = store.joinViewer(room, input.participant_id);
+          if (roomMatch[2] === 'status') {
+            if (!input.status) { send(400, { error: 'Choose a discussion status.' }); return; }
+            send(200, store.status(room, participant, input.request_id, input.status, input.body));
+          } else {
+            // The browser cannot choose an agent identity, kind, or decision revision.
+            send(200, store.post(room, participant, input.request_id, 'user_direction', input.body));
+          }
+        } catch (error) {
+          send(409, { error: error instanceof Error ? error.message : 'Unable to post. Refresh the discussion and try again.' });
+        }
+        return;
+      }
+      send(200, store.read(room, Number(after), 100));
+    } catch {
+      send(503, { error: 'Discussion storage is temporarily unavailable. The page will retry.' });
+    } finally {
+      store?.close();
+    }
+  });
+  return server;
+}
