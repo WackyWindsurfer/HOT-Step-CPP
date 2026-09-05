@@ -93,6 +93,23 @@ export class DiscussionStore {
       return { discussion: this.room(room), participant_id: id, protocol: DISCUSSION_PROTOCOL, next_step: 'Read from after_id=0 before replying. Joining never overwrites an existing brief or resumes a room.' };
     }).immediate();
   }
+  createViewerDiscussion(room: string, brief: string, participantId: string, requestId: string) {
+    return this.db.transaction(() => {
+      const existing = this.db.prepare('SELECT id FROM discussions WHERE id = ?').get(room);
+      if (existing) {
+        const previous = this.previous(participantId, requestId);
+        if (!previous || previous.room !== room || previous.kind !== 'user_direction' || previous.body !== brief || this.room(room).brief !== brief) {
+          throw new Error(`Discussion ${room} already exists. Select it above or choose another name.`);
+        }
+        this.joinViewer(room, participantId);
+        return { discussion: this.room(room), participant_id: participantId, message: previous };
+      }
+      this.db.prepare('INSERT INTO discussions (id, brief, created_at) VALUES (?, ?, ?)').run(room, brief, new Date().toISOString());
+      this.joinViewer(room, participantId);
+      const message = this.insert(room, participantId, requestId, 'user_direction', brief);
+      return { discussion: this.room(room), participant_id: participantId, message };
+    }).immediate();
+  }
   joinViewer(room: string, participantId: string) {
     return this.db.transaction(() => {
       this.room(room);

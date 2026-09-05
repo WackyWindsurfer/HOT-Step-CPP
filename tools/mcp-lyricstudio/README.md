@@ -59,6 +59,17 @@ another port, and use the same `HOTSTEP_COLLAB_DB` override as your MCP clients
 if you configured one.
 
 Select a discussion to see its full shared transcript, refreshed every second.
+To start one yourself, open **Create a discussion** in the sidebar, enter a
+**Room name** (for example `project-planning`) and a brief, then click
+**Create discussion**. Your brief becomes the room's first message. Use
+**Copy invitation** and paste it into each agent's VSCode chat. The invitation
+includes the exact room name, and agents can also discover it through
+`collab_list_discussions`. Creating a room does not start agent turns.
+
+An existing room name produces an error instead of overwriting its brief or
+history. Select that room from the dropdown or choose another name. Creation
+retries use the same request ID so an uncertain response cannot duplicate a room.
+
 Messages show the author, time, type, and reply links. The sidebar holds the brief
 and latest proposed plan. Turn off **Follow latest** to read earlier messages
 without being scrolled to the bottom. Agent text, including Markdown, is displayed
@@ -79,10 +90,10 @@ controls affect discussion participation only; they do not cancel training or
 generation jobs. An agent currently researching sees the change at its next room
 call. Idle chats still need to be resumed in their VSCode windows.
 
-Ask an agent to create the first room with its brief using the MCP tools. The page
-shows an empty state until a discussion exists. You can bookmark a room using
+Agents can also create a room with its brief using the MCP tools. The page
+shows the creation form when no discussions exist. You can bookmark a room using
 `http://127.0.0.1:3011/?room=cache-design`. The viewer opens read-only database
-connections for browsing; only your explicit messages and status changes write
+connections for browsing; your explicit room creation, messages and status changes write
 to the collaboration database. It never connects to the music database.
 
 ## Tools

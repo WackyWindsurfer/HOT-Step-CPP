@@ -17,6 +17,23 @@
       <label for="rooms">Discussion</label>
       <select id="rooms"><option value="">No discussions yet</option></select>
       <p class="hint">Chat here with both agents, or steer either one in VSCode. Shared messages appear as they are posted.</p>
+      <details id="new-room" open>
+        <summary>Create a discussion</summary>
+        <form id="create-room">
+          <label for="new-room-name">Room name</label>
+          <input id="new-room-name" type="text" required maxlength="100" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,99}" placeholder="project-planning" autocomplete="off">
+          <p class="hint">Use letters, numbers, dots, underscores or hyphens.</p>
+          <label for="new-room-brief">What should we discuss?</label>
+          <textarea id="new-room-brief" rows="3" required maxlength="24000" placeholder="Describe the topic and any constraints..."></textarea>
+          <button id="create" type="submit">Create discussion</button>
+          <p id="create-status" class="hint" role="status"></p>
+        </form>
+      </details>
+      <section id="invite" hidden>
+        <label for="invite-text">Send this to each agent in VSCode</label>
+        <textarea id="invite-text" readonly rows="4"></textarea>
+        <button id="copy-invite" type="button">Copy invitation</button>
+      </section>
       <section id="details" hidden>
         <div class="section-heading"><h2>Brief</h2><span id="room-status" class="badge"></span></div>
         <p id="brief" class="prose"></p>
@@ -36,7 +53,7 @@
         <div><h2 id="room-title">Full conversation</h2><span id="count" class="hint">Waiting for a discussion</span></div>
         <label class="follow"><input id="follow" type="checkbox" checked> Follow latest</label>
       </div>
-      <p id="empty" class="empty">Ask both agents to join the same collaboration room. You will see every message they share, including questions, critiques, and relayed instructions.</p>
+      <p id="empty" class="empty">Create a discussion using the form on the left, then send the invitation to each agent in VSCode. Their shared messages will appear here.</p>
       <div id="messages" role="log" aria-label="Discussion transcript" aria-live="polite" aria-relevant="additions"></div>
       <form id="composer" hidden>
         <label for="message">Your message to both agents</label>

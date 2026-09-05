@@ -24,6 +24,9 @@ test('group chat HTTP and MCP share the transcript without app access', { timeou
   let store: DiscussionStore | undefined;
   const client = new Client({ name: 'viewer-test-agent', version: '1.0.0' });
   const participant = randomUUID();
+  const create = (value: Record<string, unknown>, origin = base) => fetch(base + '/api/discussions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin }, body: JSON.stringify(value),
+  });
   const write = (endpoint: string, value: Record<string, unknown>, origin = base) => fetch(`${base}/api/discussions/review/${endpoint}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin },
     body: JSON.stringify({ participant_id: participant, request_id: randomUUID(), ...value }),
@@ -38,6 +41,42 @@ test('group chat HTTP and MCP share the transcript without app access', { timeou
       assert.deepEqual(await (await fetch(base + '/api/discussions')).json(), { discussions: [] });
       assert.equal(existsSync(dbPath), false);
     });
+    await t.test('room creation validates input before creating a database', async () => {
+      const input = { room: 'browser-room', brief: 'Review compatibility.', participant_id: randomUUID(), request_id: randomUUID() };
+      assert.equal((await create({ ...input, room: 'bad room name' })).status, 400);
+      assert.equal((await create({ ...input, brief: ' ' })).status, 400);
+      assert.equal((await create(input, 'https://example.com')).status, 403);
+      assert.equal(existsSync(dbPath), false);
+    });
+    await t.test('a human creates the first room with a brief, and retries preserve it', async () => {
+      const input = { room: 'browser-room', brief: 'Review compatibility.', participant_id: randomUUID(), request_id: randomUUID() };
+      const created = await create(input);
+      assert.equal(created.status, 200);
+      const result = await created.json() as any;
+      assert.equal(result.discussion.id, input.room);
+      assert.equal(result.message.author, 'You');
+      assert.equal(result.message.body, input.brief);
+      const retry = await create(input);
+      assert.equal(retry.status, 200);
+      assert.deepEqual(await retry.json(), result);
+      assert.equal((await create({ ...input, brief: 'Overwrite the brief' })).status, 409);
+      assert.equal((await create({ ...input, request_id: randomUUID() })).status, 409);
+      const page = await (await fetch(base + '/api/discussions/browser-room')).json() as any;
+      assert.equal(page.messages.length, 1);
+      assert.equal(page.participants.length, 1);
+      assert.equal(page.discussion.brief, input.brief);
+    });
+    await t.test('simultaneous creation cannot overwrite a room', async () => {
+      const input = { room: 'same-name', brief: 'Original brief', participant_id: randomUUID(), request_id: randomUUID() };
+      const responses = await Promise.all([
+        create(input), create({ ...input, brief: 'Competing brief', participant_id: randomUUID(), request_id: randomUUID() }),
+      ]);
+      assert.deepEqual(responses.map(response => response.status).sort(), [200, 409]);
+      const page = await (await fetch(base + '/api/discussions/same-name')).json() as any;
+      assert.equal(page.participants.length, 1);
+      assert.equal(page.messages.length, 1);
+      assert.equal(page.messages[0].body, page.discussion.brief);
+    });
     store = new DiscussionStore(dbPath);
     const agent = store.join('review', 'Codex', 'Review the design');
     await client.connect(new StdioClientTransport({
@@ -47,6 +86,16 @@ test('group chat HTTP and MCP share the transcript without app access', { timeou
       env: { ...getDefaultEnvironment(), HOTSTEP_COLLAB_DB: dbPath },
       stderr: 'inherit',
     }));
+
+    await t.test('MCP agents can discover and join a room created in the browser', async () => {
+      const listed = await client.callTool({ name: 'collab_list_discussions', arguments: {} });
+      const rooms = JSON.parse((listed.content as { text: string }[])[0].text);
+      assert.ok(rooms.some((room: { id: string }) => room.id === 'browser-room'));
+      const joined = await client.callTool({ name: 'collab_join_discussion', arguments: { room: 'browser-room', name: 'Codex' } });
+      assert.equal(joined.isError, undefined);
+      const result = JSON.parse((joined.content as { text: string }[])[0].text);
+      assert.equal(result.discussion.brief, 'Review compatibility.');
+    });
 
     await t.test('a human post reaches a waiting MCP agent and retry does not duplicate it', async () => {
       const waiting = client.callTool({ name: 'collab_wait_for_message', arguments: { room: 'review', after_id: 0, timeout_ms: 2000 } });
@@ -98,6 +147,8 @@ test('group chat HTTP and MCP share the transcript without app access', { timeou
       assert.equal((await write('messages', { body: ' ' })).status, 400);
       assert.equal((await write('messages', { body: 'x'.repeat(24001) })).status, 400);
       assert.equal((await write('messages', { participant_id: agent.participant_id, body: 'Pretend to be Codex' })).status, 409);
+      assert.equal((await create({ room: 'rollback-test', brief: 'Must roll back', participant_id: agent.participant_id, request_id: randomUUID() })).status, 409);
+      assert.equal((await fetch(base + '/api/discussions/rollback-test')).status, 404);
       assert.equal((await fetch(base + '/api/discussions/review?after_id=-1')).status, 400);
       assert.equal((await fetch(base + '/api/discussions/missing')).status, 404);
       assert.equal((await fetch(base + '/api/discussions', { method: 'DELETE' })).status, 405);

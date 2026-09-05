@@ -27,6 +27,10 @@ const humanWrite = z.object({
   body: z.string().trim().min(1).max(24000),
   status: z.enum(['active', 'paused', 'closed']).optional(),
 });
+const humanCreate = humanWrite.pick({ participant_id: true, request_id: true }).extend({
+  room: z.string().trim().min(1).max(100).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/),
+  brief: z.string().trim().min(1).max(24000),
+});
 
 // Local group chat. Reads use read-only SQLite connections; explicit human
 // posts and status changes write only to the separate collaboration database.
@@ -70,15 +74,25 @@ export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ??
       }
       const roomMatch = /^\/api\/discussions\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,99})(?:\/(messages|status))?$/.exec(url.pathname);
       const isWrite = request.method === 'POST';
-      if ((!roomMatch && (url.pathname !== '/api/discussions' || isWrite)) || (roomMatch && isWrite !== Boolean(roomMatch[2]))) {
+      const isCreate = isWrite && url.pathname === '/api/discussions';
+      if ((!roomMatch && url.pathname !== '/api/discussions') || (roomMatch && isWrite !== Boolean(roomMatch[2]))) {
         send(404, { error: 'Not found.' }); return;
       }
       const after = url.searchParams.get('after_id') ?? '0';
       if (!/^\d+$/.test(after) || !Number.isSafeInteger(Number(after))) {
         send(400, { error: 'after_id must be a nonnegative safe integer.' }); return;
       }
-      if (!existsSync(dbPath)) {
-        send(roomMatch ? 404 : 200, roomMatch ? { error: 'Discussion not found. Ask an agent to create it first.' } : { discussions: [] }); return;
+      if (!existsSync(dbPath) && !isCreate) {
+        send(roomMatch ? 404 : 200, roomMatch ? { error: 'Discussion not found. Create it from the discussion page first.' } : { discussions: [] }); return;
+      }
+      if (isCreate) {
+        let input: z.infer<typeof humanCreate>;
+        try { input = humanCreate.parse(await readJson(request)); }
+        catch { send(400, { error: 'Enter a room name (letters, numbers, dots, underscores or hyphens; max 100 characters) and a brief (1 to 24,000 characters), with valid request and participant IDs.' }); return; }
+        store = new DiscussionStore(dbPath);
+        try { send(200, store.createViewerDiscussion(input.room, input.brief, input.participant_id, input.request_id)); }
+        catch (error) { send(409, { error: error instanceof Error ? error.message : 'Unable to create the discussion.' }); }
+        return;
       }
       // Parse before opening a connection; a slow browser must not hold a DB handle.
       let input: z.infer<typeof humanWrite> | undefined;

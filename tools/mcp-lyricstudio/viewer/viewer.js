@@ -11,6 +11,7 @@ let timer;
 let polling = false;
 let sending = false;
 let roomStatus = 'active';
+let selectionVersion = 0;
 const memory = new Map();
 function saved(key, value) {
   if (value !== undefined) {
@@ -34,9 +35,14 @@ function updateControls() {
   byId('resume').hidden = roomStatus === 'active';
   byId('pause').disabled = sending;
   byId('resume').disabled = sending;
+  for (const id of ['create', 'new-room-name', 'new-room-brief']) byId(id).disabled = sending;
+  byId('invite').hidden = !selectedRoom;
+  const invitation = `Join MCP discussion room "${selectedRoom}" as this chat's agent. Read its brief and full transcript, then participate using the collaboration tools. Keep this to planning and follow the room's participation instructions.`;
+  if (byId('invite-text').value !== invitation) byId('invite-text').value = invitation;
 }
 
 function selectRoom(room) {
+  selectionVersion++;
   if (selectedRoom) saved(`hotstep-draft:${selectedRoom}`, byId('message').value);
   selectedRoom = room;
   roomStatus = 'active';
@@ -47,7 +53,7 @@ function selectRoom(room) {
   messages.replaceChildren();
   byId('details').hidden = true;
   byId('empty').hidden = false;
-  byId('empty').textContent = room ? 'Waiting for the first message.' : 'Ask both agents to join the same collaboration room. Their shared messages will appear here.';
+  byId('empty').textContent = room ? 'Waiting for the first message.' : 'Create a discussion using the form on the left, then send the invitation to each agent in VSCode.';
   byId('room-title').textContent = room || 'Full conversation';
   byId('count').textContent = room ? 'Loading conversation...' : 'Waiting for a discussion';
   const url = new URL(location.href);
@@ -55,6 +61,62 @@ function selectRoom(room) {
   history.replaceState(null, '', url);
   updateControls();
 }
+
+byId('copy-invite').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(byId('invite-text').value);
+    byId('copy-invite').textContent = 'Copied';
+    setTimeout(() => { byId('copy-invite').textContent = 'Copy invitation'; }, 2000);
+  } catch {
+    byId('invite-text').focus();
+    byId('invite-text').select();
+    byId('copy-invite').textContent = 'Press Ctrl+C to copy';
+  }
+});
+for (const id of ['new-room-name', 'new-room-brief']) {
+  byId(id).value = saved(`hotstep-${id}`) || '';
+  byId(id).addEventListener('input', () => saved(`hotstep-${id}`, byId(id).value));
+}
+byId('create-room').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (sending) return;
+  const room = byId('new-room-name').value.trim();
+  const brief = byId('new-room-brief').value.trim();
+  if (!room || !brief) { byId('create-status').textContent = 'Enter a room name and a discussion brief.'; return; }
+  sending = true;
+  updateControls();
+  const key = `hotstep-create:${room}`;
+  const participant_id = identity(room);
+  let pending;
+  try { pending = JSON.parse(saved(key) || 'null'); } catch { /* Replace invalid saved state. */ }
+  if (!pending || pending.brief !== brief || pending.participant_id !== participant_id) {
+    pending = { room, brief, participant_id, request_id: crypto.randomUUID() };
+  }
+  saved(key, JSON.stringify(pending));
+  byId('create-status').textContent = 'Creating discussion...';
+  try {
+    const response = await fetch('/api/discussions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pending), signal: AbortSignal.timeout(8000),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Unable to create the discussion.');
+    saved(key, '');
+    for (const id of ['new-room-name', 'new-room-brief']) { byId(id).value = ''; saved(`hotstep-${id}`, ''); }
+    byId('create-status').textContent = '';
+    byId('new-room').open = false;
+    selectRoom(result.discussion.id);
+    if (![...rooms.options].some(option => option.value === room)) rooms.append(new Option(`${room} (${result.discussion.status})`, room));
+    rooms.value = room;
+    byId('send-status').textContent = 'Room created. Copy the invitation on the left into each agent chat.';
+    clearTimeout(timer);
+    void poll();
+  } catch (error) {
+    byId('create-status').textContent = `${error.message} Your entries are kept.`;
+  } finally {
+    sending = false;
+    updateControls();
+  }
+});
 
 byId('message').addEventListener('input', () => {
   if (selectedRoom) saved(`hotstep-draft:${selectedRoom}`, byId('message').value);
@@ -174,7 +236,9 @@ async function poll() {
   polling = true;
   let nextPollMs = 1000;
   try {
+    const version = selectionVersion;
     const { discussions } = await get('/api/discussions');
+    if (version !== selectionVersion) return;
     const signature = JSON.stringify(discussions.map(room => [room.id, room.status]));
     if (signature !== roomSignature) {
       roomSignature = signature;
@@ -186,9 +250,10 @@ async function poll() {
     rooms.value = selectedRoom;
     if (selectedRoom) {
       const room = selectedRoom;
+      const readVersion = selectionVersion;
       const page = await get(`/api/discussions/${encodeURIComponent(room)}?after_id=${cursor}`);
       // Ignore results from a room that was deselected while the request ran.
-      if (room !== selectedRoom) return;
+      if (room !== selectedRoom || readVersion !== selectionVersion) return;
       byId('details').hidden = false;
       byId('room-title').textContent = room;
       byId('brief').textContent = page.discussion.brief;
