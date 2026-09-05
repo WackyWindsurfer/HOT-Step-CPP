@@ -851,11 +851,16 @@ export const MM3_LM_DEFAULTS = {
   // LoHa they need nothing from the runtime or merge loaders and render as they
   // trained. --pissa is refused together with --resume, which is why the arg
   // builder below drops it when resumeFrom is set rather than letting the run
-  // exit 2. A TRAINABLE --prefix-n still does NOT exist in that parser (MM3's
-  // --prefix-frames is the FROZEN history prefix, a different thing). Emitting a
-  // flag here ahead of the engine is deliberate where it happens: an ace-train
-  // that predates a flag exits 2 loudly on the unknown option, which is a far
-  // better failure than a UI control that silently does nothing.
+  // exit 2. A trainable --prefix-n landed on that parser on 2026-09-05 and is
+  // FD-gated (train/lm-prefix.h; still a different thing from --prefix-frames,
+  // which is the FROZEN history prefix). It is checkpointed-path only, and the
+  // engine refuses it together with --prefix-frames, --attn flash, or
+  // --reg-every — this builder emits prefixFrames unconditionally, so a
+  // prefixN run needs prefixFrames set to 0 or the engine exits 2 naming the
+  // pair. Emitting a flag here ahead of the engine is deliberate where it
+  // happens: an ace-train that predates a flag exits 2 loudly on the unknown
+  // option, which is a far better failure than a UI control that silently does
+  // nothing.
   /** 'exact' is the byte-identical graph; 'flash' routes through the fused
    *  FLASH_ATTN_TRAIN/_BACK ops mm3-lm-train-run.h gained mid-session
    *  (2026-09-05) — real and engine-verified, NOT the ahead-of-the-engine
@@ -1125,9 +1130,10 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     args.push('--artist-token', o.artistToken, '--artist-token-k', String(o.artistTokenK),
               '--artist-token-lr', String(o.artistTokenLr));
   }
-  // Trainable per-layer K/V prefix (lm-prefix.h port). Unlike the frozen
-  // history prefix above, this has no cropAnchor restriction on the AS1.5
-  // side (buildTrainLmArgs emits it unconditionally), so neither does this.
+  // Trainable per-layer K/V prefix (lm-prefix.h). No cropAnchor restriction —
+  // it has no position, unlike the frozen history prefix below. The engine
+  // refuses it alongside --prefix-frames, so the emit below is suppressed
+  // whenever this is on rather than letting the run exit 2.
   if (o.prefixN > 0) args.push('--prefix-n', String(o.prefixN));
   if (o.captionFile) args.push('--caption-file', o.captionFile);
   if (o.trigger) {
@@ -1140,7 +1146,7 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
   args.push('--crop-anchor', o.cropAnchor);
   // The engine refuses a prefix under `zero` anchoring (a history at positions
   // the window then reuses is a contradiction), so never emit that pair.
-  if (o.prefixFrames > 0 && o.cropAnchor === 'song') {
+  if (o.prefixFrames > 0 && o.cropAnchor === 'song' && !(o.prefixN > 0)) {
     args.push('--prefix-frames', String(o.prefixFrames));
     args.push('--prefix-chunk', String(o.prefixChunk));
     if (o.prefixSelftest) args.push('--prefix-selftest');

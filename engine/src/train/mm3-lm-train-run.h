@@ -2057,11 +2057,19 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     } else {
         train_params = lora.params;
     }
+    // The trained parameters that are NOT LoRA factors. mm3-lm-resume.h saves
+    // and restores `lora.params` by name, so without this list a paused run
+    // came back with a zero artist token and a re-seeded prefix — carrying the
+    // Adam momentum of the ones it had thrown away, because the momentum lives
+    // in the optimizer and WAS being saved.
+    std::vector<ggml_tensor *> soft_params;
     if (t_art) {
         train_params.push_back(t_art);
+        soft_params.push_back(t_art);
     }
     for (size_t i = 0; i < pfx.params.size(); i++) {
         train_params.push_back(pfx.params[i]);
+        soft_params.push_back(pfx.params[i]);
     }
 
     LmOptim opt;
@@ -3072,7 +3080,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     int start_step = 0;
     if (!a.resume_path.empty()) {
         std::string rerr;
-        if (!mm3_lm_resume_load(a.resume_path, &rstate, lora, opt, &rerr)) {
+        if (!mm3_lm_resume_load(a.resume_path, &rstate, lora, opt, &rerr, soft_params)) {
             fprintf(stderr, "[mm3-lm-train] resume failed: %s\n", rerr.c_str());
             fatal_msg = "resume failed: " + rerr;
             rc        = 1;
@@ -3779,7 +3787,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
 
             const int64_t t_save0 = ggml_time_ms();
             std::string   serr;
-            if (!mm3_lm_resume_save(state_path, rstate, lora, opt, &serr)) {
+            if (!mm3_lm_resume_save(state_path, rstate, lora, opt, &serr, soft_params)) {
                 // A pause that cannot be resumed is worse than no pause: the
                 // run would silently restart from zero. Fail loudly instead.
                 fprintf(stderr, "[mm3-lm-train] cannot save resume state: %s\n", serr.c_str());
@@ -3817,7 +3825,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         snapshot_state(last_step_done);
         const int64_t t_fin0 = ggml_time_ms();
         std::string   ferr;
-        if (mm3_lm_resume_save(state_path, rstate, lora, opt, &ferr)) {
+        if (mm3_lm_resume_save(state_path, rstate, lora, opt, &ferr, soft_params)) {
             mm3_lm_resume_meta_write(a.out_dir, state_path, rstate, "final", a.optimizer.c_str(),
                                      a.adapter_type.c_str(), a.steps, last_win);
             fprintf(stderr, "[mm3-lm-train] resume state written at step %d in %lld ms — this run can be continued\n",

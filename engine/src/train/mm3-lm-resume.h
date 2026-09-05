@@ -221,8 +221,15 @@ static bool mm3_prodigy_x0_load(const std::string & path, LmOptim & opt, std::st
     return true;
 }
 
+/** `extra` carries trained parameters that are NOT LoRA factors — the artist
+ *  token and the trainable KV prefix. They live in the optimizer, so their
+ *  MOMENTUM was already being saved and restored; their VALUES were not, and a
+ *  resumed run therefore came back with a zero token and a freshly re-seeded
+ *  prefix wearing three steps of Adam state. Empty for every run without one,
+ *  in which case the file is byte-identical to what this wrote before. */
 static bool mm3_lm_resume_save(const std::string & path, const MM3LmResumeState & st,
-                               const LmLora & lora, const LmOptim & opt, std::string * err) {
+                               const LmLora & lora, const LmOptim & opt, std::string * err,
+                               const std::vector<ggml_tensor *> & extra = {}) {
     const std::string tmp = path + ".tmp";
     FILE *            f   = hs_fopen(tmp, "wb");
     if (!f) {
@@ -259,10 +266,13 @@ static bool mm3_lm_resume_save(const std::string & path, const MM3LmResumeState 
     // Tensors: LoRA parameters, then momentum, each block prefixed by its count
     // so a reader knows what to expect without trusting the fingerprint alone.
     {
-        const uint32_t n = (uint32_t) lora.params.size();
+        const uint32_t n = (uint32_t) (lora.params.size() + extra.size());
         ok = ok && mm3_rs_w(f, n);
-        for (uint32_t j = 0; ok && j < n; j++) {
+        for (size_t j = 0; ok && j < lora.params.size(); j++) {
             ok = mm3_rs_write_tensor(f, lora.params[j], &scratch);
+        }
+        for (size_t j = 0; ok && j < extra.size(); j++) {
+            ok = mm3_rs_write_tensor(f, extra[j], &scratch);
         }
     }
     {
@@ -314,7 +324,8 @@ static bool mm3_lm_resume_save(const std::string & path, const MM3LmResumeState 
  *  the file but not in the live run (or vice versa) is an error rather than a
  *  shrug: a partial restore is indistinguishable from training on garbage. */
 static bool mm3_lm_resume_load(const std::string & path, MM3LmResumeState * st,
-                               LmLora & lora, LmOptim & opt, std::string * err) {
+                               LmLora & lora, LmOptim & opt, std::string * err,
+                               const std::vector<ggml_tensor *> & extra = {}) {
     FILE * f = hs_fopen(path, "rb");
     if (!f) {
         *err = "cannot open " + path;
@@ -389,6 +400,11 @@ static bool mm3_lm_resume_load(const std::string & path, MM3LmResumeState * st,
     // Tensors.
     std::unordered_map<std::string, ggml_tensor *> live;
     for (ggml_tensor * p : lora.params) live[ggml_get_name(p)] = p;
+    // A state file written before the soft-prompt halves were saved has no
+    // record for them, so `restored != live.size()` below refuses the resume by
+    // name rather than silently continuing with a zero token. That only affects
+    // runs that HAVE one, and those were never resuming correctly.
+    for (ggml_tensor * p : extra) live[ggml_get_name(p)] = p;
     for (size_t j = 0; j < opt.mom_m.size(); j++) {
         if (opt.mom_m[j]) live[ggml_get_name(opt.mom_m[j])] = opt.mom_m[j];
         if (j < opt.mom_v.size() && opt.mom_v[j]) live[ggml_get_name(opt.mom_v[j])] = opt.mom_v[j];
