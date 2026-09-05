@@ -392,6 +392,11 @@ struct MM3LmAdapterCfg {
     bool        rslora    = false;
     bool        dora      = false;
     std::string peft_type = "LORA";
+    /** Whether adapter_config.json was actually there. Everything above is a
+     *  DEFAULT when it was not, which matters the moment a caller cross-checks
+     *  the file's own marker against it: "the config says LORA" and "there is no
+     *  config" are different claims. */
+    bool        present   = false;
 };
 
 static MM3LmAdapterCfg mm3_lm_adapter_read_cfg(const std::string & sf_path) {
@@ -415,6 +420,7 @@ static MM3LmAdapterCfg mm3_lm_adapter_read_cfg(const std::string & sf_path) {
         if (rs && yyjson_is_true(rs)) out.rslora = true;
         if (dv && yyjson_is_true(dv)) out.dora = true;
         if (pt && yyjson_is_str(pt)) out.peft_type = yyjson_get_str(pt);
+        out.present = true;
     }
     yyjson_doc_free(doc);
     if (alpha > 0.0 && r > 0.0) {
@@ -523,16 +529,51 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
     HS_STAT_T sb {};
     hs_stat(std::string(path), &sb);
 
+    const MM3LmAdapterCfg cfg = mm3_lm_adapter_read_cfg(path);
+
+    // How this file must be APPLIED, taken from the file itself.
+    //
+    // HiRA is otherwise indistinguishable from a plain LoRA on disk: it exports
+    // ordinary lora_A/lora_B and was identified only by adapter_config.json's
+    // peft_type, so a checkpoint whose config went missing (repacked for HF, one
+    // file copied on its own) loaded as LORA and applied y = Wx + s*BAx instead
+    // of y = Wx + (W (.) s*BA)x — a wrong delta, silently. The marker is written
+    // by train/lm-export.h as hot_step.param_method: 0=lora 1=dora 2=hira
+    // 3=loha. An adapter that predates it has none, and behaves as before.
+    std::string marker;
+    {
+        const STEntry * mk = st_find(st, "hot_step.param_method");
+        if (mk && mk->dtype == "F32" && mk->n_dims == 1 && mk->shape[0] == 1) {
+            const int code = (int) *(const float *) st_data(st, *mk);
+            marker = code == 1 ? "dora" : code == 2 ? "hira" : code == 3 ? "loha" : "lora";
+        }
+    }
+    if (!marker.empty() && cfg.present) {
+        const std::string from_cfg = cfg.peft_type == "HIRA"   ? "hira"
+                                     : cfg.peft_type == "LOHA" ? "loha"
+                                     : cfg.dora                ? "dora"
+                                                               : "lora";
+        if (marker != from_cfg) {
+            if (err) {
+                *err = std::string("adapter ") + path + " carries a " + marker
+                     + " marker but adapter_config.json describes " + from_cfg
+                     + " — refusing rather than guessing which one the weights were trained as";
+            }
+            return nullptr;
+        }
+    }
+
     MM3LmAdapter * ad = new MM3LmAdapter();
     ad->path          = path;
     ad->mtime         = (int64_t) sb.st_mtime;
     {
-        const MM3LmAdapterCfg cfg = mm3_lm_adapter_read_cfg(path);
         ad->cfg_ratio  = cfg.ratio;
         ad->cfg_rslora = cfg.rslora;
         ad->cfg_dora   = cfg.dora;
         ad->cfg_peft   = cfg.peft_type;
-        ad->is_hira    = cfg.peft_type == "HIRA";
+        // The marker wins when the config is absent — that is the whole point of
+        // writing it — and the two agree by the refusal above when both exist.
+        ad->is_hira    = cfg.peft_type == "HIRA" || marker == "hira";
     }
     ad->bp            = backend_init("MM3-LM-Adapter");
     ad->backend_ref   = true;

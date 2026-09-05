@@ -1221,7 +1221,15 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
             // same seed, no token, no prefix. That is the A/B this feature is
             // provable by: the LoRA is identical between the two arms, so any
             // difference in the logits is the soft prompt and nothing else.
-            opt.lm_soft = yyjson_obj_get(root, "lm_soft_off") ? nullptr : g_mm3_lm_adapter;
+            //
+            // Read by VALUE, not by presence: a client that serialises its whole
+            // option struct sends "lm_soft_off": false for the normal arm, and
+            // keying on the key alone turned the soft prompt off for exactly the
+            // caller most likely to be running the A/B this endpoint exists for.
+            {
+                yyjson_val * off = yyjson_obj_get(root, "lm_soft_off");
+                opt.lm_soft = (off && yyjson_is_true(off)) ? nullptr : g_mm3_lm_adapter;
+            }
             if (opt.lm_soft && opt.lm_soft->has_artist_token()) {
                 // The trainer splices at the front of the prompt; reproduce it
                 // (mm3-pipeline.h carries the same block and the reasoning).

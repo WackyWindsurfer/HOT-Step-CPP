@@ -108,6 +108,11 @@ struct LmAdapterCfgInfo {
     float       ratio     = -1.0f;
     bool        use_dora  = false;
     std::string peft_type = "LORA";
+    /** Whether adapter_config.json existed at all. Everything above is a
+     *  DEFAULT when it did not, and "the config says LORA" is a different claim
+     *  from "there is no config" the moment the file's own marker is checked
+     *  against it. */
+    bool        present   = false;
 };
 
 static LmAdapterCfgInfo lm_adapter_read_cfg(const std::string & dir) {
@@ -129,6 +134,7 @@ static LmAdapterCfgInfo lm_adapter_read_cfg(const std::string & dir) {
         if (rs && yyjson_is_true(rs)) rslora = true;
         if (dv && yyjson_is_true(dv)) out.use_dora = true;
         if (pt && yyjson_is_str(pt)) out.peft_type = yyjson_get_str(pt);
+        out.present = true;
     }
     yyjson_doc_free(doc);
     // rsLoRA (use_rslora): the trainer applied alpha/sqrt(r) in-graph, so the
@@ -362,12 +368,46 @@ static LMLora * lm_adapter_load(const char * path, float user_scale, ggml_backen
                 break;
             }
         }
-        if (has_hada || cfg_info.peft_type == "LOHA" || cfg_info.peft_type == "HIRA") {
+        // HiRA has no tensor of its own — it exports ordinary lora_A/lora_B — so
+        // a checkpoint that lost its adapter_config.json used to load here as a
+        // plain LoRA and apply the wrong delta silently. train/lm-export.h now
+        // writes what the file IS as hot_step.param_method (0=lora 1=dora
+        // 2=hira 3=loha): read it, refuse a disagreement with the config, and
+        // believe it when there is no config. Adapters that predate the marker
+        // carry none and behave exactly as before.
+        std::string marker;
+        {
+            const STEntry * mk = st_find(st, "hot_step.param_method");
+            if (mk && mk->dtype == "F32" && mk->n_dims == 1 && mk->shape[0] == 1) {
+                const int code = (int) *(const float *) st_data(st, *mk);
+                marker = code == 1 ? "dora" : code == 2 ? "hira" : code == 3 ? "loha" : "lora";
+            }
+        }
+        if (!marker.empty() && cfg_info.present) {
+            const std::string from_cfg = cfg_info.peft_type == "HIRA"  ? "hira"
+                                        : cfg_info.peft_type == "LOHA" ? "loha"
+                                        : cfg_info.use_dora            ? "dora"
+                                                                       : "lora";
+            if (marker != from_cfg) {
+                fprintf(stderr,
+                        "[LM-Adapter] FATAL: %s carries a %s marker but adapter_config.json describes %s.\n"
+                        "             Refusing rather than guessing which one the weights were trained as.\n",
+                        sf_path.c_str(), marker.c_str(), from_cfg.c_str());
+                st_close(&st);
+                return nullptr;
+            }
+        }
+        if (has_hada || marker == "loha" || marker == "hira"
+            || cfg_info.peft_type == "LOHA" || cfg_info.peft_type == "HIRA") {
+            const std::string kind = has_hada                       ? "LoHa"
+                                     : cfg_info.peft_type != "LORA" ? cfg_info.peft_type
+                                     : marker == "hira"             ? "HiRA"
+                                                                    : "LoHa";
             fprintf(stderr,
                     "[LM-Adapter] FATAL: %s is a %s adapter. Its delta is not low-rank, so the planner LM's\n"
                     "             runtime path cannot apply it, and this model has no merge mode to fall back\n"
                     "             on. Train --dora or --rslora instead, or use the MM3 LM (merge mode).\n",
-                    sf_path.c_str(), has_hada ? "LoHa" : cfg_info.peft_type.c_str());
+                    sf_path.c_str(), kind.c_str());
             st_close(&st);
             return nullptr;
         }

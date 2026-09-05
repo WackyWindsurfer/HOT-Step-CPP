@@ -582,16 +582,25 @@ static ggml_tensor * mm3_lm_mm(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
         const MM3LmAdapterPair & p = ad->mods[layer][module];
         if (p.has_lora()) {
             const float s = ad->effective(layer, module, sc);
+            // Scale 0 is "this module's adapter is off", and off must be the
+            // base model — that is the control arm of every A/B, and it is what
+            // mm3_lm_merge_apply produces for the same dials (it `continue`s at
+            // s == 0). The magnitude rescale is NOT 1 at s == 0: m is the
+            // trained magnitude and nrm was computed at the trained scale, so
+            // leaving it applied over a base the delta never touched gave a
+            // distorted model instead of the base, and merge and runtime
+            // disagreed about the same adapter at the same dials.
             if (s != 0.0f) {
                 ggml_tensor * d = ggml_mul_mat(ctx, p.b, ggml_mul_mat(ctx, p.a, x));
                 y               = ggml_add(ctx, y, ggml_scale(ctx, d, s));
-            }
-            if (p.has_dora()) {
-                // DoRA: y <- y * (m / ||W + s*BA||_col). The norm was computed
-                // once at adapter load (mm3-lm-dora.h) — W, A and B are all
-                // frozen here, so it is exact rather than an approximation.
-                // m/nrm is [out] and broadcasts over the token and batch axes.
-                y = ggml_mul(ctx, y, ggml_div(ctx, p.m, p.nrm));
+                if (p.has_dora()) {
+                    // DoRA: y <- y * (m / ||W + s*BA||_col). The norm was
+                    // computed once at adapter load (mm3-lm-dora.h) — W, A and B
+                    // are all frozen here, so it is exact rather than an
+                    // approximation. m/nrm is [out] and broadcasts over the
+                    // token and batch axes.
+                    y = ggml_mul(ctx, y, ggml_div(ctx, p.m, p.nrm));
+                }
             }
         } else if (p.has_lokr()) {
             const float s = ad->effective(layer, module, sc);

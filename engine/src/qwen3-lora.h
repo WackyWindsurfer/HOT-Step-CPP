@@ -181,7 +181,14 @@ static inline struct ggml_tensor * qwen3_linear_lora(struct ggml_context * ctx,
                                                      const QwLoraPair *    p,
                                                      struct ggml_tensor *  x) {
     struct ggml_tensor * y = ggml_mul_mat(ctx, w, x);
-    if (p && p->A && p->B) {
+    // Scale 0 is "adapter off", and off has to mean the BASE model — it is the
+    // control arm of every A/B. The magnitude rescale is not zero-valued at
+    // scale 0 (m is the trained magnitude and nrm was baked at the trained
+    // scale, so m/nrm != 1), so it has to be skipped with the delta rather than
+    // left applied to a base the delta never touched. lm_adapter_dora_prepare
+    // folds user_scale into nrm, which is why this reads p->scale and not the
+    // dial: at user_scale 0 the pair carries m/||W||, not 1.
+    if (p && p->A && p->B && p->scale != 0.0f) {
         struct ggml_tensor * t = ggml_mul_mat(ctx, p->A, x);   // [r, S]
         t = ggml_scale(ctx, t, p->scale);                      // cheapest on the rank-r side
         y = ggml_add(ctx, y, ggml_mul_mat(ctx, p->B, t));      // [out, S]
