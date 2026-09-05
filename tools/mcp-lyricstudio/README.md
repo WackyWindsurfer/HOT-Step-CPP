@@ -125,12 +125,58 @@ of adding a duplicate, and rejects reuse with different content. Decision writes
 also require `expected_revision`, initially zero. If another participant updates
 the decision first, read the new revision before revising it.
 
-Idle limits and the eight-reply limit are instructions to participating agents.
-The server enforces the per-call wait limit and paused/closed write restrictions;
-it does not enforce a total discussion budget. A timeout should not generate a
+Agents now get one contribution before another speaker replies. The server
+enforces this inside the write transaction, across MCP processes. Replies,
+relayed user directions and proposed decisions all count. Record the plan as
+the contribution; do not announce it in a separate message first. Retrying the
+same request remains safe. Agent status events do not unlock another turn;
+human messages and status changes do. Human messages are not turn-limited.
+The name `You` is reserved for the viewer. Rejoining under the same agent label
+does not bypass the limit; use distinct honest labels for distinct chats.
+These are coordination rules for trusted local clients, not authentication.
+
+The protocol asks for about 150 words per reply, with only new evidence or
+disagreements. Agent replies have a hard 2,400-character limit; a recorded plan
+can still contain up to 24,000 characters. No repeated agreement summaries are
+needed after consensus.
+
+MCP reads use `compact: true` by default. They omit unchanged brief and
+participants after the first page, include the latest plan on initial read or
+when its decision event is read, and replace old decision bodies with revision
+references. Missing metadata means unchanged, not removed. Empty waits retain
+status, revision and cursor without resending the plan. `compact: false`
+returns the original full format when historical detail is needed. The browser
+still shows the complete transcript. Write acknowledgements return IDs rather
+than echoing the message or plan.
+
+Idle limits and the eight-reply limit remain instructions to participating agents.
+The bridge cannot cap or measure either chat's private reasoning or total model
+token usage. A timeout should not generate a
 filler message. MCP does not wake a finished chat; start or resume it in its chat
 window. No API keys, extra model invocations, or message delivery to other
 services are added by these tools.
+
+## Export the proposed plan
+
+Expand **Current proposed plan** in the viewer and click **Download plan (.md)**.
+The download contains the latest saved revision and open disagreements, labelled
+as a proposal. It does not export the whole conversation or imply user approval.
+The endpoint is `GET /api/discussions/ROOM/plan.md`; rooms without a plan return 404.
+
+For an offline snapshot without the viewer, run from this tool's directory:
+
+```powershell
+npm run export:plan -- MM3_Optimisations
+```
+
+This writes `docs/plans/discussions/MM3_Optimisations-rN.md` at the repository
+root. Optional `--out FILE.md` chooses another path; `--db DATABASE` chooses a
+database. Existing files are never overwritten. Older plans containing literal
+`\n` separators throughout are converted to actual Markdown line breaks.
+
+Restart both clients' MCP connections to load the new protocol and enforcement.
+Restart the discussion viewer and refresh the page for the download link. These
+tools run from source; the music engine does not need a restart or rebuild.
 
 ## Storage and optional standalone entry point
 

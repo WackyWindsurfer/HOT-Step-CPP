@@ -13,10 +13,14 @@ export const DEFAULT_COLLAB_DB = fileURLToPath(new URL('../../../data/collaborat
 
 export const DISCUSSION_PROTOCOL = `You are participating as the current chat agent, not launching another model.
 Read the brief and transcript before replying. Post concrete proposals and critiques with code references where useful.
+Aim for 150 words per reply; agent messages are limited to 2400 characters. State only new evidence, disagreements, or the next decision. Do not repeat a peer's proposal or announce that you will reply later.
+One agent contribution per turn, including a decision. After posting, wait for a different speaker (another agent or the human) before posting again. Do not send an acknowledgement followed by a proposal or decision. Combine them into one contribution. Rejoining or relaying user_direction does not bypass this rule.
+Once agreement is reached, one agent records the plan as its contribution. Others need not repeat it. Stop when the requested discussion is complete.
 Check new user_direction messages before continuing the plan; the user can post directly from the group chat as You. Address their questions and constraints in the room so every participant can follow.
 Relay user instructions that affect the shared plan as kind=user_direction, clearly identifying them as the user's words or a paraphrase. Never invent user approval.
 Each join returns a participant_id for this chat; retain it and identify yourself honestly. These IDs prevent accidental mixups, not malicious impersonation by trusted local clients.
 After reading a page, retain next_after_id. If has_more is true, read the next page before replying. Never use your posted message ID as the read cursor: other messages may have arrived before it.
+Reads are compact by default: brief and participant list arrive on the initial read only; decision text arrives initially and with a new decision event. Retain earlier values. Older decision bodies are revision references. Use compact=false for full historical text or refreshed participant metadata. Write results acknowledge IDs without echoing your text.
 Use collab_wait_for_message with that cursor between responses. A timeout is not a message: do not post filler or respond repeatedly to your own messages.
 Stop waiting after 3 consecutive timeouts, at the user's deadline, or after 8 substantive replies from you, whichever comes first. Summarize remaining questions in your chat.
 Pause or close the room when asked; all participants must stop discussion work when its status is paused or closed. Resume only on user direction.
@@ -26,6 +30,27 @@ Keep training, generation, and source edits outside this discussion unless separ
 
 type Room = { id: string; brief: string; status: 'active' | 'paused' | 'closed'; revision: number; created_at: string };
 type Message = { id: number; room: string; participant_id: string; author: string; kind: string; body: string; reply_to: number | null; request_id: string; created_at: string };
+type Decision = { room: string; revision: number; message_id: number; plan: string; disagreements: string };
+export const MAX_AGENT_REPLY_CHARS = 2400;
+
+function compactPage(page: ReturnType<DiscussionStore['read']>, after: number) {
+  const decision = page.decision;
+  const includeDecision = after === 0 || page.messages.some(m => m.id === decision?.message_id);
+  return {
+    discussion: { id: page.discussion.id, status: page.discussion.status, revision: page.discussion.revision,
+      ...(after === 0 ? { brief: page.discussion.brief } : {}) },
+    messages: page.messages.map(({ id, author, kind, body, reply_to }) => {
+      if (kind === 'decision') {
+        try { body = JSON.stringify({ revision: JSON.parse(body).expected_revision + 1, superseded: id !== decision?.message_id }); }
+        catch { /* Preserve unrecognised historical events. */ }
+      }
+      return { id, author, kind, body, ...(reply_to !== null ? { reply_to } : {}) };
+    }),
+    has_more: page.has_more, next_after_id: page.next_after_id,
+    ...(after === 0 ? { participants: page.participants } : {}),
+    ...(includeDecision ? { decision } : {}),
+  };
+}
 
 export class DiscussionStore {
   private db: Database.Database;
@@ -82,6 +107,7 @@ export class DiscussionStore {
     return this.db.prepare('SELECT * FROM discussions ORDER BY created_at DESC, id LIMIT ?').all(limit);
   }
   join(room: string, name: string, brief?: string) {
+    if (name.trim().toLowerCase() === 'you') throw new Error('You is reserved for the human discussion viewer. Use your honest agent name.');
     return this.db.transaction(() => {
       const existing = this.db.prepare('SELECT id FROM discussions WHERE id = ?').get(room);
       if (!existing) {
@@ -131,9 +157,35 @@ export class DiscussionStore {
         discussion, messages, has_more: rows.length > limit,
         next_after_id: messages.at(-1)?.id ?? after,
         participants: this.db.prepare('SELECT id, name, joined_at FROM participants WHERE room = ? ORDER BY joined_at').all(room),
-        decision: this.db.prepare('SELECT * FROM decisions WHERE room = ? ORDER BY revision DESC LIMIT 1').get(room) ?? null,
+        decision: this.latestDecision(room),
       };
     })();
+  }
+  latestDecision(room: string) {
+    return (this.db.prepare('SELECT * FROM decisions WHERE room = ? ORDER BY revision DESC LIMIT 1').get(room) as Decision | undefined) ?? null;
+  }
+  exportPlan(room: string) {
+    return this.db.transaction(() => {
+      const discussion = this.room(room);
+      const decision = this.latestDecision(room);
+      if (!decision) throw new Error('No proposed plan has been recorded for this discussion.');
+      // Older clients sometimes sent literal backslash-n separators throughout.
+      const prose = (value: string) => value.includes('\n') ? value : value.replaceAll('\\n', '\n');
+      const markdown = `# ${room}: proposed plan\n\nRevision: ${decision.revision}\n\nRoom status: ${discussion.status}\n\nThis is an agent proposal, not user approval or permission to implement.\n\n## Plan\n\n${prose(decision.plan)}\n\n## Open disagreements\n\n${prose(decision.disagreements) || 'None recorded.'}\n`;
+      return { filename: `${room}-r${decision.revision}.md`, markdown, revision: decision.revision };
+    })();
+  }
+  private checkTurn(room: string, participant: string, body?: string) {
+    const { name } = this.participant(room, participant);
+    if (name === 'You') return; // Human messages can always steer an active room.
+    if (body !== undefined && body.length > MAX_AGENT_REPLY_CHARS) {
+      throw new Error(`Keep agent replies within ${MAX_AGENT_REPLY_CHARS} characters. Combine only new evidence and your proposed next step.`);
+    }
+    // Agent control events must neither consume nor unlock a discussion turn.
+    const last = this.db.prepare("SELECT author FROM messages WHERE room = ? AND (kind != 'status' OR author = 'You') ORDER BY id DESC LIMIT 1").get(room) as { author: string } | undefined;
+    if (last?.author.trim().toLowerCase() === name.trim().toLowerCase()) {
+      throw new Error('Wait for another agent or the human to reply before posting again. Do not retry, rejoin, or post user_direction to bypass the turn limit.');
+    }
   }
   private previous(participant: string, request: string) {
     return this.db.prepare('SELECT * FROM messages WHERE participant_id = ? AND request_id = ?').get(participant, request) as Message | undefined;
@@ -156,6 +208,10 @@ export class DiscussionStore {
         return previous;
       }
       this.active(room);
+      if (replyTo !== undefined && !this.db.prepare('SELECT id FROM messages WHERE room = ? AND id = ?').get(room, replyTo)) {
+        throw new Error('reply_to must refer to a message in this discussion.');
+      }
+      this.checkTurn(room, participant, body);
       return this.insert(room, participant, request, kind, body, replyTo);
     }).immediate();
   }
@@ -183,6 +239,7 @@ export class DiscussionStore {
       }
       const current = this.active(room);
       if (current.revision !== expected) throw new Error(`Decision changed: expected revision ${expected}, current ${current.revision}. Read it before revising.`);
+      this.checkTurn(room, participant);
       const message = this.insert(room, participant, request, 'decision', body);
       const revision = expected + 1;
       this.db.prepare('INSERT INTO decisions VALUES (?, ?, ?, ?, ?)').run(room, revision, message.id, plan, disagreements);
@@ -213,7 +270,7 @@ export function registerCollaborationTools(server: McpServer, dbPath = process.e
   };
   const room = z.string().min(1).max(100).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/).describe('Shared discussion name, for example mm3-cache-design');
   const identity = { room, participant_id: z.string().uuid().describe('ID returned by your join call'), request_id: z.string().min(1).max(100).describe('Unique ID for this write. Reuse it only when retrying identical content.') };
-  const cursor = { room, after_id: z.number().int().min(0).default(0).describe('Last message ID actually read, initially 0'), limit: z.number().int().min(1).max(100).default(50) };
+  const cursor = { room, after_id: z.number().int().min(0).default(0).describe('Last message ID actually read, initially 0'), limit: z.number().int().min(1).max(100).default(50), compact: z.boolean().default(true).describe('Omit repeated metadata and old decision bodies; false returns the full transcript format.') };
   const body = z.string().trim().min(1).max(24000);
 
   server.tool('collab_list_discussions', 'List shared project discussions. Does not start another agent.', { limit: z.number().int().min(1).max(100).default(30) },
@@ -222,18 +279,18 @@ export function registerCollaborationTools(server: McpServer, dbPath = process.e
     { room, name: z.string().trim().min(1).max(100).describe('Honest chat identity, e.g. Codex or Claude'), brief: body.optional() },
     async ({ room, name, brief }) => result(() => get().join(room, name, brief)));
   server.tool('collab_read_discussion', 'Read ordered messages, status and latest proposed decision. Page until has_more=false before replying. Retain next_after_id.', cursor,
-    async ({ room, after_id, limit }) => result(() => get().read(room, after_id, limit)));
-  server.tool('collab_post_message', 'Post a discussion message. Relay relevant user steering as user_direction; distinguish quotes from paraphrases. This grants no permission to implement.',
+    async ({ room, after_id, limit, compact }) => result(() => { const page = get().read(room, after_id, limit); return compact ? compactPage(page, after_id) : page; }));
+  server.tool('collab_post_message', 'Post one reply (max 2400 characters), then wait for another speaker. Relay user steering accurately. No implementation permission.',
     { ...identity, kind: z.enum(['proposal', 'critique', 'question', 'reply', 'user_direction', 'summary']).default('reply'), body, reply_to: z.number().int().positive().optional() },
-    async ({ room, participant_id, request_id, kind, body, reply_to }) => result(() => get().post(room, participant_id, request_id, kind, body, reply_to)));
+    async ({ room, participant_id, request_id, kind, body, reply_to }) => result(() => { const message = get().post(room, participant_id, request_id, kind, body, reply_to); return { id: message.id, kind: message.kind }; }));
   server.tool('collab_wait_for_message', 'Wait for new messages in this active turn; does not wake idle chats. Retain next_after_id; stop after 3 consecutive timeouts or when paused/closed. Never post filler on timeout.',
     { ...cursor, timeout_ms: z.number().int().min(0).max(25000).default(20000) },
-    async ({ room, after_id, limit, timeout_ms }, extra) => result(() => get().wait(room, after_id, timeout_ms, limit, extra.signal)));
+    async ({ room, after_id, limit, timeout_ms, compact }, extra) => result(async () => { const page = await get().wait(room, after_id, timeout_ms, limit, extra.signal); return compact ? { ...compactPage(page, after_id), timed_out: page.timed_out } : page; }));
   server.tool('collab_set_status', 'Pause/close on user request or completion; resume (active) only on user direction. Status changes are visible to all waiting participants.',
     { ...identity, status: z.enum(['active', 'paused', 'closed']), reason: body },
-    async ({ room, participant_id, request_id, status, reason }) => result(() => get().status(room, participant_id, request_id, status, reason)));
-  server.tool('collab_record_decision', 'Save a proposed plan and disagreements, not user approval. expected_revision must match the latest discussion revision to prevent overwrites.',
+    async ({ room, participant_id, request_id, status, reason }) => result(() => { const value = get().status(room, participant_id, request_id, status, reason); return { id: value.event.id, status: value.discussion.status }; }));
+  server.tool('collab_record_decision', 'Save the plan as your one contribution this turn; do not post an announcement first. Not user approval. expected_revision prevents overwrites.',
     { ...identity, expected_revision: z.number().int().min(0), plan: body, disagreements: z.string().max(24000).default('') },
-    async ({ room, participant_id, request_id, expected_revision, plan, disagreements }) => result(() => get().decide(room, participant_id, request_id, expected_revision, plan, disagreements)));
+    async ({ room, participant_id, request_id, expected_revision, plan, disagreements }) => result(() => { const value = get().decide(room, participant_id, request_id, expected_revision, plan, disagreements) as Decision; return { revision: value.revision, message_id: value.message_id }; }));
   return { close: () => { store?.close(); store = undefined; } };
 }

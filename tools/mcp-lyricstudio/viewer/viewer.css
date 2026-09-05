@@ -39,6 +39,7 @@ input { accent-color: #86bea8; vertical-align: middle; }
 .message time { margin-left: auto; }
 .message-body { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
 .message a { color: #b4cef0; }
+#export-plan { color: #b4cef0; }
 .reply-link { display: block; font-size: 12px; margin-top: 12px; }
 #composer { position: sticky; bottom: 0; background: #101419; padding: 18px 0 0; border-top: 1px solid #384556; margin-top: 24px; }
 textarea { display: block; resize: vertical; width: 100%; min-height: 88px; max-height: 40vh; margin: 8px 0; padding: 12px; border: 1px solid #435165; border-radius: 7px; background: #1b232d; color: #e5eaf0; font: inherit; }

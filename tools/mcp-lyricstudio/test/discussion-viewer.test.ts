@@ -117,8 +117,9 @@ test('group chat HTTP and MCP share the transcript without app access', { timeou
     });
     await t.test('agent replies appear through HTTP, including pagination and proposed decisions', async () => {
       const first = store!.read('review', 0, 100).messages[0];
-      for (let i = 0; i < 105; i++) store!.post('review', agent.participant_id, `reply-${i}`, 'reply', `Reply ${i}`, first.id);
-      store!.decide('review', agent.participant_id, 'plan', 0, 'Keep compatibility', 'Check the old format');
+      const peer = store!.join('review', 'Claude');
+      for (let i = 0; i < 105; i++) store!.post('review', i % 2 ? peer.participant_id : agent.participant_id, `reply-${i}`, 'reply', `Reply ${i}`, first.id);
+      store!.decide('review', peer.participant_id, 'plan', 0, 'Keep compatibility', 'Check the old format');
       const page = await (await fetch(base + '/api/discussions/review')).json() as any;
       assert.equal(page.messages.length, 100);
       assert.equal(page.has_more, true);
@@ -131,6 +132,29 @@ test('group chat HTTP and MCP share the transcript without app access', { timeou
       const readonly = new DiscussionStore(dbPath, { readonly: true });
       try { assert.throws(() => readonly.post('review', agent.participant_id, 'readonly', 'reply', 'No write'), /readonly/i); }
       finally { readonly.close(); }
+    });
+    await t.test('Markdown download exports the latest plan and disagreements without writing storage', async () => {
+      const before = store!.read('review', 0, 1000);
+      const download = await fetch(base + '/api/discussions/review/plan.md');
+      assert.equal(download.status, 200);
+      assert.equal(download.headers.get('content-type'), 'text/markdown; charset=utf-8');
+      assert.match(download.headers.get('content-disposition')!, /review-r1.md/);
+      const markdown = await download.text();
+      assert.match(markdown, /Revision: 1/);
+      assert.match(markdown, /Keep compatibility/);
+      assert.match(markdown, /Check the old format/);
+      assert.match(markdown, /not user approval/);
+      assert.doesNotMatch(markdown, /Reply 104/);
+      assert.deepEqual(store!.read('review', 0, 1000), before);
+      assert.equal((await fetch(base + '/api/discussions/browser-room/plan.md')).status, 404);
+      assert.equal((await fetch(base + '/api/discussions/missing/plan.md')).status, 404);
+      assert.equal((await write('plan.md', { body: 'Cannot mutate by export' })).status, 404);
+      store!.decide('review', agent.participant_id, 'revised-plan', 1, 'Updated plan\\n\\n1. Preserve café vocals.\\n2. Keep timing.', 'None');
+      const updated = await fetch(base + '/api/discussions/review/plan.md');
+      assert.match(updated.headers.get('content-disposition')!, /review-r2.md/);
+      const revised = await updated.text();
+      assert.match(revised, /Updated plan\n\n1\. Preserve café vocals\.\n2\./);
+      assert.doesNotMatch(revised, /Keep compatibility/);
     });
     await t.test('human pause wakes agents, rejects further messages, and resume restores posting', async () => {
       const cursor = store!.read('review', 0, 1000).next_after_id;

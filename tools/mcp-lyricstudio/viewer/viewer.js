@@ -37,7 +37,7 @@ function updateControls() {
   byId('resume').disabled = sending;
   for (const id of ['create', 'new-room-name', 'new-room-brief']) byId(id).disabled = sending;
   byId('invite').hidden = !selectedRoom;
-  const invitation = `Join MCP discussion room "${selectedRoom}" as this chat's agent. Read its brief and full transcript, then participate using the collaboration tools. Keep this to planning and follow the room's participation instructions.`;
+  const invitation = `Join MCP discussion room "${selectedRoom}" as this chat's agent. Read the brief and discussion with compact reads. Aim for 150 words: only new evidence, disagreements or the next decision. Post once, then wait for another speaker; a plan revision counts as your turn. Stop at consensus. Planning only.`;
   if (byId('invite-text').value !== invitation) byId('invite-text').value = invitation;
 }
 
@@ -266,6 +266,8 @@ async function poll() {
       byId('participants').textContent = page.participants.map(p => p.name).join(', ') || 'No participants';
       byId('decision').hidden = !page.decision;
       if (page.decision) {
+        byId('export-plan').href = `/api/discussions/${encodeURIComponent(room)}/plan.md`;
+        byId('export-plan').download = `${room}-r${page.decision.revision}.md`;
         byId('revision').textContent = `(revision ${page.decision.revision})`;
         byId('plan').textContent = page.decision.plan;
         byId('disagreements').textContent = page.decision.disagreements || 'None recorded.';

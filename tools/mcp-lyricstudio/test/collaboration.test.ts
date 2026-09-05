@@ -29,7 +29,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
     return client;
   }
   async function call(client: Client, name: string, args: Record<string, unknown>) {
-    const response = await client.callTool({ name, arguments: args });
+    const response = await client.callTool({ name, arguments: name === 'collab_read_discussion' || name === 'collab_wait_for_message' ? { compact: false, ...args } : args });
     const content = response.content as { type: string; text: string }[];
     if (response.isError) throw new Error(content[0].text);
     return JSON.parse(content[0].text);
@@ -72,6 +72,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
     });
 
     await t.test('concurrent retry is stored once; changed retry and foreign identities are rejected', async () => {
+      await post(claude, claudeId, 'retry-direction', 'Please expand on the identity.');
       const [a, b] = await Promise.all([
         post(codex, codexId, 'retry', 'One message'),
         post(claude, codexId, 'retry', 'One message'),
@@ -121,6 +122,14 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
     });
 
     await t.test('simultaneous decision revisions cannot overwrite each other', async () => {
+      await post(claude, claudeId, 'decision-direction', 'Ready to record.');
+      // A human steering message gives both agents an opportunity to propose.
+      const setup = new DiscussionStore(dbPath);
+      try {
+        const humanId = '11111111-1111-4111-8111-111111111111';
+        setup.joinViewer(room, humanId);
+        setup.post(room, humanId, 'pick-plan', 'user_direction', 'Record the proposal.');
+      } finally { setup.close(); }
       const decide = (client: Client, id: string, request: string, plan: string) => call(client, 'collab_record_decision', {
         room, participant_id: id, request_id: request, expected_revision: 0, plan, disagreements: 'Needs user judgment.',
       });
@@ -137,6 +146,57 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
       const page = await call(codex, 'collab_read_discussion', { room });
       assert.equal(page.discussion.revision, 1);
       assert.equal(page.decision.disagreements, 'Needs user judgment.');
+    });
+
+    await t.test('one contribution per speaker is enforced across processes, decisions and rejoining', async () => {
+      const a = await call(codex, 'collab_join_discussion', { room: 'turns', name: 'Codex', brief: 'Take turns' });
+      const b = await call(claude, 'collab_join_discussion', { room: 'turns', name: 'Claude' });
+      const send = (id: string, request_id: string, kind = 'reply', body = 'One contribution') => call(codex, 'collab_post_message', { room: 'turns', participant_id: id, request_id, kind, body });
+      const first = await send(a.participant_id, 'first');
+      assert.deepEqual(Object.keys(first).sort(), ['id', 'kind']);
+      await assert.rejects(send(a.participant_id, 'second'), /Wait for another/);
+      await assert.rejects(send(a.participant_id, 'steering', 'user_direction'), /Wait for another/);
+      const rejoined = await call(claude, 'collab_join_discussion', { room: 'turns', name: 'Codex' });
+      await assert.rejects(send(rejoined.participant_id, 'rejoin'), /Wait for another/);
+      await assert.rejects(call(codex, 'collab_join_discussion', { room: 'turns', name: 'You' }), /reserved/);
+      await assert.rejects(call(codex, 'collab_record_decision', { room: 'turns', participant_id: a.participant_id, request_id: 'decision', expected_revision: 0, plan: 'No second contribution' }), /Wait for another/);
+      await assert.rejects(send(b.participant_id, 'long', 'reply', 'x'.repeat(2401)), /2400/);
+      await send(b.participant_id, 'reply');
+      const decision = await call(codex, 'collab_record_decision', { room: 'turns', participant_id: a.participant_id, request_id: 'decision', expected_revision: 0, plan: 'The accepted proposal', disagreements: 'None' });
+      assert.deepEqual(Object.keys(decision).sort(), ['message_id', 'revision']);
+      await assert.rejects(send(a.participant_id, 'after-decision'), /Wait for another/);
+      // Another agent's control event cannot masquerade as its discussion reply.
+      await call(claude, 'collab_set_status', { room: 'turns', participant_id: b.participant_id, request_id: 'active', status: 'active', reason: 'Continue' });
+      await assert.rejects(send(a.participant_id, 'after-status'), /Wait for another/);
+      assert.deepEqual(await send(a.participant_id, 'first'), first); // Retry still works after turn moves.
+      await send(b.participant_id, 'unlock');
+      const racing = await Promise.allSettled([
+        send(a.participant_id, 'race-a'),
+        call(claude, 'collab_post_message', { room: 'turns', participant_id: a.participant_id, request_id: 'race-b', body: 'Competing contribution' }),
+      ]);
+      assert.equal(racing.filter(r => r.status === 'fulfilled').length, 1);
+      assert.match((racing.find(r => r.status === 'rejected') as PromiseRejectedResult).reason.message, /Wait for another/);
+    });
+
+    await t.test('compact reads retain text once, advance cursors, and omit the plan on empty waits', async () => {
+      const full = await call(codex, 'collab_read_discussion', { room: 'turns' });
+      const page = await call(codex, 'collab_read_discussion', { room: 'turns', compact: true });
+      assert.equal(page.decision.plan, 'The accepted proposal');
+      assert.equal(page.messages[0].body, 'One contribution');
+      assert.equal(page.messages[0].request_id, undefined);
+      assert.equal(page.messages.find((m: any) => m.kind === 'decision').body.includes('accepted proposal'), false);
+      assert.equal(page.next_after_id, full.next_after_id);
+      const idle = await call(codex, 'collab_wait_for_message', { room: 'turns', after_id: page.next_after_id, timeout_ms: 0, compact: true });
+      assert.equal(idle.timed_out, true);
+      assert.equal(idle.decision, undefined);
+      assert.equal(idle.participants, undefined);
+      assert.equal(idle.discussion.brief, undefined);
+      assert.equal(idle.discussion.revision, 1);
+      assert.equal(idle.next_after_id, page.next_after_id);
+      const beforeDecision = full.messages.find((m: any) => m.kind === 'decision').id - 1;
+      const changed = await call(codex, 'collab_read_discussion', { room: 'turns', after_id: beforeDecision, compact: true, limit: 1 });
+      assert.equal(changed.decision.plan, 'The accepted proposal');
+      assert.equal(changed.has_more, true);
     });
 
     await t.test('MCP cancellation leaves the client usable', async () => {
@@ -157,7 +217,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
       const restarted = await connect('test-restarted');
       assert.deepEqual(await call(restarted, 'collab_read_discussion', { room }), before);
       const listed = await call(restarted, 'collab_list_discussions', {});
-      assert.equal(listed.length, 2);
+      assert.equal(listed.length, 3);
       await assert.rejects(post(restarted, codexId, 'closed-post', 'Must fail'), /closed/);
     });
   } finally {
