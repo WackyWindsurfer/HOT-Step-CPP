@@ -84,7 +84,7 @@ import {
 } from '../services/training/pipelineRunner.js';
 import { getTrainingDefaults, setTrainingDefaults } from '../services/training/trainingDefaults.js';
 import {
-  availableMm3Bases, MM3_VRAM_MODEL, recommendMm3Config,
+  availableMm3Bases, MM3_VRAM_MODEL, mm3FlashVramCalibrated, recommendMm3Config,
   MM3_LM_DEFAULTS, missingMm3TrainModels, mm3AdapterRunDir, mm3CodesDir, mm3PriorDir,
   mm3RunName,
   type Mm3BasePrecision,
@@ -92,6 +92,7 @@ import {
 import {
   listMm3Runs, readMm3Run, resolveMm3RunDir, resumeOptionsFor,
 } from '../services/training/mm3Runs.js';
+import { listMm3PreviewCandidates } from '../services/training/mm3Preview.js';
 import { writeSidecar } from '../services/training/sidecarIO.js';
 import { essentiaAvailable } from '../services/training/essentiaClient.js';
 import { engineQueueDepth, engineUnderstandReady, pickBestLm } from '../services/training/understandClient.js';
@@ -1829,7 +1830,25 @@ router.get('/datasets/:id/mm3', async (req: Request, res: Response) => {
       // The coefficients, not just the answer — the form re-estimates locally
       // as rank and crop length move, and must not carry its own copy.
       vramModel: MM3_VRAM_MODEL,
+      // Tells the card whether MM3_VRAM_MODEL.flash carries a real
+      // measurement. False today — see the field's own comment — so a flash
+      // estimate the form computes off vramModel is the SAME number as exact
+      // mode, and the card must caption it "pending measurement", never
+      // present it as a proven saving.
+      flashVramCalibrated: mm3FlashVramCalibrated(),
       defaults: MM3_LM_DEFAULTS,
+      // For the preview-song picker (Mm3TrainCard's select, default = auto).
+      // Empty when the dataset has no codes cache yet — the picker then just
+      // shows "auto". Computed at the DEFAULT holdout; the card's own auto
+      // pick still runs server-side at request time against whatever holdout
+      // the form actually has, so this is a preview of the split, not a
+      // promise of it.
+      previewSongs: (() => {
+        try {
+          return listMm3PreviewCandidates(ds.datasetJsonPath, ds.sourceDir,
+            path.join(codesDir, 'codes'), MM3_LM_DEFAULTS.holdout, sharedCaption || undefined);
+        } catch { return []; }
+      })(),
     });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || String(err) });
@@ -1866,6 +1885,28 @@ router.post('/datasets/:id/mm3-codes', (req: Request, res: Response) => {
   }
 });
 
+/** Refuse (400, naming the conflict) more than one of the mutually-exclusive
+ *  LoRA-family methods, or one of them together with a LoKr adapter type.
+ *
+ *  train-dit's buildTrainDitArgs handles the same illegal states with a
+ *  silent AND-chain precedence order — safe there because the only caller is
+ *  a UI method-row that makes the combination unrepresentable in the first
+ *  place. This route has no such UI in front of it (a raw API call can set
+ *  every boolean at once), so the illegal state needs an explicit refusal
+ *  rather than a precedence order nobody asked for. Returns '' when fine. */
+function mm3MethodConflict(b: Record<string, unknown>, adapterType: 'lora' | 'lokr'): string {
+  const on = (['dora', 'hira', 'loha', 'pissa', 'hra'] as const).filter(k => b[k] === true);
+  if (!on.length) return '';
+  if (adapterType === 'lokr') {
+    return `${on.join(', ')} ${on.length > 1 ? 'are' : 'is a'} LoRA-family parameterization`
+         + `${on.length > 1 ? 's' : ''} and cannot combine with adapterType "lokr".`;
+  }
+  if (on.length > 1) {
+    return `dora, hira, loha, pissa and hra are mutually exclusive — got ${on.join(' + ')}.`;
+  }
+  return '';
+}
+
 /** Mid-run preview options off the request body, clamped.
  *
  *  Returns undefined for "off", which is what the runner checks. Both cadence
@@ -1896,6 +1937,7 @@ function parseMm3PreviewOptions(raw: unknown): Mm3PreviewOptions | undefined {
     seed: int('seed', 424242, 0, 2 ** 31 - 1),
     caption: str('caption'),
     lyrics: str('lyrics'),
+    previewSongId: str('previewSongId'),
     control: p.control !== false,
     controlCaption: str('controlCaption'),
     baseline: p.baseline !== false,
@@ -2103,6 +2145,43 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       }
     }
 
+    const adapterType: 'lora' | 'lokr' = b.adapterType === 'lora' || b.adapterType === 'lokr'
+      ? b.adapterType : D.adapterType;
+    const methodConflict = mm3MethodConflict(b, adapterType);
+    if (methodConflict) {
+      res.status(400).json({ error: methodConflict });
+      return;
+    }
+
+    // Soft prompt: OFF by default. Unlike train-lm (which defaults the token
+    // to the adapter's own name the moment a request says nothing), this is a
+    // brand-new surface for MM3 with no validated recipe yet — see the flag-
+    // contract note on MM3_LM_DEFAULTS.artistToken. An explicit name switches
+    // it on.
+    const artistTokenResolved = typeof b.artistToken === 'string'
+      ? b.artistToken.trim().replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64) : '';
+    const prefixNResolved = num('prefixN', D.prefixN, 0, 64);
+    // 0 = off. Resolved here (not just inline in the job object below) because
+    // the flash-attention coercion right after needs it too.
+    const prefixFramesResolved = num('prefixFrames', D.prefixFrames, 0, 9000);
+    // The engine REFUSES this pair outright (mm3-lm-train-run.h, 2026-09-05
+    // --attn port: "--attn flash cannot be combined with --prefix-frames" is a
+    // fatal exit) — a frozen KV prefix makes the attention mask rectangular
+    // (S_kv = n_pfx + S), which is outside the fused-op capability probe. Same
+    // rule for the (not-yet-wired) trainable prefixN, since it will hit the
+    // identical rectangular-mask shape once it exists. Coerce and log rather
+    // than 400: prefixFrames defaults to 4096 (on), so a bare "turn on flash"
+    // click would otherwise be refused by the engine for a reason the user
+    // never touched — same "coerce, don't fail 5 minutes into a model load"
+    // choice train-lm's own attnBackendEff makes for its KV prefix.
+    let attnBackendResolved: 'exact' | 'flash' = b.attnBackend === 'flash' ? 'flash' : D.attnBackend;
+    if ((prefixFramesResolved > 0 || prefixNResolved > 0) && attnBackendResolved !== 'exact') {
+      console.log(`[Training] mm3-train-lm: attnBackend ${attnBackendResolved} -> exact `
+                 + `(prefixFrames=${prefixFramesResolved}, prefixN=${prefixNResolved} — either one makes the `
+                 + 'attention mask rectangular, which the engine refuses under flash)');
+      attnBackendResolved = 'exact';
+    }
+
     const job = queue.startMm3TrainLmJob(ds.id, {
       manifest:    ds.datasetJsonPath,
       captionsDir,
@@ -2134,11 +2213,24 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
                             num('maxFrames', D.maxFrames, 64, 9000)),
       rankDropout: num('rankDropout', D.rankDropout, 0, 0.9),
       captionFile: sharedCaptionPath,
-      adapterType: b.adapterType === 'lora' || b.adapterType === 'lokr'
-        ? b.adapterType : D.adapterType,
+      adapterType,
       lokrFactor:  num('lokrFactor', D.lokrFactor, 1, 64),
       lokrDim:     num('lokrDim', D.lokrDim, 1, 8192),
       lokrAlpha:   num('lokrAlpha', D.lokrAlpha, 1, 8192),
+      // Flag-contract parity fields (2026-09-05) — see mm3MethodConflict above
+      // for the exclusivity refusal and MM3_LM_DEFAULTS for what each does.
+      attnBackend: attnBackendResolved,
+      rslora: b.rslora === true,
+      dora:   b.dora === true,
+      hira:   b.hira === true,
+      loha:   b.loha === true,
+      pissa:  b.pissa === true,
+      hra:    b.hra === true,
+      loraPlusRatio: num('loraPlusRatio', D.loraPlusRatio, 1, 64),
+      artistToken:   artistTokenResolved,
+      artistTokenK:  num('artistTokenK', D.artistTokenK, 1, 256),
+      artistTokenLr: num('artistTokenLr', D.artistTokenLr, 1e-6, 1),
+      prefixN: prefixNResolved,
       trigger:     typeof b.trigger === 'string' ? b.trigger.trim() : (ds.customTag || ''),
       triggerPrepend: b.triggerPrepend !== false,
       datasetName: ds.name || ds.slug,
@@ -2148,7 +2240,7 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       // 0 = off. The upper bound is the engine's own sequence ceiling; the
       // store is linear in this, so a long prefix is affordable in a way a
       // long crop is not.
-      prefixFrames: num('prefixFrames', D.prefixFrames, 0, 9000),
+      prefixFrames: prefixFramesResolved,
       prefixChunk:  num('prefixChunk', D.prefixChunk, 32, 2048),
       prefixSelftest: b.prefixSelftest !== false,
       lrEndFrac:   num('lrEndFrac', D.lrEndFrac, 0, 1),
@@ -2313,6 +2405,29 @@ router.post('/datasets/:id/mm3-resume-lm', (req: Request, res: Response) => {
     }
     // Previews are a per-launch choice too. Absent = whatever the run used.
     if (b.preview !== undefined) opts.preview = parseMm3PreviewOptions(b.preview);
+    // attnBackend and prefixN are RECIPE knobs (which attention formulation
+    // ran, how much trainable history), not adapter-identity ones — same
+    // re-decidable status train-lm's own attnBackend has (aceTrain.ts). Every
+    // other new flag-contract field (rslora/dora/hira/loha/pissa/hra/
+    // loraPlusRatio/artistToken*) changes what tensors the adapter HAS, so it
+    // stays fixed to whatever `base` recovered from the manifest or the log —
+    // there is no override for it here, on purpose.
+    if (b.attnBackend === 'exact' || b.attnBackend === 'flash') opts.attnBackend = b.attnBackend;
+    if (Number.isFinite(Number(b.prefixN))) {
+      opts.prefixN = Math.min(64, Math.max(0, Math.trunc(Number(b.prefixN))));
+    }
+    // Same engine refusal as the start route: --attn flash + a nonzero
+    // prefixFrames (the run's own recorded frozen history prefix, fixed —
+    // it is adapter-identity, not re-decidable here) makes the mask
+    // rectangular and the engine exits fatally. prefixFrames defaults to
+    // 4096, so most runs carry a nonzero one; coerce rather than let a bare
+    // "resume with flash on" request fail on an unrelated setting.
+    if ((opts.prefixN > 0 || opts.prefixFrames > 0) && opts.attnBackend !== 'exact') {
+      console.log('[Training] mm3-resume-lm: attnBackend -> exact '
+                 + `(prefixFrames=${opts.prefixFrames}, prefixN=${opts.prefixN} — either one makes the `
+                 + 'attention mask rectangular, which the engine refuses under flash)');
+      opts.attnBackend = 'exact';
+    }
     opts.resumeFrom = run.resume.statePath;
     opts.resumeStep = from;
 
@@ -2931,6 +3046,20 @@ router.post('/datasets/:id/train-lm', async (req: Request, res: Response) => {
       bwd,
       captionDropout,
       rslora: body.rslora === true,
+      // LoRA-family parameterizations (2026-09-05). Exclusivity is enforced by
+      // buildTrainLmArgs's precedence chain (dora > rslora > hira > loha >
+      // pissa > hra), the same silent-AND-chain convention buildTrainDitArgs
+      // already uses — this route has no method-row UI making the illegal
+      // combination unrepresentable EITHER, same as train-dit's route today,
+      // so a raw API call setting two of these gets the higher-precedence one
+      // rather than a 400. (MM3's mm3-train-lm route refuses instead — see
+      // mm3MethodConflict — because that surface is new enough to hold the
+      // stricter bar from the start.)
+      dora: body.dora === true,
+      hira: body.hira === true,
+      loha: body.loha === true,
+      pissa: body.pissa === true,
+      hra: body.hra === true,
       loraPlusRatio: numOpt(body.loraPlusRatio, 1),
       // Soft prompt: the name becomes a safetensors key, so keep it to a slug.
       artistToken: artistTokenResolved,

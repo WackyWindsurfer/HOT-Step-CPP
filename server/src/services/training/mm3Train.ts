@@ -240,7 +240,21 @@ export const MM3_VRAM_MODEL = {
    *  stream plus the window (the window splices its own K/V onto the end).
    *  Predicted 848 MB at 750 prefix frames against 856 measured. */
   prefixMbPerColumn: 0.28125,
+  /** Flash-attention training's own coefficient set (2026-09-05 flag-contract
+   *  work) — a NAMED PLACE for the two-anchor fit the flash-attn-training
+   *  skill's methodology calls for, once mm3-lm-train-run.h gains --attn flash
+   *  and someone has actually measured it. null = not measured: `estimateMm3PeakMb`
+   *  falls back to the exact-mode quadratic term rather than guessing a
+   *  halving, and callers should show "flash: estimate pending measurement"
+   *  instead of a number they cannot stand behind. Shape mirrors the fields
+   *  flash mode would plausibly change; extend it once real anchors exist. */
+  flash: null as null | { perTokenSqMb: number },
 } as const;
+
+/** Whether MM3_VRAM_MODEL.flash carries a real measurement. False today. */
+export function mm3FlashVramCalibrated(m: typeof MM3_VRAM_MODEL = MM3_VRAM_MODEL): boolean {
+  return m.flash !== null;
+}
 
 /** Extra peak VRAM from a frozen KV prefix, in MB. 0 when it is off.
  *
@@ -266,7 +280,8 @@ export function estimateMm3PrefixMb(prefixFrames: number, maxFrames: number,
 export function estimateMm3PeakMb(baseBytes: number, rank: number, maxFrames: number,
                                   extraMb = 0,
                                   optimizer: 'muon' | 'adamw' | 'prodigy' = MM3_LM_DEFAULTS.optimizer,
-                                  prefixFrames = 0): number {
+                                  prefixFrames = 0,
+                                  attn: 'exact' | 'flash' = 'exact'): number {
   const M      = MM3_VRAM_MODEL;
   const loaded = baseBytes / 1048576 + M.loadedOverheadMb;
   const S      = M.promptTokens + Math.max(0, maxFrames);
@@ -277,7 +292,15 @@ export function estimateMm3PeakMb(baseBytes: number, rank: number, maxFrames: nu
   // gap against 2.66 predicted.
   const extraBuffers = optimizer === 'adamw' ? 1 : optimizer === 'prodigy' ? 3 : 0;
   const perRank = M.perRankMb + extraBuffers * M.adamwPerRankMb;
-  return Math.round(loaded + perRank * rank + M.perTokenMb * S + M.perTokenSqMb * S * S
+  // Flash mode is the whole reason this term exists to be replaced — non-flash
+  // attention backpropagates through retained [S, S, heads] scores, and flash
+  // does not. But M.flash is null until a real two-anchor fit exists (see the
+  // field's comment), so asking for 'flash' with no measurement falls back to
+  // the exact-mode coefficient rather than reporting a saving nobody has
+  // proven. mm3FlashVramCalibrated() tells a caller whether the number below
+  // actually reflects flash mode or is standing in for it.
+  const perTokenSqMb = (attn === 'flash' && M.flash) ? M.flash.perTokenSqMb : M.perTokenSqMb;
+  return Math.round(loaded + perRank * rank + M.perTokenMb * S + perTokenSqMb * S * S
                     + M.constMb + extraMb + estimateMm3PrefixMb(prefixFrames, maxFrames));
 }
 
@@ -808,6 +831,57 @@ export const MM3_LM_DEFAULTS = {
    *  and is what the UI offers the moment one is picked. */
   regEvery: 3,
   regTopK: 64,
+
+  // ── Flag-contract parity with train-dit / train-lm (2026-09-05) ──────────
+  //
+  // ENGINE STATUS, updated as the concurrent engine port landed DURING this
+  // change: the mm3-lm-train parser (engine/tools/ace-train.cpp) already
+  // accepted --artist-token[-k/-lr] and --lora-plus-ratio before this work
+  // started (they existed, they were just never wired past the arg builder);
+  // --attn exact|flash|flash-f32 landed on mm3-lm-train mid-session (R3 of the
+  // flash-attn roadmap) and is real — see the note on attnBackend below.
+  // --rslora, --dora, --hira, --loha, --pissa[-oversample/-iters], --hra and a
+  // TRAINABLE --prefix-n still do NOT exist in that parser as of this commit —
+  // they are being ported concurrently, to the same names train-dit and
+  // train-lm use. Emitting them here ahead of the engine change is
+  // deliberate: an ace-train that predates a flag exits 2 loudly on the
+  // unknown option, which is a far better failure than a UI control that
+  // silently does nothing.
+  /** 'exact' is the byte-identical graph; 'flash' routes through the fused
+   *  FLASH_ATTN_TRAIN/_BACK ops mm3-lm-train-run.h gained mid-session
+   *  (2026-09-05) — real and engine-verified, NOT the ahead-of-the-engine
+   *  case the rest of this block is. The engine REFUSES `--attn flash`
+   *  together with a nonzero `--prefix-frames` (the frozen history prefix
+   *  below, default 4096): a KV prefix makes the attention mask rectangular
+   *  (S_kv = n_pfx + S), which the fused ops do not accept, and the run exits
+   *  fatally rather than silently falling back. The mm3-train-lm and
+   *  mm3-resume-lm routes coerce this pair to 'exact' and log it — see
+   *  attnBackendResolved in routes/training.ts — so a bare "turn on flash"
+   *  click is never refused for a setting the user never touched. Only the
+   *  non-default value is emitted, so a build that predates --attn on this
+   *  subcommand stays compatible for every existing caller. */
+  attnBackend: 'exact' as 'exact' | 'flash',
+  /** LoRA-family parameterizations, mutually exclusive with each other and
+   *  with LoKr (adapterType). Same semantics as train-dit's dora/hira/loha/
+   *  pissa/hra — see DitMethod in TrainDitForm.tsx. */
+  rslora: false,
+  dora: false,
+  hira: false,
+  loha: false,
+  pissa: false,
+  hra: false,
+  /** LoRA+'s B-side learning-rate multiplier. 1 = off (paper default 16). */
+  loraPlusRatio: 1,
+  /** Soft prompt (train/artist-token-io.h via the shared LM trainer core).
+   *  '' = no token. Name defaults to the run's adapter name in the UI, not
+   *  here — this module has no adapter name to default to. */
+  artistToken: '',
+  artistTokenK: 32,
+  artistTokenLr: 0.005,
+  /** Trainable per-layer K/V prefix (train/lm-prefix.h) — NOT the same thing
+   *  as prefixFrames/prefixChunk above, which is a FROZEN prefix baked from
+   *  real audio history (train/mm3-lm-kvprefix.h). 0 = off. */
+  prefixN: 0,
 } as const;
 
 /** Where a regularisation corpus's captured base distributions live.
@@ -890,6 +964,26 @@ export interface ResolvedMm3TrainLmOptions {
   lokrFactor: number;
   lokrDim: number;
   lokrAlpha: number;
+  /** Attention backend. See MM3_LM_DEFAULTS.attnBackend. */
+  attnBackend: 'exact' | 'flash';
+  /** LoRA-family parameterizations. All five are LoKr-incompatible and
+   *  mutually exclusive with each other (dora > rslora > hira > loha > pissa
+   *  > hra precedence in buildMm3TrainLmArgs, textually identical to
+   *  buildTrainDitArgs / buildTrainLmArgs). See MM3_LM_DEFAULTS. */
+  rslora: boolean;
+  dora: boolean;
+  hira: boolean;
+  loha: boolean;
+  pissa: boolean;
+  hra: boolean;
+  loraPlusRatio: number;
+  /** Soft prompt. '' = no token. See MM3_LM_DEFAULTS.artistToken. */
+  artistToken: string;
+  artistTokenK: number;
+  artistTokenLr: number;
+  /** Trainable per-layer K/V prefix. 0 = off. Distinct from prefixFrames/
+   *  prefixChunk (the frozen history prefix) — see MM3_LM_DEFAULTS.prefixN. */
+  prefixN: number;
   /** One caption for EVERY track. The mechanism that binds a style to the
    *  prompt: with the caption constant across rows the adapter has nowhere
    *  to put the style except into itself. Empty = per-song captions. */
@@ -991,7 +1085,41 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     args.push('--lokr-factor', String(o.lokrFactor));
     args.push('--lokr-dim', String(o.lokrDim));
     args.push('--lokr-alpha', String(o.lokrAlpha));
+  } else {
+    // LoRA-family parameterizations. Precedence order is textually identical
+    // to buildTrainDitArgs / buildTrainLmArgs (aceTrain.ts) so the same set of
+    // booleans never resolves to a different method on a different trainer:
+    // dora, then rslora (independent of dora — a rank-scaling modifier, not a
+    // competing method), then hira (excludes dora), loha (excludes dora/hira),
+    // pissa (excludes dora/hira/loha, and not resumable), hra (excludes
+    // dora/hira/loha/pissa/rslora).
+    if (o.dora) args.push('--dora');
+    if (o.rslora) args.push('--rslora');
+    if (o.hira && !o.dora) args.push('--hira');
+    if (o.loha && !o.dora && !o.hira) args.push('--loha');
+    if (o.pissa && !o.dora && !o.hira && !o.loha && !o.resumeFrom) args.push('--pissa');
+    if (o.hra && !o.dora && !o.hira && !o.loha && !o.pissa && !o.rslora) args.push('--hra');
   }
+  if (o.loraPlusRatio && o.loraPlusRatio !== 1) args.push('--lora-plus-ratio', String(o.loraPlusRatio));
+  // Attention backend — REAL on mm3-lm-train (landed 2026-09-05, mid-session,
+  // alongside this change). Only the non-default value is emitted (same
+  // "older exe stays compatible" rule as train-lm's --attn), so a build that
+  // predates it never sees the flag for the 'exact' default every existing
+  // caller still asks for. The route resolves the flash+frozen-prefix
+  // collision (engine exit) before this ever runs — see attnBackendResolved
+  // in routes/training.ts.
+  if (o.attnBackend && o.attnBackend !== 'exact') args.push('--attn', o.attnBackend);
+  // Soft prompt. Uses the SAME flag names the parser already accepts
+  // (--artist-token/-k/-lr) — this is not a new engine surface, just a
+  // previously-unwired one.
+  if (o.artistToken) {
+    args.push('--artist-token', o.artistToken, '--artist-token-k', String(o.artistTokenK),
+              '--artist-token-lr', String(o.artistTokenLr));
+  }
+  // Trainable per-layer K/V prefix (lm-prefix.h port). Unlike the frozen
+  // history prefix above, this has no cropAnchor restriction on the AS1.5
+  // side (buildTrainLmArgs emits it unconditionally), so neither does this.
+  if (o.prefixN > 0) args.push('--prefix-n', String(o.prefixN));
   if (o.captionFile) args.push('--caption-file', o.captionFile);
   if (o.trigger) {
     args.push('--trigger', o.trigger);

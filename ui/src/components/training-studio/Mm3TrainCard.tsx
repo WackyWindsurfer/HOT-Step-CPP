@@ -22,7 +22,7 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { estimateMm3PeakMb, estimateMm3PrefixMb } from '../../services/trainingApi';
+import { estimateMm3PeakMb, estimateMm3PrefixMb, mm3FlashVramCalibrated } from '../../services/trainingApi';
 import type { Mm3TrainLmRequest } from '../../services/trainingApi';
 import { useTrainingStore } from '../../stores/trainingStore';
 import { JobProgress } from './JobProgress';
@@ -61,6 +61,25 @@ interface FormState {
   muonLrScale: number;
   adapterType: 'lora' | 'lokr';
   lokrFactor: number;
+  // ── Flag-contract parity fields (2026-09-05) ───────────────────────────
+  attnBackend: 'exact' | 'flash';
+  rslora: boolean;
+  dora: boolean;
+  hira: boolean;
+  loha: boolean;
+  pissa: boolean;
+  hra: boolean;
+  loraPlusRatio: number;
+  /** Soft prompt (a token + a TRAINABLE prefix, both new to MM3). Distinct
+   *  from prefixFrames below, which is the FROZEN real-audio history prefix —
+   *  a different engine mechanism (train/mm3-lm-kvprefix.h vs lm-prefix.h). */
+  artistTokenOn: boolean;
+  artistToken: string;
+  artistTokenK: number;
+  artistTokenLr: number;
+  prefixN: number;
+  /** '' = auto-pick (server-side ladder — see mm3Preview.ts). */
+  previewSongId: string;
   sharedCaption: string;
   gradAccum: number;
   seed: number;
@@ -83,6 +102,21 @@ interface FormState {
   regEvery: number;
   regTopK: number;
 }
+
+/** Same shape as TrainDitForm's DitMethod / TrainLmForm's LmMethod (2026-09-05
+ *  flag-contract parity). LoKr is its own type; DoRA/HiRA/LoHa/HRA are the
+ *  LoRA type with one flag set. */
+type Mm3Method = 'lokr' | 'lora' | 'dora' | 'hira' | 'loha' | 'hra';
+const methodOf = (s: FormState): Mm3Method =>
+  s.adapterType === 'lokr' ? 'lokr' : s.dora ? 'dora' : s.hira ? 'hira' : s.loha ? 'loha' : s.hra ? 'hra' : 'lora';
+const MM3_METHOD_KEYS: Record<Mm3Method, { label: string; info: string }> = {
+  lokr: { label: 'adapterLokr', info: 'adapterTypeHint' },
+  lora: { label: 'adapterLora', info: 'adapterTypeHint' },
+  dora: { label: 'dora', info: 'doraInfo' },
+  hira: { label: 'hira', info: 'hiraInfo' },
+  loha: { label: 'loha', info: 'lohaInfo' },
+  hra:  { label: 'hra',  info: 'hraInfo' },
+};
 
 const NumField: React.FC<{
   label: string; value: number; onChange: (v: number) => void; step?: number; hint?: string;
@@ -156,6 +190,24 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
     muonLrScale: status.defaults.muonLrScale ?? 64,
     adapterType: status.defaults.adapterType ?? 'lora',
     lokrFactor: status.defaults.lokrFactor ?? 6,
+    // Flag-contract parity (2026-09-05). All off/exact/1 by default — none of
+    // these has an MM3-specific measurement yet (see the hover text), and
+    // --attn/--dora/--hira/--loha/--pissa/--hra/--prefix-n are landing in the
+    // mm3-lm-train engine parser concurrently with this UI, not before it.
+    attnBackend: status.defaults.attnBackend ?? 'exact',
+    rslora: status.defaults.rslora ?? false,
+    dora: status.defaults.dora ?? false,
+    hira: status.defaults.hira ?? false,
+    loha: status.defaults.loha ?? false,
+    pissa: status.defaults.pissa ?? false,
+    hra: status.defaults.hra ?? false,
+    loraPlusRatio: status.defaults.loraPlusRatio ?? 1,
+    artistTokenOn: !!status.defaults.artistToken,
+    artistToken: status.defaults.artistToken ?? '',
+    artistTokenK: status.defaults.artistTokenK ?? 32,
+    artistTokenLr: status.defaults.artistTokenLr ?? 0.005,
+    prefixN: status.defaults.prefixN ?? 0,
+    previewSongId: '',
     sharedCaption: status.sharedCaption ?? '',
     gradAccum: status.defaults.gradAccum ?? 1,
     seed: status.defaults.seed ?? 42,
@@ -206,36 +258,60 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
   // single term after the base itself, so an estimate pinned to the defaults
   // would be wrong for exactly the users who need it most.
   const chosen = status?.bases?.find(b => b.id === form?.basePrecision);
+  const flashCalibrated = status ? (status.flashVramCalibrated ?? mm3FlashVramCalibrated(status.vramModel)) : false;
   const peak = (() => {
     if (!form || !status?.vramModel || !chosen) return null;
     const mb    = estimateMm3PeakMb(chosen.bytes, form.rank, form.maxFrames, status.vramModel,
                                     form.optimizer,
-                                    form.cropAnchor === 'song' ? form.prefixFrames : 0)
+                                    form.cropAnchor === 'song' ? form.prefixFrames : 0,
+                                    256, form.attnBackend)
                 + (chosen.extraMb || 0);
+    // Flash mode's own coefficients are not measured yet (MM3_VRAM_MODEL.flash
+    // is null server-side), so the number above is silently standing in for
+    // exact mode's — say so rather than presenting it as a proven saving.
+    const flashCaveat = form.attnBackend === 'flash' && !flashCalibrated
+      ? ` (${t('trainingStudio.mm3.flashVramPending', 'flash: estimate pending measurement')})` : '';
     const total = status.gpuTotalMb || 0;
     const gb    = (mb / 1024).toFixed(1);
     // 0 means the engine could not be read, NOT a card with no memory. Show the
     // estimate without a verdict rather than inventing a scary one.
     if (total <= 0) {
-      return { text: t('trainingStudio.mm3.peakUnknown', { gb }), tone: 'text-zinc-500' };
+      return { text: t('trainingStudio.mm3.peakUnknown', { gb }) + flashCaveat, tone: 'text-zinc-500' };
     }
     const totalGb = (total / 1024).toFixed(1);
     if (mb + 1536 <= total) {
-      return { text: t('trainingStudio.mm3.peakFits', { gb, totalGb }), tone: 'text-emerald-500' };
+      return { text: t('trainingStudio.mm3.peakFits', { gb, totalGb }) + flashCaveat, tone: 'text-emerald-500' };
     }
     if (mb <= total) {
       // Fits on paper, with nothing left for the desktop. This is the state that
       // produced 12-14 s/step instead of 3.7 in the f16 A/B, so it is a warning
       // rather than an error.
-      return { text: t('trainingStudio.mm3.peakTight', { gb, totalGb }), tone: 'text-amber-500' };
+      return { text: t('trainingStudio.mm3.peakTight', { gb, totalGb }) + flashCaveat, tone: 'text-amber-500' };
     }
     // "Pick a smaller base" is bad advice when the server already established
     // that nothing in the catalogue fits at any rank on the ladder.
     if (status.recommended?.overBudget) {
-      return { text: t('trainingStudio.mm3.peakNoFit', { gb, totalGb }), tone: 'text-rose-500' };
+      return { text: t('trainingStudio.mm3.peakNoFit', { gb, totalGb }) + flashCaveat, tone: 'text-rose-500' };
     }
-    return { text: t('trainingStudio.mm3.peakOver', { gb, totalGb }), tone: 'text-rose-500' };
+    return { text: t('trainingStudio.mm3.peakOver', { gb, totalGb }) + flashCaveat, tone: 'text-rose-500' };
   })();
+
+  // The card has no per-type default BUNDLE the way TrainDitForm's pickType
+  // does — lokrFactor/rank/alpha already coexist in one flat state, only
+  // their visibility changes — so switching method here is just the flag
+  // set. PiSSA drops when hopping off plain LoRA; rsLoRA drops for HRA.
+  const method: Mm3Method = form ? methodOf(form) : 'lora';
+  const pickMethod = (m: Mm3Method) => {
+    if (!form || m === method) return;
+    if (m === 'lokr') { set('adapterType', 'lokr'); return; }
+    setEdits(prev => ({
+      ...prev,
+      adapterType: 'lora',
+      dora: m === 'dora', hira: m === 'hira', loha: m === 'loha', hra: m === 'hra',
+      pissa: m === 'lora' ? form.pissa : false,
+      rslora: m === 'hra' ? false : form.rslora,
+    }));
+  };
 
   const startTrain = async () => {
     if (!form) return;
@@ -289,8 +365,33 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
             baseline: form.previewBaseline,
             scaleMlp: form.previewScaleMlp,
             ...(form.previewCaption.trim() ? { caption: form.previewCaption.trim() } : {}),
+            // Explicit pick wins over the caption box above only because the
+            // form never lets both be non-empty at once (picking a song clears
+            // the caption box's relevance) — the server resolves it into
+            // caption/lyrics through the same override path either way.
+            ...(!form.previewCaption.trim() && form.previewSongId
+              ? { previewSongId: form.previewSongId } : {}),
           },
         } : {}),
+        // Flag-contract parity fields (2026-09-05): only sent when moved off
+        // default, same "an older engine never sees it" rule as everywhere
+        // else in this codebase. adapterType==='lora' guards the whole group —
+        // the server ignores them under lokr, but sending only the relevant
+        // side keeps the request body honest about what actually ran.
+        ...(form.adapterType === 'lora' && form.attnBackend !== 'exact' ? { attnBackend: form.attnBackend } : {}),
+        ...(form.adapterType === 'lora' && form.dora ? { dora: true } : {}),
+        ...(form.adapterType === 'lora' && form.hira ? { hira: true } : {}),
+        ...(form.adapterType === 'lora' && form.loha ? { loha: true } : {}),
+        ...(form.adapterType === 'lora' && form.rslora ? { rslora: true } : {}),
+        ...(form.adapterType === 'lora' && form.pissa && !form.dora && !form.hira && !form.loha
+          ? { pissa: true } : {}),
+        ...(form.adapterType === 'lora' && form.hra && !form.dora && !form.hira && !form.loha && !form.pissa
+          ? { hra: true } : {}),
+        ...(form.adapterType === 'lora' && form.loraPlusRatio !== 1 ? { loraPlusRatio: form.loraPlusRatio } : {}),
+        ...(form.adapterType === 'lora' && form.artistTokenOn
+          ? { artistToken: form.artistToken, artistTokenK: form.artistTokenK, artistTokenLr: form.artistTokenLr }
+          : {}),
+        ...(form.adapterType === 'lora' && form.prefixN > 0 ? { prefixN: form.prefixN } : {}),
       };
       await startMm3TrainLm(body);
     } finally {
@@ -563,6 +664,40 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                     'How hard the adapter’s MLP delta is applied in previews only. '
                     + '1 = full, 0 = attention only.') as string} />
               </div>
+              {/* Explicit song pick (2026-09-05): a select over the dataset's
+                  usable rows, default = auto. Fixes the auto-pick landing on
+                  a noise interlude (oasis_morningglory's "instrumental_2",
+                  40s of "[Instrumental]") by letting a user route around
+                  whatever the ladder in mm3Preview.ts picks — the ladder
+                  itself was also fixed the same day, this is the manual
+                  override for when it still isn't the song you want. Wired
+                  through the SAME override the caption box below uses:
+                  picking a song here only takes effect while that box is
+                  blank. */}
+              <label className="flex flex-col gap-1 mt-3">
+                <span className="text-[11px] font-medium text-zinc-500 uppercase tracking-wider">
+                  {t('trainingStudio.mm3.previewSong', 'Preview song')}
+                </span>
+                <select className={INPUT} value={form.previewSongId}
+                  disabled={!!form.previewCaption.trim()}
+                  onChange={e => set('previewSongId', e.target.value)}>
+                  <option value="">{t('trainingStudio.mm3.previewSongAuto', 'Auto (held-out, real lyrics preferred)')}</option>
+                  {(status?.previewSongs ?? []).map(s => (
+                    <option key={s.id} value={s.id}>
+                      {s.filename}{s.held ? '' : ` (${t('trainingStudio.mm3.previewSongTraining', 'training')})`}
+                      {!s.usableLyrics ? ` — ${t('trainingStudio.mm3.previewSongInstrumental', 'likely instrumental')}` : ''}
+                      {s.durationS > 0 ? ` · ${Math.round(s.durationS)}s` : ''}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-[10px] text-zinc-500 leading-snug">
+                  {form.previewCaption.trim()
+                    ? t('trainingStudio.mm3.previewSongDisabled', 'Ignored while the caption box below is filled in.')
+                    : t('trainingStudio.mm3.previewSongHint',
+                        'Rows marked "likely instrumental" are exactly what the auto-pick now avoids — '
+                        + 'pick one anyway if that is deliberately what you want to hear.')}
+                </span>
+              </label>
               <label className="flex flex-col gap-1 mt-3">
                 <span className="text-[11px] font-medium text-zinc-500 uppercase tracking-wider">
                   {t('trainingStudio.mm3.previewCaption', 'Preview caption')}
@@ -570,7 +705,8 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                 <textarea
                   className={`${INPUT} font-mono text-[11px] leading-snug`} rows={3}
                   placeholder={t('trainingStudio.mm3.previewCaptionPlaceholder',
-                    'Blank = the first held-out song’s own caption, with the trigger prepended') as string}
+                    'Blank = the preview-song pick above, or auto (first held-out song with real '
+                    + 'lyrics), with the trigger prepended') as string}
                   value={form.previewCaption}
                   onChange={e => set('previewCaption', e.target.value)}
                 />
@@ -714,6 +850,69 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                       + 'the dataset.')}
                   </span>
                 </label>
+                {/* ── Method row (2026-09-05) ───────────────────────────────
+                    Same shape as TrainDitForm's DitMethod / TrainLmForm's
+                    LmMethod: LoKr is its own type, DoRA/HiRA/LoHa/HRA are the
+                    LoRA type with one flag set, PiSSA/rsLoRA/LoRA+ sit
+                    underneath as checkboxes. None of the five new methods has
+                    an MM3-specific measurement — see each button's hover
+                    text — and --dora/--hira/--loha/--pissa/--hra are landing
+                    in the mm3-lm-train engine parser concurrently with this
+                    card, not before it: a run that picks one is refused by an
+                    older ace-train, loudly, rather than silently training
+                    plain LoRA. */}
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-[11px] font-medium text-zinc-500 uppercase tracking-wider">
+                    {t('trainingStudio.mm3.adapterType', 'Adapter type')}
+                  </span>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {(['lokr', 'lora', 'dora', 'hira', 'loha', 'hra'] as Mm3Method[]).map(m => {
+                      const active = method === m;
+                      return (
+                        <button
+                          key={m}
+                          type="button"
+                          onClick={() => pickMethod(m)}
+                          title={t(`trainingStudio.mm3.${MM3_METHOD_KEYS[m].info}`)}
+                          className={`px-4 py-1.5 rounded-lg text-xs font-bold border transition-colors ${
+                            active
+                              ? 'text-amber-500 bg-amber-500/10 border-amber-500/30'
+                              : 'text-zinc-500 border-zinc-300 dark:border-white/10 hover:text-zinc-700 dark:hover:text-zinc-300'
+                          }`}
+                        >
+                          {t(`trainingStudio.mm3.${MM3_METHOD_KEYS[m].label}`)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <span className="text-[10px] text-zinc-500 leading-snug">
+                    {t('trainingStudio.mm3.adapterTypeHint',
+                      'LoRA is the default. LoKr trains a Kronecker pair per slot for a smaller file '
+                      + '(about 528 MB at factor 6 against a rank-128 LoRA\'s 1.4 GB) — NOT YET '
+                      + 'VALIDATED BY EAR. DoRA/HiRA/LoHa/HRA are new here 2026-09-05 (see each '
+                      + 'button\'s hover text); none has an MM3 measurement of its own yet.')}
+                  </span>
+                  {method !== 'lokr' && (
+                    <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-zinc-200 dark:border-white/5 px-3 py-2 mt-1">
+                      <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+                        <input type="checkbox" checked={form.pissa} disabled={method !== 'lora'} className="accent-amber-500"
+                          onChange={e => set('pissa', e.target.checked)} />
+                        {t('trainingStudio.mm3.pissa', 'PiSSA init')}
+                      </label>
+                      <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+                        <input type="checkbox" checked={form.rslora} disabled={method === 'hra'} className="accent-amber-500"
+                          onChange={e => set('rslora', e.target.checked)} />
+                        {t('trainingStudio.mm3.rslora', 'rsLoRA')}
+                      </label>
+                      <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+                        {t('trainingStudio.mm3.loraPlusRatio', 'LoRA+ ratio')}
+                        <input type="number" min={1} max={64} step={1} value={form.loraPlusRatio}
+                          onChange={e => set('loraPlusRatio', Math.max(1, Number(e.target.value) || 1))}
+                          className={`${INPUT} w-20`} />
+                      </label>
+                    </div>
+                  )}
+                </div>
                 <div className="grid grid-cols-2 gap-3">
                   <label className="flex flex-col gap-1">
                     <span className="text-[11px] font-medium text-zinc-500 uppercase tracking-wider">
@@ -736,23 +935,20 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                         + 'silence, because that value was tuned on a different model.')}
                     </span>
                   </label>
-                  <label className="flex flex-col gap-1">
-                    <span className="text-[11px] font-medium text-zinc-500 uppercase tracking-wider">
-                      {t('trainingStudio.mm3.adapterType', 'Adapter type')}
-                    </span>
-                    <select className={INPUT} value={form.adapterType}
-                      onChange={e => set('adapterType', e.target.value as 'lora' | 'lokr')}>
-                      <option value="lokr">LoKr</option>
-                      <option value="lora">LoRA</option>
-                    </select>
-                    <span className="text-[10px] text-zinc-500 leading-snug">
-                      {t('trainingStudio.mm3.adapterTypeHint',
-                        'LoKr trains a Kronecker pair per slot instead of a low-rank pair, for a '
-                        + 'smaller file: about 528 MB at factor 6 against a rank-128 LoRA\'s 1.4 GB. '
-                        + 'NOT YET VALIDATED BY EAR — no LoKr adapter has been auditioned, so treat a '
-                        + 'LoKr run as an experiment. FACTOR is the size knob, not dim: factor 16 gives '
-                        + 'only 27M parameters, fewer than rank 64, and rank 64 was the setting that '
-                        + 'turned lyrics to gibberish.')}
+                  <label className="flex items-start gap-2 text-[11px] text-zinc-600 dark:text-zinc-300 self-end pb-1">
+                    <input type="checkbox" className="mt-0.5" checked={form.attnBackend === 'flash'}
+                      onChange={e => set('attnBackend', e.target.checked ? 'flash' : 'exact')} />
+                    <span>
+                      {t('trainingStudio.mm3.attnBackend', 'Flash attention')}
+                      <span className="block text-[10px] text-zinc-500">
+                        {flashCalibrated
+                          ? t('trainingStudio.mm3.attnBackendHelp',
+                              'Fused attention kernels — see the VRAM estimate above for the measured saving.')
+                          : t('trainingStudio.mm3.attnBackendHelpPending',
+                              'Fused attention kernels, once mm3-lm-train gains --attn (landing '
+                              + 'concurrently). VRAM saving not yet measured — the estimate above stands '
+                              + 'in with exact mode\'s number until it is.')}
+                      </span>
                     </span>
                   </label>
                   {form.adapterType === 'lokr' && (
@@ -768,6 +964,59 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                       hint={t('trainingStudio.mm3.muonLrScaleHint',
                         '64 is the best of the values measured so far, not a tuned optimum.') as string} />
                   )}
+                </div>
+
+                {/* ── Soft prompt (2026-09-05) ──────────────────────────────
+                    A trainable token + a trainable K/V prefix, both new to
+                    MM3 (the mm3-lm-train ENGINE parser already accepts
+                    --artist-token/-k/-lr; --prefix-n is landing concurrently
+                    with this card). Kept visually separate from "History
+                    before crop" below, which is a DIFFERENT, FROZEN prefix
+                    baked from real audio (train/mm3-lm-kvprefix.h) — the two
+                    are not the same knob and must not be confused. */}
+                <div className="rounded-lg border border-zinc-200 dark:border-white/10 p-3 flex flex-col gap-2">
+                  <span className="text-xs font-semibold text-zinc-800 dark:text-zinc-200">
+                    {t('trainingStudio.mm3.softPromptGroup', 'Soft prompt (trainable, this run)')}
+                  </span>
+                  <span className="text-[10px] text-zinc-500 leading-snug">
+                    {t('trainingStudio.mm3.softPromptGroupHelp',
+                      'A named token adds k learned vectors behind a placeholder in every caption; the '
+                      + 'prefix adds n trainable key/value columns per layer. Both train WITH the LoRA '
+                      + 'and ship in the same adapter file. Different mechanism from "History before '
+                      + 'crop" below, which is FROZEN real-audio context, not a trained parameter.')}
+                  </span>
+                  <label className="flex items-start gap-2 text-[11px] text-zinc-600 dark:text-zinc-300">
+                    <input type="checkbox" className="mt-0.5" checked={form.artistTokenOn}
+                      onChange={e => {
+                        const on = e.target.checked;
+                        setEdits(prev => ({
+                          ...prev, artistTokenOn: on,
+                          artistToken: on && !form.artistToken.trim()
+                            ? (form.trigger.trim() || 'artist') : form.artistToken,
+                        }));
+                      }} />
+                    {t('trainingStudio.mm3.artistTokenOn', 'Train an artist token')}
+                  </label>
+                  {form.artistTokenOn && (
+                    <div className="grid grid-cols-3 gap-2">
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[10px] text-zinc-500">
+                          {t('trainingStudio.mm3.artistToken', 'Token name')}
+                        </span>
+                        <input className={INPUT} value={form.artistToken}
+                          onChange={e => set('artistToken', e.target.value.replace(/[^A-Za-z0-9_-]/g, ''))} />
+                      </label>
+                      <NumField label={t('trainingStudio.mm3.artistTokenK', 'Token vectors (k)')}
+                        value={form.artistTokenK} onChange={v => set('artistTokenK', v)} />
+                      <NumField label={t('trainingStudio.mm3.artistTokenLr', 'Token LR')}
+                        value={form.artistTokenLr} onChange={v => set('artistTokenLr', v)} step={0.0005} />
+                    </div>
+                  )}
+                  <NumField label={t('trainingStudio.mm3.prefixN', 'Prefix columns (trainable)')}
+                    value={form.prefixN} onChange={v => set('prefixN', Math.max(0, Math.min(64, v)))}
+                    hint={t('trainingStudio.mm3.prefixNInfo',
+                      'n trainable key/value columns per layer that every position attends to. 0 = off. '
+                      + 'Not the frozen history prefix below — this one trains.') as string} />
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <label className="flex flex-col gap-1">

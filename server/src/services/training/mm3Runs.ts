@@ -61,6 +61,10 @@ export interface Mm3RunManifest {
   /** How many times this directory has been trained into. 1 = the original. */
   launches: number;
   options: ResolvedMm3TrainLmOptions;
+  /** Which manifest row the artist preview caption came from on the most
+   *  recent launch, and how it was picked. Absent when previews are off or the
+   *  plan had nothing to render an artist take from. See mm3Preview.ts. */
+  previewSong?: { id: string; filename: string; source: 'held' | 'train' | 'explicit' };
 }
 
 /** Record what a run was started with, so it can be continued with the same
@@ -69,7 +73,8 @@ export interface Mm3RunManifest {
  *  should pick up from the newer of the two. Never fails a run. */
 export function writeMm3RunManifest(opts: ResolvedMm3TrainLmOptions,
                                     meta: { datasetId: string; datasetSlug: string;
-                                            datasetName: string }): void {
+                                            datasetName: string;
+                                            previewSong?: Mm3RunManifest['previewSong'] }): void {
   try {
     const file = mm3RunManifestPath(opts.outDir);
     const prev = readJson<Mm3RunManifest>(file);
@@ -86,6 +91,10 @@ export function writeMm3RunManifest(opts: ResolvedMm3TrainLmOptions,
       updatedAt: Date.now(),
       launches: (prev?.launches ?? 0) + 1,
       options: clean as ResolvedMm3TrainLmOptions,
+      // Previews were computed AFTER this write on earlier launches too — a
+      // resume that renders no new artist take (previews off this time)
+      // should not erase what the last launch recorded.
+      previewSong: meta.previewSong ?? prev?.previewSong,
     };
     fs.mkdirSync(opts.outDir, { recursive: true });
     fs.writeFileSync(file, JSON.stringify(out, null, 2), 'utf-8');
@@ -131,6 +140,8 @@ interface LogFacts {
   cropAnchor?: string;
   cropPolicy?: Record<string, unknown>;
   kvPrefix?: Record<string, unknown>;
+  /** 'exact' | 'flash' | 'flash-f32', from the engine's own `attn` event. */
+  attn?: string;
   depthLoss?: Record<string, unknown>;
   targetLoss?: Record<string, unknown>;
   lastStep: number;
@@ -183,6 +194,14 @@ function readLog(dir: string): LogFacts {
         break;
       case 'cropPolicy':    out.cropPolicy ??= ev; break;
       case 'kvPrefix':      out.kvPrefix ??= ev; break;
+      // Written by mm3-lm-train-run.h once --attn is resolved (landed
+      // 2026-09-05, same day this reader was taught to read it). First-wins,
+      // same as cropAnchor/kvPrefix — a resume's second `attn` line describes
+      // the shape a LATER attempt asked for, not the one the saved state was
+      // written under.
+      case 'attn':
+        if (out.attn === undefined && typeof ev.mode === 'string') out.attn = ev.mode;
+        break;
       case 'depthLossCfg':  out.depthLoss ??= ev; break;
       case 'targetLoss':    out.targetLoss ??= ev; break;
       case 'step':
@@ -247,6 +266,9 @@ export interface Mm3RunSummary {
   best?: { step: number; loss: number };
   targetLoss?: number;
   targetLossMetric?: string;
+  /** Which manifest row the most recent artist preview was rendered from.
+   *  Manifest-sourced only — a pre-manifest run does not carry this. */
+  previewSong?: { id: string; filename: string; source: 'held' | 'train' | 'explicit' };
   /** Present only when this run can actually be continued. */
   resume?: {
     step: number;
@@ -380,6 +402,29 @@ function optionsFromLog(dir: string, facts: LogFacts): ResolvedMm3TrainLmOptions
     lokrFactor: n(facts.adapter?.factor, D.lokrFactor),
     lokrDim: n(facts.adapter?.dim, D.lokrDim),
     lokrAlpha: n(facts.adapter?.alpha, D.lokrAlpha),
+    // attn IS fingerprinted now (the engine's own `attn` event, landed
+    // 2026-09-05) — 'exact' is the only value this reads back as 'exact' vs
+    // 'flash', which is enough to keep a resume on the formulation the saved
+    // state was actually written under. The LoRA-family methods below are
+    // NOT fingerprinted by the engine's `adapter` event today (it reports
+    // only lora vs lokr, per the adapterType line above), so a pre-manifest
+    // run always reconstructs to today's off defaults for those — same
+    // honesty tradeoff optionsFromLog already makes for everything the log
+    // does not carry (see the function comment above). If the engine's
+    // flag-contract port adds a `kind` value per method, read it here the
+    // same way `adapterType` does.
+    attnBackend: facts.attn === 'flash' || facts.attn === 'flash-f32' ? 'flash' : D.attnBackend,
+    rslora: D.rslora,
+    dora: false,
+    hira: false,
+    loha: false,
+    pissa: false,
+    hra: false,
+    loraPlusRatio: D.loraPlusRatio,
+    artistToken: '',
+    artistTokenK: D.artistTokenK,
+    artistTokenLr: D.artistTokenLr,
+    prefixN: D.prefixN,
     trigger: '',
     triggerPrepend: D.triggerPrepend,
     datasetName: '',
@@ -444,6 +489,7 @@ export function readMm3Run(dir: string): Mm3RunSummary | null {
     targetLossMetric: manifest?.options.stopMode === 'loss'
       ? manifest.options.targetLossMetric
       : (facts.targetLoss?.metric as string | undefined),
+    previewSong: manifest?.previewSong,
     optionsSource: manifest ? 'manifest' : (facts.init ? 'log' : 'none'),
     sizeBytes: dirSize(dir),
   };

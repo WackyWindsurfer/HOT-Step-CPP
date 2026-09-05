@@ -105,11 +105,16 @@ export interface Mm3PreviewPlan {
   scaleAttn: number;
   /** Where the WAVs go: <run dir>/previews. */
   dir: string;
+  /** Which manifest row the 'artist' caption/lyrics came from, and how it was
+   *  picked. Absent when the caption was given explicitly (preview.caption
+   *  set) or came from a shared caption with no matching row. Recorded so a
+   *  bad pick is visible in the manifest and the log, not just heard. */
+  previewSong?: { id: string; filename: string; source: 'held' | 'train' | 'explicit' };
 }
 
 // ── the artist caption ──────────────────────────────────────────────────────
 
-interface ManifestRow { id: string; filename: string; lyrics: string }
+interface ManifestRow { id: string; filename: string; lyrics: string; duration: number }
 
 /** The trainer's own view of the dataset, in the trainer's own order.
  *
@@ -144,9 +149,47 @@ function usableRows(manifest: string, captionsDir: string, codesDir: string,
     // workflow that is now the default.
     if (requireCaption && !fs.existsSync(path.join(captionsDir, `${stem}.mm3.txt`))) continue;
     if (!fs.existsSync(path.join(codesDir, `${id}.codes`))) continue;
-    out.push({ id, filename, lyrics: typeof r?.lyrics === 'string' ? r.lyrics : '' });
+    const duration = Number(r?.duration);
+    out.push({
+      id, filename,
+      lyrics: typeof r?.lyrics === 'string' ? r.lyrics : '',
+      duration: Number.isFinite(duration) ? duration : 0,
+    });
   }
   return out;
+}
+
+/** True when a row's lyrics are worth previewing rather than a bare structural
+ *  tag. Two failure modes it exists to catch, both real (oasis_morningglory
+ *  track 11, "instrumental_2.flac"): lyrics that are exactly `[Instrumental]`
+ *  with nothing else, and rows too short to be more than a tag plus noise. 200
+ *  chars is comfortably above every instrumental-interlude row measured (14 and
+ *  30 chars there) and comfortably below a real verse. */
+function hasUsableLyrics(lyrics: string): boolean {
+  const t = lyrics.trim();
+  if (t.length < 200) return false;
+  if (/^\[instrumental\]$/i.test(t)) return false;
+  return true;
+}
+
+/** Pick the best row to preview from a candidate set (held-out rows, or the
+ *  full training set as a fallback — see planMm3Previews). Ladder:
+ *
+ *    1. The FIRST row with real lyrics (hasUsableLyrics) whose manifest
+ *       duration, if known, is at least 60s — a short one is as likely to be
+ *       an interlude as a full song, and this preview is meant to show
+ *       whether identity is arriving over a normal verse/chorus structure.
+ *    2. Otherwise, the row with the LONGEST lyrics in the set — never the
+ *       positional first, which is exactly the bug this replaced (`held[0]`
+ *       landing on a 40s noise interlude because it happened to sort last in
+ *       the manifest).
+ *
+ *  Returns null only when `candidates` is empty. */
+function pickBestPreviewRow(candidates: ManifestRow[]): ManifestRow | null {
+  if (!candidates.length) return null;
+  const good = candidates.find(r => hasUsableLyrics(r.lyrics) && (r.duration <= 0 || r.duration >= 60));
+  if (good) return good;
+  return candidates.reduce((best, r) => (r.lyrics.length > best.lyrics.length ? r : best), candidates[0]);
 }
 
 /** The trainer's held-out tail, by the trainer's own rule
@@ -192,6 +235,8 @@ export function planMm3Previews(o: {
   const specs: Mm3PreviewSpec[] = [];
   let caption = (p?.caption ?? '').trim();
   let lyrics = (p?.lyrics ?? '').trim();
+  const explicitSongId = (p?.previewSongId ?? '').trim();
+  let previewSong: Mm3PreviewPlan['previewSong'];
   if (!caption) {
     // The shared caption IS the training prompt when one is in force, so the
     // preview should be rendered with it rather than with a per-song caption the
@@ -206,7 +251,28 @@ export function planMm3Previews(o: {
     // a row does not need its own .mm3.txt to be usable.
     const rows = usableRows(o.manifest, o.captionsDir, o.codesDir, !shared);
     const held = holdoutRows(rows, o.holdout);
-    const pick = held.length ? held[0] : rows.length ? rows[rows.length - 1] : null;
+
+    let pick: ManifestRow | null = null;
+    let source: 'held' | 'train' | 'explicit' = 'held';
+    if (explicitSongId) {
+      pick = rows.find(r => r.id === explicitSongId) ?? null;
+      if (pick) source = 'explicit';
+    }
+    if (!pick) {
+      // §pickBestPreviewRow: prefer a held-out row with real lyrics (not an
+      // "[Instrumental]" tag) at a plausible song length; fall back to the
+      // longest-lyrics held-out row, then — only when nothing was held out at
+      // all — to the same ladder over every usable training row. This is what
+      // replaced a bare `held[0]`, which on oasis_morningglory always picked
+      // "instrumental_2.flac" (a 40s noise interlude, lyrics = "[Instrumental]").
+      pick = pickBestPreviewRow(held);
+      source = 'held';
+      if (!pick) {
+        pick = pickBestPreviewRow(rows);
+        source = 'train';
+      }
+    }
+
     if (shared) {
       caption = shared;
       if (!lyrics && pick) lyrics = pick.lyrics;
@@ -217,6 +283,7 @@ export function planMm3Previews(o: {
       } catch { /* fall through to the control-only plan below */ }
       if (!lyrics) lyrics = pick.lyrics;
     }
+    if (pick) previewSong = { id: pick.id, filename: pick.filename, source };
   }
   if (caption) {
     specs.push({ kind: 'artist', caption: applyMm3Trigger(caption, o.trigger), lyrics });
@@ -243,7 +310,34 @@ export function planMm3Previews(o: {
     scaleMlp: clampScale(p?.scaleMlp, MM3_PREVIEW_DEFAULTS.scaleMlp),
     scaleAttn: clampScale(p?.scaleAttn, MM3_PREVIEW_DEFAULTS.scaleAttn),
     dir: path.join(o.outDir, 'previews'),
+    previewSong,
   };
+}
+
+/** One usable row for the preview-song picker (Mm3TrainCard's select), and
+ *  whether it would be held out under `holdout`. Server-computed because
+ *  "which rows have both a caption and codes" is a filesystem fact the
+ *  browser cannot see — same reasoning as GET /datasets/:id/mm3's other
+ *  filesystem-derived fields. */
+export interface Mm3PreviewCandidate {
+  id: string;
+  filename: string;
+  durationS: number;
+  lyricsChars: number;
+  /** hasUsableLyrics — false marks the row as a likely instrumental/interlude
+   *  in the picker, without hiding it (a user may still want to preview it). */
+  usableLyrics: boolean;
+  held: boolean;
+}
+
+export function listMm3PreviewCandidates(manifest: string, captionsDir: string, codesDir: string,
+                                         holdout: number, captionFile?: string): Mm3PreviewCandidate[] {
+  const rows = usableRows(manifest, captionsDir, codesDir, !captionFile);
+  const held = new Set(holdoutRows(rows, holdout).map(r => r.id));
+  return rows.map(r => ({
+    id: r.id, filename: r.filename, durationS: r.duration, lyricsChars: r.lyrics.trim().length,
+    usableLyrics: hasUsableLyrics(r.lyrics), held: held.has(r.id),
+  }));
 }
 
 /** The base a preview renders its adapter on.

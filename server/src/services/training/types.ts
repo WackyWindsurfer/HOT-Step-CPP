@@ -138,10 +138,19 @@ export interface Mm3PreviewOptions {
   /** Fixed across every preview in the run — that is what makes step-to-step
    *  comparison legible. */
   seed?: number;
-  /** Blank = the first HELD-OUT song's own caption, with the trigger prepended
-   *  the way the training rows carry it. */
+  /** Blank = auto-pick: the first held-out song with real lyrics (not an
+   *  "[Instrumental]"-only interlude) and, when the manifest carries a
+   *  duration, at least 60s of it. Falls back to the longest-lyrics held-out
+   *  row, then to any usable training row. See pickPreviewSong in
+   *  mm3Preview.ts — this replaced a bare `held[0]`, which on
+   *  oasis_morningglory picked a 40s noise interlude every time. */
   caption?: string;
   lyrics?: string;
+  /** Explicit song id (dataset.json row id) to preview, in place of the
+   *  auto-pick above. '' / absent = auto. Resolved into caption/lyrics through
+   *  the same path a manual override takes, so this is plumbing, not a third
+   *  selection mechanism. */
+  previewSongId?: string;
   /** Also render a neutral off-genre caption with the adapter active, to catch
    *  collateral damage to the base planner. */
   control?: boolean;
@@ -656,6 +665,15 @@ export interface TrainLmOptions {
   prefixN?: number;                // default 0; 8 is the measured recipe
   /** rsLoRA: alpha/sqrt(r) scaling; written as use_rslora and honoured at load. LoRA only. */
   rslora?: boolean;
+  /** LoRA-family parameterizations (2026-09-05), mirroring TrainDitOptions'
+   *  dora/hira/loha/pissa/hra. Mutually exclusive with each other; LoRA type
+   *  only (refused with adapterType 'lokr'). See DitMethod in
+   *  TrainDitForm.tsx for the shared UI shape. */
+  dora?: boolean;
+  hira?: boolean;
+  loha?: boolean;
+  pissa?: boolean;
+  hra?: boolean;
   /** LoRA+: B tensors at ratio x A's learning rate. 1 = off. AdamW-rule tensors only. */
   loraPlusRatio?: number;
   /** Optimizer (2026-07-30). 'adamw' is the default and the shipped path.

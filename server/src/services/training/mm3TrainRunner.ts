@@ -522,15 +522,9 @@ export async function runMm3TrainLmJob(job: TrainingJob): Promise<void> {
   }
 
   const runName = path.basename(opts.outDir);
-  // Record the recipe BEFORE the first step, not after the last: a run that
-  // crashes at step 3 is exactly the one someone will want to continue, and a
-  // manifest written on success would not be there.
-  const ds = getDataset(job.datasetId);
-  writeMm3RunManifest(opts, {
-    datasetId: job.datasetId,
-    datasetSlug: ds?.slug || '',
-    datasetName: opts.datasetName || ds?.name || ds?.slug || '',
-  });
+  // Computed before the manifest write so the pick can ride along in it (see
+  // Mm3RunManifest.previewSong) — planMm3Previews only reads the dataset off
+  // disk, so this ordering costs nothing.
   const plan = planMm3Previews({
     preview: opts.preview,
     manifest: opts.manifest,
@@ -540,6 +534,29 @@ export async function runMm3TrainLmJob(job: TrainingJob): Promise<void> {
     holdout: opts.holdout,
     trigger: opts.trigger,
     captionFile: opts.captionFile,
+  });
+  if (plan?.previewSong) {
+    const { id, filename, source } = plan.previewSong;
+    const sourceLabel = source === 'explicit' ? 'user-selected'
+      : source === 'held' ? 'held-out (auto)' : 'training set (auto — nothing held out)';
+    log(job, 'info', `Preview song: "${filename}" [${id}] — ${sourceLabel}`);
+    // Also into the run's own JSONL, beside the engine's own init/step/etc
+    // events — readMm3Run's log reader ignores unknown `type` values, so this
+    // is safe to add without touching anything that parses that file today.
+    try {
+      fs.appendFileSync(path.join(opts.outDir, 'train-log.jsonl'),
+        JSON.stringify({ type: 'previewSong', ts: Date.now(), id, filename, source }) + '\n');
+    } catch { /* a run must not fail because this could not be logged */ }
+  }
+  // Record the recipe BEFORE the first step, not after the last: a run that
+  // crashes at step 3 is exactly the one someone will want to continue, and a
+  // manifest written on success would not be there.
+  const ds = getDataset(job.datasetId);
+  writeMm3RunManifest(opts, {
+    datasetId: job.datasetId,
+    datasetSlug: ds?.slug || '',
+    datasetName: opts.datasetName || ds?.name || ds?.slug || '',
+    previewSong: plan?.previewSong,
   });
   clearPause(opts.outDir);
 

@@ -66,6 +66,17 @@ export interface Mm3Status {
   /** Datasets usable as a prior-preservation corpus: they have RVQ codes and
    *  are not this one. Absent on an older server. */
   regCandidates?: Array<{ id: string; name: string; songs: number }>;
+  /** Whether vramModel.flash carries a real measurement. False on every
+   *  server today — see MM3_VRAM_MODEL.flash. The card must show a "pending
+   *  measurement" caveat next to a flash estimate, never present it as
+   *  calibrated, while this is false. Absent on an older server = false. */
+  flashVramCalibrated?: boolean;
+  /** Usable rows for the preview-song picker (Mm3TrainCard's select, default
+   *  = auto). Empty when the dataset has no codes cache yet. */
+  previewSongs?: Array<{
+    id: string; filename: string; durationS: number; lyricsChars: number;
+    usableLyrics: boolean; held: boolean;
+  }>;
 }
 
 /** One installed base. `quality` and `lossDelta` are MEASURED against f16 on an
@@ -103,6 +114,17 @@ export interface Mm3VramModel {
   /** Frozen KV prefix, MB per stored column. Optional: an older server does not
    *  send it, and without it a prefix estimate is simply 0. */
   prefixMbPerColumn?: number;
+  /** Flash-attention's own coefficients, once measured. null/absent = not
+   *  measured yet — estimateMm3PeakMb then falls back to the exact-mode
+   *  quadratic term instead of guessing a saving. See MM3_VRAM_MODEL.flash. */
+  flash?: { perTokenSqMb: number } | null;
+}
+
+/** Whether `m.flash` carries a real measurement. False for any server that
+ *  has not fitted one yet — the card should show a "pending measurement"
+ *  caveat next to the estimate rather than presenting it as calibrated. */
+export function mm3FlashVramCalibrated(m: Mm3VramModel): boolean {
+  return !!m.flash;
 }
 
 /** Peak VRAM in MB. The coefficients come from the server, which fitted them to
@@ -123,7 +145,8 @@ export function estimateMm3PrefixMb(prefixFrames: number, maxFrames: number, m: 
 export function estimateMm3PeakMb(baseBytes: number, rank: number, maxFrames: number,
                                   m: Mm3VramModel,
                                   optimizer: 'muon' | 'adamw' | 'prodigy' = 'adamw',
-                                  prefixFrames = 0, prefixChunk = 256): number {
+                                  prefixFrames = 0, prefixChunk = 256,
+                                  attn: 'exact' | 'flash' = 'exact'): number {
   const loaded  = baseBytes / 1048576 + m.loadedOverheadMb;
   const S       = m.promptTokens + Math.max(0, maxFrames);
   // The S term is QUADRATIC — the backward retains [S, S, heads] attention
@@ -133,7 +156,10 @@ export function estimateMm3PeakMb(baseBytes: number, rank: number, maxFrames: nu
   // buffer is one adamwPerRankMb. Measured at rank 128: 14.2 / 17.5 / 20.2 GB.
   const extraBuffers = optimizer === 'adamw' ? 1 : optimizer === 'prodigy' ? 3 : 0;
   const perRank = m.perRankMb + extraBuffers * (m.adamwPerRankMb ?? 0);
-  const sq      = (m.perTokenSqMb ?? 0) * S * S;
+  // 'flash' with no calibrated m.flash falls back to the exact-mode term —
+  // see MM3_VRAM_MODEL.flash server-side. Never invent a saving.
+  const perTokenSqMb = (attn === 'flash' && m.flash) ? m.flash.perTokenSqMb : (m.perTokenSqMb ?? 0);
+  const sq      = perTokenSqMb * S * S;
   return Math.round(loaded + perRank * rank + m.perTokenMb * S + sq + m.constMb
                     + estimateMm3PrefixMb(prefixFrames, maxFrames, m, prefixChunk));
 }
@@ -224,6 +250,27 @@ export interface Mm3TrainLmRequest {
    *  evalEvery. */
   targetLossMetric?: 'train' | 'eval';
   targetLossEpochs?: number;
+  /** Attention backend. 'flash' needs the mm3-lm-train --attn port (2026-09-05
+   *  flag-contract work); on an engine that predates it the run is refused, not
+   *  silently trained as 'exact'. */
+  attnBackend?: 'exact' | 'flash';
+  /** LoRA-family parameterizations (2026-09-05). LoKr-incompatible and
+   *  mutually exclusive with each other — see DitMethod in TrainDitForm.tsx
+   *  for the same shape on the DiT trainer. */
+  rslora?: boolean;
+  dora?: boolean;
+  hira?: boolean;
+  loha?: boolean;
+  pissa?: boolean;
+  hra?: boolean;
+  loraPlusRatio?: number;
+  /** Soft prompt. '' or absent = no token. */
+  artistToken?: string;
+  artistTokenK?: number;
+  artistTokenLr?: number;
+  /** Trainable per-layer K/V prefix. 0/absent = off. NOT prefixFrames above —
+   *  that one is the frozen real-audio history prefix, a different mechanism. */
+  prefixN?: number;
 }
 
 // -- previous runs, and continuing one ---------------------------------------
@@ -315,9 +362,15 @@ export interface Mm3PreviewOptions {
   everyMinutes?: number;
   seconds?: number;
   seed?: number;
-  /** Blank = the first HELD-OUT song's caption, trigger prepended. */
+  /** Blank = auto-pick: the first held-out song with real lyrics (not an
+   *  "[Instrumental]" interlude) and, when the manifest carries a duration,
+   *  at least 60s of it — see planMm3Previews / pickPreviewSong server-side. */
   caption?: string;
   lyrics?: string;
+  /** Explicit song id (dataset.json row id) to preview, in place of the
+   *  auto-pick. '' / absent = auto. Resolved server-side into caption/lyrics
+   *  through the same path a manual override takes. */
+  previewSongId?: string;
   control?: boolean;
   controlCaption?: string;
   baseline?: boolean;
