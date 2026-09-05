@@ -623,6 +623,11 @@ struct MM3SynthRequest {
     // at r256. "merge" = fold scale·B·A into the resident weights once
     // (mm3-lm-merge.h) — zero per-step cost, scale changes re-merge.
     std::string        lm_adapter_mode = "runtime";
+    // A/B switch for the soft-prompt halves (artist token, trained KV prefix):
+    // true runs the adapter's weight delta ALONE — same weights, same seed, no
+    // token, no prefix — so the only difference between the two arms is the
+    // soft prompt. Mirrors /mm3/lm-plan's field of the same name.
+    bool               lm_soft_off = false;
 
     std::string prompt;  // the assembled template
     int64_t     n_tokens = 0;
@@ -982,6 +987,12 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
                 return false;
             }
             out->lm_adapter_mode = mode;
+        }
+        // Read by VALUE, not by presence: a client that serialises its whole
+        // option struct sends "lm_soft_off": false for the normal arm.
+        {
+            yyjson_val * sv = yyjson_obj_get(root, "lm_soft_off");
+            out->lm_soft_off = sv && yyjson_is_true(sv);
         }
         struct {
             const char * key;

@@ -440,6 +440,7 @@ static void mm3_ar_key_add_models(std::string & k, const MM3Model & m, const MM3
         add_s("ad", req.lm_adapter);
         add_i("ad_mtime", ok ? (long long) sb.st_mtime : -1);
         add_s("ad_mode", req.lm_adapter_mode);
+        add_i("ad_soft_off", req.lm_soft_off ? 1 : 0);  // a token-off plan is not a token-on plan
         const MM3LmAdapterScales & s = req.lm_adapter_scales;
         add_f("ad_g", s.global); add_f("ad_a", s.attn);  add_f("ad_m", s.mlp);
         add_f("ad_e", s.early);  add_f("ad_i", s.mid);   add_f("ad_l", s.late);
@@ -997,7 +998,7 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
                 // conditioning input on k prompt positions and a prefix is n KV
                 // columns; neither is a weight delta, so mm3_lm_merge_apply
                 // folds neither and both still have to reach the graph.
-                req.gen.lm_soft    = g_mm3_lm_adapter;
+                req.gen.lm_soft    = req.lm_soft_off ? nullptr : g_mm3_lm_adapter;
             } else {
                 // Runtime mode cannot express a delta that is not low-rank.
                 // HiRA (W (.) s*BA) and LoHa ((A1B1) (.) (A2B2)) both need a
@@ -1019,7 +1020,7 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
                     return;
                 }
                 req.gen.lm_adapter = g_mm3_lm_adapter;
-                req.gen.lm_soft    = g_mm3_lm_adapter;
+                req.gen.lm_soft    = req.lm_soft_off ? nullptr : g_mm3_lm_adapter;
             }
         } else {
             req.gen.lm_adapter = nullptr;  // cached adapter stays resident but inert
