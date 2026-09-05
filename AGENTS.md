@@ -1,6 +1,6 @@
 # AGENTS.md — HOT-Step CPP
 
-Orientation map for agents. Keep this short and navigational — point at the deep docs, don't duplicate them.
+Orientation map for agents, and the **single source of truth** for project rules. Claude Code reads it through `CLAUDE.md` (a one-line `@AGENTS.md` import); Codex reads it directly. Edit this file only. Keep it short and navigational — point at the deep docs, don't duplicate them.
 
 ## What this is
 
@@ -29,7 +29,7 @@ LAUNCH.bat → Node server (Express :3001)
 
 ## Environment
 
-- **Windows 11 + PowerShell.** This repo's primary dev environment is Windows. The Codex harness also gives you a Bash (POSIX) tool — each takes its own syntax. In PowerShell use `;` not `&&`.
+- **Windows 11 + PowerShell.** This repo's primary dev environment is Windows. Your harness (Claude Code, Codex) may also give you a Bash (POSIX) tool — each takes its own syntax. In PowerShell use `;` not `&&`.
 - **Node 18–22 LTS only.** Node 24+ breaks dependencies (`engines` field enforces `<24`).
 
 ## Build & run rules (IMPORTANT — learned the hard way)
@@ -50,6 +50,30 @@ LAUNCH.bat → Node server (Express :3001)
 - Commit to local git **often** (data has been lost before to uncommitted files).
 - **Releases:** push a `vX.Y.Z` tag → the `Release` workflow builds all platforms and drafts a GitHub Release. **Any pushed `v*` tag triggers a build** — use a `-CI-Test` suffix for throwaway compile checks, and don't push local feature tags matching `v*`. Full process + gotchas: [docs/RELEASING.md](docs/RELEASING.md).
 - Use `gh` CLI for GitHub ops (authenticated as `scragnog`).
+
+## Shipping to users (works here ≠ works for them)
+
+This is a public app. A feature can pass every local check because **this machine**
+holds a file that was never part of the distribution — model weights sitting in
+`models/`, a data file that CI never copies into the archive. Nothing catches it:
+paths are resolved at runtime, so tsc is clean and the build is green, and the
+feature is simply dead for everyone who downloads it. It has shipped twice
+(MM3 training encoders, #137; the MM3 caption corpus, #139).
+
+- **Any new file the app resolves at runtime must be reachable by a user** —
+  weights uploaded to Hugging Face **and** listed in
+  [`server/src/data/model-registry.json`](server/src/data/model-registry.json);
+  runtime data files packaged by [`release.yml`](.github/workflows/release.yml)
+  (it copies `server/src/data/` wholesale, so put them there).
+- **Before pushing anything to `master`, and always before a release tag:**
+
+  ```
+  node server/scripts/check-release-prereqs.mjs
+  ```
+
+  It verifies every registry entry exists on HF at the claimed size, that packs
+  reference real files, and that every runtime data file gets packaged. Exit 1 =
+  do not ship. Details: [.claude/skills/validating-changes/SKILL.md](.claude/skills/validating-changes/SKILL.md) (Tier 6).
 
 ## Upstream sync (fork hooks that break silently)
 
@@ -87,38 +111,39 @@ Solvers (17), schedulers (9), guidance modes, and postprocess are **hot-loadable
 ## Discord transcripts
 
 The MM3 working group lives in Discord, and a lot of project-relevant decisions
-happen there. [tools/discord-Codex/](tools/discord-Codex/) bridges that thread to
-Codex *and* logs every message to `logs/discord/<channelId>.jsonl` (gitignored —
+happen there. [tools/discord-claude/](tools/discord-claude/) bridges that thread to
+Claude *and* logs every message to `logs/discord/<channelId>.jsonl` (gitignored —
 it is other people's chat). Read it with:
 
 ```
-node tools/discord-Codex/read-log.mjs --list                     # channels + message counts
-node tools/discord-Codex/read-log.mjs --since 12h                # busiest channel, recent
-node tools/discord-Codex/read-log.mjs --channel all-for-one --last 200
-node tools/discord-Codex/read-log.mjs --all --grep "encoder|NVFP4" --context 3
+node tools/discord-claude/read-log.mjs --list                     # channels + message counts
+node tools/discord-claude/read-log.mjs --since 12h                # busiest channel, recent
+node tools/discord-claude/read-log.mjs --channel all-for-one --last 200
+node tools/discord-claude/read-log.mjs --all --grep "encoder|NVFP4" --context 3
 ```
 
 `backfill.mjs` pulls history from the Discord API (safe to re-run; dedupes by message id).
-**Do not** reconstruct the thread by scraping `~/.Codex/projects/*.jsonl` — those sessions
+**Do not** reconstruct the thread by scraping `~/.claude/projects/*.jsonl` — those sessions
 only ever saw a rolling window and are lossy.
 
 ## Read-Y-for-X index
 
 | For… | Read |
 |------|------|
-| **Any maintenance task — start here** (per-domain procedures, gotchas, distilled institutional knowledge) | [.Codex/skills/README.md](.Codex/skills/README.md) — 16 skills (13 fact-checked + 3 MM3) |
-| **MiniMax-Music3 backend** (second generation backend: engine port, /mm3 endpoints, backend registry/toggle, trap list) | [.Codex/skills/mm3-backend/SKILL.md](.Codex/skills/mm3-backend/SKILL.md) |
-| MM3 caption/prompt format (genre adherence) | [.Codex/skills/mm3-captioning/SKILL.md](.Codex/skills/mm3-captioning/SKILL.md) |
-| **Training an MM3 LM adapter** (album/artist clone: rank, steps, which checkpoint to ship, likeness-vs-coherence) | [.Codex/skills/mm3-lm-adapter-training/SKILL.md](.Codex/skills/mm3-lm-adapter-training/SKILL.md) |
-| **What the Discord working group said** (MM3 group: bghira, Serveurperso, testerf, Shaz…) — searchable transcripts of every channel | `node tools/discord-Codex/read-log.mjs --list` — see [Discord transcripts](#discord-transcripts) |
+| **Any maintenance task — start here** (per-domain procedures, gotchas, distilled institutional knowledge) | [.claude/skills/README.md](.claude/skills/README.md) — 16 skills (13 fact-checked + 3 MM3) |
+| **MiniMax-Music3 backend** (second generation backend: engine port, /mm3 endpoints, backend registry/toggle, trap list) | [.claude/skills/mm3-backend/SKILL.md](.claude/skills/mm3-backend/SKILL.md) |
+| MM3 caption/prompt format (genre adherence) | [.claude/skills/mm3-captioning/SKILL.md](.claude/skills/mm3-captioning/SKILL.md) |
+| **Training an MM3 LM adapter** (album/artist clone: rank, steps, which checkpoint to ship, likeness-vs-coherence) | [.claude/skills/mm3-lm-adapter-training/SKILL.md](.claude/skills/mm3-lm-adapter-training/SKILL.md) |
+| **What the Discord working group said** (MM3 group: bghira, Serveurperso, testerf, Shaz…) — searchable transcripts of every channel | `node tools/discord-claude/read-log.mjs --list` — see [Discord transcripts](#discord-transcripts) |
 | **Writing anything a human reads** (issue replies, commits, PR bodies, release notes, docs) | [docs/WRITING-STYLE.md](docs/WRITING-STYLE.md) — no emojis, no AI tells, honest confidence |
 | Full feature catalogue (100+) | [FEATURES.md](FEATURES.md) |
 | Engine internals, CLI, request JSON, generation modes | [engine/docs/ARCHITECTURE.md](engine/docs/ARCHITECTURE.md) |
 | **Training system** (dataset→preprocess→LM/DiT training→audition; ace-train, FSQ, ggml training gotchas) | [docs/TRAINING.md](docs/TRAINING.md) |
+| **Flash-attention training** (fused attention backward: porting `--attn flash` to a trainer, VRAM-model branches, measurement traps) | [.claude/skills/flash-attn-training/SKILL.md](.claude/skills/flash-attn-training/SKILL.md) |
 | Writing a Lua plugin | [docs/PLUGINS.md](docs/PLUGINS.md) |
 | Build / install / releases | [README.md](README.md) |
 | Cutting & publishing a release (agent runbook) | [docs/RELEASING.md](docs/RELEASING.md) |
 | Internal design/investigation docs (perf, adapters, upstream sync, feature designs) | `docs/plans/` *(gitignored, local-only)* |
 | In-app assistant behaviour/KB | [server/src/data/assistant-knowledge.md](server/src/data/assistant-knowledge.md) |
 
-> **Doc convention:** committed contributor-facing docs = `README.md`, `FEATURES.md`, `docs/PLUGINS.md`, `engine/docs/ARCHITECTURE.md`. Internal planning/investigation docs live in `docs/plans/`, which is **gitignored** (local only). This file (`AGENTS.md`) is committed.
+> **Doc convention:** committed contributor-facing docs = `README.md`, `FEATURES.md`, `docs/PLUGINS.md`, `engine/docs/ARCHITECTURE.md`. Internal planning/investigation docs live in `docs/plans/`, which is **gitignored** (local only). This file (`AGENTS.md`) is committed; `CLAUDE.md` only imports it.
