@@ -2551,34 +2551,24 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                         : "zero (every crop presented as the opening — the legacy convention)");
     jl("{\"type\":\"cropAnchor\",\"mode\":\"%s\"}", anchor_song ? "song" : "zero");
     if (kv_on) {
-        // Both are hard requirements, not preferences. The non-checkpointed
-        // path builds one whole-trunk graph and has no place to splice a store
-        // into; and a prefix under `zero` anchoring would sit at positions the
-        // window then re-uses, which is not a history, it is a contradiction.
-        if (!a.ckpt) {
-            fprintf(stderr, "[mm3-lm-train] --prefix-frames needs the checkpointed path (drop --no-ckpt)\n");
-            lm_kvprefix_free(&kvpfx);
-            return 1;
-        }
-        if (!anchor_song) {
-            fprintf(stderr, "[mm3-lm-train] --prefix-frames needs --crop-anchor song\n");
-            lm_kvprefix_free(&kvpfx);
-            return 1;
-        }
+        // The two hard requirements — the checkpointed path (the naive path has
+        // nowhere to splice a store into) and `song` anchoring (a history at
+        // positions the window then re-uses is a contradiction) — are refused by
+        // cmd_mm3_lm_train from the flags alone, before the base load. Asserted
+        // here so a future caller that skips the parser is loud rather than
+        // subtly wrong.
+        GGML_ASSERT(a.ckpt && anchor_song && "--prefix-frames needs --crop-anchor song on the ckpt path");
         fprintf(stderr,
                 "[mm3-lm-train] kv prefix: up to %lld frames (%.1f s) of no-grad history in front of each crop\n",
                 (long long) a.prefix_frames, (double) a.prefix_frames / 25.0);
         jl("{\"type\":\"kvPrefix\",\"frames\":%lld,\"chunk\":%d}", (long long) a.prefix_frames,
            a.prefix_chunk);
     }
-    if (pfx.active() && !a.ckpt) {
-        // Same reason as the frozen prefix's first refusal: the naive path
-        // builds one whole-trunk graph from a single LmLayerOpts and would need
-        // its own copy of the per-layer resolution AND the rectangular mask.
-        fprintf(stderr, "[mm3-lm-train] --prefix-n needs the checkpointed path (drop --no-ckpt)\n");
-        lm_prefix_free(&pfx);
-        return 1;
-    }
+    // Same as the frozen prefix above: refused in cmd_mm3_lm_train, asserted
+    // here. The old refusal sat at this point in the run body, which meant an
+    // 8.5 GB base load before the message and a `return 1` that freed the prefix
+    // and nothing else.
+    GGML_ASSERT(!(pfx.active() && !a.ckpt) && "--prefix-n needs the checkpointed path");
     if (a.crop_mode == "structured") {
         fprintf(stderr,
                 "[mm3-lm-train] crop policy: structured - %.0f%% start share (half at frame 0, "
@@ -2635,7 +2625,6 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         // turbo8 no-op trap in reverse — the file would load and mean something
         // else.
         meta.rslora       = a.rslora;
-        meta.dora         = a.dora;
         // Provenance for the soft-prompt halves, so the config says what was
         // trained even though the tensors are self-describing.
         meta.artist_token = a.artist_token;
@@ -3054,6 +3043,15 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     // m and v mean, so resuming one into the other must be refused rather than
     // silently accepted the way a 0/1 flag would.
     rstate.optimizer_muon = a.optimizer == "muon" ? 1 : (a.optimizer == "prodigy" ? 2 : 0);
+    // Adapter identity. Same string the export writes as `param_method`, so a
+    // state file and the checkpoint beside it always agree about what they are.
+    rstate.param_method   = a.hra     ? "hra"
+                            : a.pissa ? "pissa"
+                            : a.hira  ? "hira"
+                            : a.loha  ? "loha"
+                            : a.dora  ? "dora"
+                                      : "lora";
+    rstate.rslora         = a.rslora ? 1 : 0;
 
     // ── Prodigy x0 ─────────────────────────────────────────────────────────
     //

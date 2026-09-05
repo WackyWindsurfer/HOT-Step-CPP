@@ -2050,6 +2050,21 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
                 "  needs a genuinely inert model, and a prefix is non-zero from initialisation.\n");
         return 2;
     }
+    // Both prefixes need the checkpointed path: the naive path builds one
+    // whole-trunk graph from a single LmLayerOpts and has nowhere to splice a
+    // store in. Decided here, from the flags alone, rather than after the 8.5 GB
+    // base load — where the run body's copy of this refusal used to sit.
+    if ((a.prefix_n > 0 || a.prefix_frames > 0) && !a.ckpt) {
+        fprintf(stderr, "ace-train mm3-lm-train: %s needs the checkpointed path (drop --no-ckpt)\n",
+                a.prefix_n > 0 ? "--prefix-n" : "--prefix-frames");
+        return 2;
+    }
+    // A frozen history at positions the window then re-uses is not a history,
+    // it is a contradiction. (--prefix-n has no position, so it is unaffected.)
+    if (a.prefix_frames > 0 && a.crop_anchor == "zero") {
+        fprintf(stderr, "ace-train mm3-lm-train: --prefix-frames needs --crop-anchor song\n");
+        return 2;
+    }
     if (a.target_loss_metric != "train" && a.target_loss_metric != "eval") {
         fprintf(stderr, "ace-train mm3-lm-train: --target-loss-metric must be train or eval\n");
         return 2;
@@ -4088,7 +4103,7 @@ static int cmd_train_lm(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--artist-token-lr") && i + 1 < argc) a.artist_lr = (float) atof(argv[++i]);
         else if (!strcmp(argv[i], "--prefix-n") && i + 1 < argc) a.prefix_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--prefix-sigma") && i + 1 < argc) a.prefix_sigma = (float) atof(argv[++i]);
-        else if (!strcmp(argv[i], "--rslora")) a.rslora = true;
+        else if (!strcmp(argv[i], "--rslora")) { a.rslora = true; saw.rslora = true; }
         else if (!strcmp(argv[i], "--dora")) { a.dora = true; saw.method = true; }
         else if (!strcmp(argv[i], "--hira")) { a.hira = true; saw.method = true; }
         else if (!strcmp(argv[i], "--loha")) { a.loha = true; saw.method = true; }

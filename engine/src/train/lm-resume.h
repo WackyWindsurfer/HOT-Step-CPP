@@ -63,6 +63,11 @@ struct LmResumeSource {
     // (lm-export.h `param_method`). Identity, not a knob — a DoRA adapter
     // resumed as a plain LoRA would silently drop its magnitudes.
     std::string method       = "lora";
+    // alpha/sqrt(r) instead of alpha/r. Identity too, in the way that matters
+    // for a chain: it changes nothing about the tensor set, so a leg that drops
+    // it loads the same A/B and applies them 16x weaker at r256, then exports
+    // use_rslora:false so the runtime does the same. Nothing else would notice.
+    bool        rslora       = false;
     int         rank = 0, alpha = 0;
     int         lokr_dim = 0, lokr_factor = 0;
     float       lokr_alpha = 0.0f;
@@ -83,6 +88,7 @@ struct LmResumeSource {
 struct LmResumeExplicit {
     bool rank = false, alpha = false, adapter_type = false;
     bool method = false;  // --dora / --hira / --loha typed on this run's CLI
+    bool rslora = false;  // --rslora typed on this run's CLI
     bool lokr_dim = false, lokr_alpha = false, lokr_factor = false;
     bool weights = false;
     bool prodigy_d0 = false;   // not identity: only decides whether the source's d is adopted
@@ -113,6 +119,10 @@ static bool lm_resume_read_log(const std::string & dir, LmResumeSource * src, st
     src->dir              = dir;
     src->adapter_type     = s("adapter_type").empty() ? "lora" : s("adapter_type");
     src->method           = s("param_method").empty() ? "lora" : s("param_method");
+    {
+        yyjson_val * v = yyjson_obj_get(cfg, "rslora");
+        src->rslora    = yyjson_is_bool(v) ? yyjson_get_bool(v) : false;
+    }
     src->rank             = i("rank", 0);
     src->alpha            = i("alpha", 0);
     src->lokr_dim         = i("lokr_dim", 0);
@@ -373,6 +383,9 @@ static bool lm_resume_prepare(ArgsT * a, const LmResumeExplicit & saw, LmResumeS
     if (saw.method && cli_method != src->method) {
         bad.push_back({ "--dora/--hira/--loha/--hra", cli_method, src->method });
     }
+    if (saw.rslora && a->rslora != src->rslora) {
+        bad.push_back({ "--rslora", a->rslora ? "on" : "off", src->rslora ? "on" : "off" });
+    }
     if (a->pissa) {
         *errbuf = "--pissa cannot be combined with --init-adapter: the init rewrites A/B from the base weight's "
                   "singular vectors, which would discard everything the source run learned.";
@@ -404,6 +417,10 @@ static bool lm_resume_prepare(ArgsT * a, const LmResumeExplicit & saw, LmResumeS
     a->hira = (src->method == "hira");
     a->loha = (src->method == "loha");
     a->hra  = (src->method == "hra");
+    // Adopted for the same reason as the method: the server's multi-stage
+    // spawner types --rslora only on the leg that turned it on, so every later
+    // --init-adapter leg would otherwise continue at alpha/r.
+    a->rslora = src->rslora;
     if (src->rank > 0) {
         a->rank = src->rank;
     }

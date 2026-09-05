@@ -58,7 +58,7 @@
 #include "train/lm-optim.h"
 
 static const char     MM3_RESUME_MAGIC[8] = { 'M', 'M', '3', 'R', 'E', 'S', 'U', 'M' };
-static const uint32_t MM3_RESUME_VERSION  = 3;   // v3 adds the epoch-mean history
+static const uint32_t MM3_RESUME_VERSION  = 4;   // v4 adds the parameterization identity
 static const uint32_t MM3_RESUME_VERSION_MIN = 1;   // v1 still readable
 
 /** Where a Prodigy run keeps x0 — the weights as they were at init, which the
@@ -76,6 +76,19 @@ struct MM3LmResumeState {
     int32_t  rank = 0, alpha = 0, seed = 0;
     int32_t  n_params = 0, n_samples = 0, n_holdout = 0;
     int32_t  optimizer_muon = 0;
+
+    /** Which post-LoRA parameterization the state was written under: "lora",
+     *  "dora", "hira", "loha", "hra" or "pissa" (v4).
+     *
+     *  Rank, alpha and the tensor COUNT are identical between plain LoRA and
+     *  PiSSA — same A/B, same names — so nothing else in this fingerprint can
+     *  tell them apart, and resuming a PiSSA run without --pissa trains against
+     *  a base that no longer carries the frozen -B0A0 the factors were fitted
+     *  against. rsLoRA is the same shape of silence at the scale level. A v1-v3
+     *  file records none of this and is read leniently: the check is skipped
+     *  with a note rather than refusing every state written before v4. */
+    std::string param_method = "lora";
+    int32_t     rslora       = 0;
 
     // Position in the run.
     int32_t  steps_done = 0;      // completed optimizer steps
@@ -262,6 +275,8 @@ static bool mm3_lm_resume_save(const std::string & path, const MM3LmResumeState 
         ok = ok && mm3_rs_w(f, n);
         ok = ok && (n == 0 || fwrite(st.epoch_means.data(), sizeof(double), n, f) == n);
     }
+    // v4: adapter identity that the tensor set cannot express.
+    ok = ok && mm3_rs_w_str(f, st.param_method) && mm3_rs_w(f, st.rslora);
 
     // Tensors: LoRA parameters, then momentum, each block prefixed by its count
     // so a reader knows what to expect without trusting the fingerprint alone.
@@ -379,6 +394,20 @@ static bool mm3_lm_resume_load(const std::string & path, MM3LmResumeState * st,
             return fail("truncated epoch-mean history");
         }
     }
+    // v4. A v1-v3 file carries no identity, so it inherits this run's — the
+    // resume then behaves exactly as it did before this field existed.
+    if (ver >= 4) {
+        if (!mm3_rs_r_str(f, &in.param_method) || !mm3_rs_r(f, &in.rslora)) {
+            return fail("truncated parameterization identity");
+        }
+    } else {
+        in.param_method = st->param_method;
+        in.rslora       = st->rslora;
+        fprintf(stderr,
+                "[mm3-lm-train] resume: state file is v%u and records no parameterization — trusting this "
+                "run's --%s\n",
+                ver, st->param_method.c_str());
+    }
 
     // Fingerprint. Every one of these changes what the stored tensors MEAN.
     if (in.rank != st->rank || in.alpha != st->alpha || in.n_params != st->n_params
@@ -387,6 +416,17 @@ static bool mm3_lm_resume_load(const std::string & path, MM3LmResumeState * st,
                     + "/alpha " + std::to_string(in.alpha) + "/" + std::to_string(in.n_params)
                     + " tensors, this run is rank " + std::to_string(st->rank) + "/alpha "
                     + std::to_string(st->alpha) + "/" + std::to_string(st->n_params) + ")");
+    }
+    // The parameterization is NOT visible in the tensor set for every method
+    // (plain LoRA and PiSSA have the same names and shapes; rsLoRA changes only
+    // a scalar scale), so it has to be compared explicitly or a resume into the
+    // wrong one looks exactly like a correct resume and trains against a
+    // different base function from step 1.
+    if (in.param_method != st->param_method || (in.rslora != 0) != (st->rslora != 0)) {
+        return fail("resume file was written by a " + in.param_method
+                    + (in.rslora ? " (rslora)" : "") + " run, this run is " + st->param_method
+                    + (st->rslora ? " (rslora)" : "")
+                    + " — the factors mean different things under the two, so this is a new run, not a resume");
     }
     st->prodigy_d = in.prodigy_d;
     st->prodigy_r = in.prodigy_r;
@@ -453,10 +493,13 @@ static bool mm3_lm_resume_load(const std::string & path, MM3LmResumeState * st,
     const int32_t keep_rank = st->rank, keep_alpha = st->alpha, keep_seed = st->seed;
     const int32_t keep_np = st->n_params, keep_ns = st->n_samples, keep_nh = st->n_holdout;
     const int32_t keep_muon = st->optimizer_muon;
+    const std::string keep_method = st->param_method;
+    const int32_t     keep_rslora = st->rslora;
     *st = in;
     st->rank = keep_rank; st->alpha = keep_alpha; st->seed = keep_seed;
     st->n_params = keep_np; st->n_samples = keep_ns; st->n_holdout = keep_nh;
     st->optimizer_muon = keep_muon;
+    st->param_method = keep_method; st->rslora = keep_rslora;
     return true;
 }
 

@@ -2562,7 +2562,6 @@ static int lm_train_main(const LmTrainArgs & a) {
     // backend actually launched once an epoch has run.
     meta.attn_mode      = a.attn;
     meta.adapter_type   = a.adapter_type;
-    meta.dora           = a.dora;
     meta.param_method   = a.hra    ? "hra"
                           : a.pissa ? "pissa"
                           : a.hira  ? "hira"

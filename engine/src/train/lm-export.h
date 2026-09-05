@@ -50,11 +50,14 @@ struct LmExportMeta {
     std::string lm_path, lm_size, codes_path, tensors_dir, order;
     int         rank = 16, alpha = 32;
     bool        rslora = false;  // alpha/sqrt(r) scaling; mirrored by lm-adapter.h at load
-    // Post-LoRA parameterization (2026-09-05). `dora` writes use_dora and the
-    // lora_magnitude_vector tensors; `param_method` is the RESUME identity key
-    // ("lora"|"dora"|"hira"|"loha") and is what lm-resume.h reads back. A run
-    // that predates this records nothing and reads back as "lora".
-    bool        dora   = false;
+    // Post-LoRA parameterization (2026-09-05). The RESUME identity key
+    // ("lora"|"dora"|"hira"|"loha"|"hra"|"pissa"), read back by lm-resume.h. A
+    // run that predates this records nothing and reads back as "lora".
+    //
+    // There is deliberately no `dora` bool beside it: use_dora and the
+    // lora_magnitude_vector tensors are both written from the live LmLora
+    // (L.dora), so a second copy here could only ever disagree with the tensors
+    // actually in the file — which the loaders now treat as fatal.
     std::string param_method = "lora";
     // Soft prompt provenance (2026-09-04): recorded so a run's log says what it trained.
     std::string artist_token;
@@ -384,6 +387,7 @@ struct LmExportResult {
 // thing and always travel together, so they live in one file. We are the only
 // AS1.5 app that loads LM adapters, so the layout is ours to define:
 //
+//   hot_step.param_method        F32 [1]  0=lora 1=dora 2=hira 3=loha
 //   hot_step.artist_token.vec    F32 [k, H]
 //   hot_step.artist_token.meta   F32 [4]  {k, placeholder, hidden, site}    site 1=as15_lm 2=mm3_lm
 //   hot_step.prefix.L<l>.k       F32 [n, Nkv*D]   post-QK-norm, NO RoPE
@@ -559,6 +563,27 @@ static bool lm_export_peft(const LmLora & L, const Qwen3LMConfig & cfg, const Lm
     GGML_ASSERT(store.size() == tensors.size());
     for (size_t i = 0; i < tensors.size(); i++) {
         tensors[i].data = store[i].data();
+    }
+
+    // How the file must be APPLIED, in the file itself.
+    //
+    // HiRA is otherwise invisible: it exports ordinary lora_A/lora_B and is
+    // identified only by adapter_config.json's peft_type, so a checkpoint whose
+    // config was dropped or rewritten (repacking for HF, copying one file) loads
+    // as a plain LoRA and applies y = Wx + s*BAx where y = Wx + (W (.) s*BA)x was
+    // trained — a silently wrong delta, no message. LoHa at least has hada_w*.
+    //
+    // The code describes the APPLY, not the training method: PiSSA and HRA
+    // export as genuine plain LoRA (the `ovr` branch), so they mark 0.
+    std::vector<float> method_marker = {
+        (float) (ovr ? 0 : L.loha ? 3 : L.hira ? 2 : L.dora ? 1 : 0)
+    };
+    {
+        STWTensor sm;
+        sm.name  = "hot_step.param_method";
+        sm.shape = { 1 };
+        sm.data  = method_marker.data();
+        tensors.push_back(sm);
     }
 
     // Soft-prompt halves, appended AFTER the re-point above so the LoRA entries'
