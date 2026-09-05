@@ -67,7 +67,7 @@ gives back the VRAM win).
 | Trainer | Files | Specifics |
 |---|---|---|
 | **AS1.5 LM** (R2) — **DONE 2026-09-02** | `engine/src/train/lm-graph.h`, `lm-train-run.h`, `lm-vram.h`, `lm-selftest.h`, `flash-prec.h` | Causal = one triangular −INF mask; the kernel skips all-−INF tiles, so causal gets ~half its compute skipped free. Qwen GQA at B=1 is the tested path. Ships **off by default** (CLI and Training Studio checkbox); 4B low-VRAM is 5.5% faster than the shipped head-blocked arm and 1.2% faster at equal graph shape (opposite split from the DiT — there the fused kernel is the whole win, here the head-block copies are); naive 0.6B roughly doubles auto-fit `maxLen`, 1.7B only 1.27×. Not yet ear-validated — see `project-flash-attn-backward.md` in memory and §7/§8 below for the full numbers and open items. |
-| **MM3 LM** (R3) | `mm3-lm-train-run.h`, `mm3-lm-load.h`, `lm-kvprefix.h` | The "sequence term was quadratic all along" retained softmax is exactly what goes. `--prefix-frames` (no-grad frozen K/V) composes but the fused backward computes dK/dV for the prefix columns and discards them — harmless, wasted; measure before building a no-dK/dV variant. Re-derive crop/prefix budgets afterwards. |
+| **MM3 LM** (R3) — **DONE 2026-09-05** | `mm3-lm-train-run.h`, `mm3-lm-adapter.h`, `mm3-lm-graph.h` | The "sequence term was quadratic all along" retained softmax is what goes — but refused rather than composed with a frozen/trained KV prefix: `--attn flash` is rejected together with `--prefix-frames > 0` or `--prefix-n > 0` (the fused kernel doesn't take the rectangular mask a prefix needs), so the no-dK/dV-for-frozen-columns idea above was never built. **Default `exact`.** Measured (RTX 5090, `mm3-lm-f16`/`mm3-lm-q8_0`, `oasis_morningglory`, rank 256, checkpointed): flash is within noise of exact up to ~1500 frames (checkpointing already hides the small softmax in allocator slack), then saves VRAM growing to ~9 GB by 5000 frames; the usable crop ceiling moves from ~4300 frames (exact, before it starts spilling past ~29 GB used) to at least 11,178 frames (flash — this corpus's longest track, no OOM reached). Paired 20-step run at the shipped recipe's crop (750): 2118 ms/step flash vs 2215 ms exact, max loss drift 1.9e-4. Resolves to tf32 on this card for `--attn flash`, f32 for `--attn flash-f32`. **Not ear-validated** — the shipped recipe still trains at crop 750, where flash measures no benefit. Full numbers: `docs/TRAINING.md` MM3 section. |
 | **MM3 DiT** (R4) | `mm3-dit-train-*.h` | Bidirectional like the AS DiT; smallest win (shorter sequences). |
 
 For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual chain returned;
@@ -201,10 +201,12 @@ For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual 
 | LM attention-only bound (`fattn-train-test --bench-lm` vs blocked) | 0.74×/0.79×/0.80× at S=1024/2113/3500 |
 | LM naive auto-fit `maxLen` lift, flash vs exact | 0.6B ~2.0× (3136→6208 tok); 1.7B ~1.27× (2624→3328 tok) |
 | LM 50-epoch same-seed drift, flash vs exact | same class as `--weights bf16`; smaller on 2/3 measures, ~20% larger on final CE (1 seed, no error bar) |
+| **MM3 LM, usable crop ceiling, flash vs exact** | **~4300 frames exact -> >=11,178 frames flash** (this corpus's longest track; RTX 5090, `oasis_morningglory`, rank 256) |
+| MM3 LM, paired step time at the shipped recipe's crop (750 frames) | 2118 ms/step flash vs 2215 ms exact |
 
 ## 8. Open items (as of 2026-09-02)
 
-- R3/R4 ports (this skill is their brief) — R2 (AS1.5 LM) is DONE, off by default pending ear test.
+- R4 (MM3 DiT) port remains (this skill is its brief) — R2 (AS1.5 LM) and R3 (MM3 LM) are DONE, both off by default pending ear tests.
 - Cross-attention backward kernel: dK/dV role split blocked by smem; a dQ split exists in
   the plan doc (reverted, −2.7%).
 - `DIT_FLASH_LOKR_RETENTION` refit after the apply reorder; batch>1 VRAM term.

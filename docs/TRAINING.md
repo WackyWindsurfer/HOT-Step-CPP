@@ -13,6 +13,123 @@ tripwire, render dials — live in
 Backend/runtime facts (endpoints, sampling knobs, replay) are in
 [.claude/skills/mm3-backend/SKILL.md](../.claude/skills/mm3-backend/SKILL.md).
 
+### `--attn exact|flash` on `mm3-lm-train` (2026-09-05)
+
+The same fused op as the DiT and AS1.5 LM trainers
+(`GGML_OP_FLASH_ATTN_TRAIN`/`_BACK`, closed 2026-09-01), now wired into the
+MM3 planner-LM trainer. **Default `exact`.** Refused together with
+`--prefix-frames > 0` or the new `--prefix-n > 0` — a frozen or trained KV
+prefix needs a rectangular mask the fused kernel does not take — both at the
+CLI (exit 2 before the model loads) and in the `mm3-train-lm` server route,
+which coerces `attnBackend` back to `exact` and echoes the resolved value in
+its response whenever either prefix flag is nonzero.
+
+Measured on an RTX 5090 (32 GB), `mm3-lm-f16` and `mm3-lm-q8_0` bases,
+`oasis_morningglory` (12 tracks, longest ~11,178 frames), rank 256/alpha 256,
+Muon, checkpointed. Peak VRAM is whole-device `used` including the ~10.3 GB
+resident base:
+
+| crop (frames) | exact peak VRAM | flash peak VRAM |
+|---|---|---|
+| 750 | 18,626 MB | 18,634 MB |
+| 1,500 | 19,098 MB | 19,084 MB |
+| 2,500 | 21,124 MB | 19,706 MB |
+| 3,500 | 25,939 MB | 20,332 MB |
+| 4,300 | 28,631 MB (starting to spill) | — |
+| 5,000 | 30,293 MB (spilling) | 21,272 MB |
+| 6,000 | OOM | — |
+| 9,000 | — | 23,832 MB |
+| 11,200 (longest track) | — | 27,244 MB |
+| 19,000 | — | 31,473 MB (spilling) |
+| 21,000 | — | OOM |
+
+Flash is within noise of exact up to ~1,500 frames — under gradient
+checkpointing the small softmax already disappears into allocator slack — then
+saves VRAM growing to ~9 GB by 5,000 frames. Practical spill threshold on this
+card is ~29 GB used regardless of mode; past it step time balloons 2–8× before
+`cudaMalloc` actually fails, so "still fits" is not the same question as
+"still fast". **Usable crop ceiling: ~4,300 frames at `--attn exact`, at least
+11,178 frames (this corpus's longest track, no OOM reached) at `--attn
+flash`** — roughly 2.6× on this measurement. `--attn flash` resolves to tf32
+on this card; `--attn flash-f32` pins f32. Paired 20-step run at the shipped
+recipe's crop (750, same seed and crop sequence both arms): 2118 ms/step mean
+flash vs 2215 ms exact, maximum loss drift 1.9e-4 over 20 steps. **Not
+ear-validated** — the shipped recipe (below) trains at crop 750, where flash
+measures no benefit, so nothing has shipped a reason to turn it on yet. The
+whole-graph (non-checkpointed) finite-difference gate could not be run in any
+mode on this 32 GB card — both the exact and flash naive arms need ~27.5 GB on
+top of the 16 GB f16 base — so flash is proven correct only on an F32-isolated
+2-layer slice, not the full model. Full per-frame numbers and fitting caveats:
+`.claude/skills/flash-attn-training/SKILL.md` §3/§7.
+
+### Six adapter parameterizations, both LM trainers (2026-09-04/05)
+
+`train-lm` and `mm3-lm-train` share one `LmLora` implementation
+(`engine/src/train/lm-graph.h`), so `--dora`, `--rslora`, `--hira`, `--loha`,
+`--pissa` (+ `--pissa-oversample`, `--pissa-iters`) and `--hra` behave
+identically on both trainers, mutually exclusive under the same rules as the
+DiT trainer documented below (HiRA excludes DoRA; LoHa excludes both; PiSSA
+excludes DoRA/HiRA/LoHa; HRA excludes everything including rsLoRA and needs
+an even `--rank`); `--rslora` and `--lora-plus-ratio` stack with any of them.
+The delta each one computes is the same as the DiT table further down — the
+LM's projection sites (`q/k/v/o_proj`, `gate/up/down_proj`) are the only
+difference.
+
+**The DiT trainer's blind listening test found that no parameterization beat
+plain LoRA** (`docs/plans/adapter-parameterizations-roadmap.md`, local).
+Nothing on the LM side has been rendered at all — every gate that ran here is
+a finite-difference probe or an export/load round trip through the runtime
+loader, never audio. Do not read "passed its gate" as "sounds better".
+
+Two open bugs, neither fixed as of this writing: HiRA's finite-difference gate
+fails at the CLI's default epsilon on a full 36-layer graph (worst relative
+error 3.3e-2 against a 2e-2 bar; passes at `--fd-eps 0.05`, which is not the
+default); and a full-depth 10-step HiRA run at the default rank (64) crashes
+before step 1 with a ggml `cgraph->n_nodes < cgraph->size` assert — the
+finite-difference gate only ever exercised a 2-layer, F32-isolated slice, so
+it never saw the full graph's node count.
+
+MM3's binary resume format is now v4 and refuses a checkpoint whose
+parameterization or rsLoRA bit disagrees with the run being continued
+(`mm3-lm-resume.h`); `--pissa` cannot be resumed on either trainer (refused at
+the CLI). `hra`+`rslora` and `--prefix-n` combined with prior preservation
+(`--reg-*`) are both refused with a 400 from the training routes rather than
+failing after the model loads.
+
+### Artist token and KV prefix now reach MM3 generation (2026-09-05)
+
+The soft-prompt machinery documented below for AS1.5 (`--artist-token`,
+`--prefix-n`) was already trainable on `mm3-lm-train`; until this date nothing
+at MM3 generation time applied what it trained. `mm3-lm-adapter.h` now reads
+the same `hot_step.artist_token.{vec,meta}` / `hot_step.prefix.L<l>.{k,v}` /
+`hot_step.prefix.meta` tensors out of `adapter_model.safetensors` that the
+AS1.5 runtime reads (site 2 = mm3_lm in the `.meta` tensor — **one file
+format for both LM trainers**), installs the token at the prompt's
+placeholder span, and seeds the prefix into the KV cache before the prefill.
+Wired into both the runtime and merge generation paths; the merge path is
+compile-checked only, not executed, because exercising it needs a resident MM3
+LM inside a running `ace-server`. The prefix is seeded into every batch row,
+including the CFG unconditional one — MM3 has one KV cache and a mask with no
+batch axis, so seeding the conditional rows only (what the AS1.5 runtime does)
+is not expressible there.
+
+Debug surface: `POST /mm3/lm-plan` accepts `"lm_soft_off": true` to run an
+adapter's LoRA half alone — same weights, same seed, soft prompt off — which
+is the A/B this feature is provable by. Proven on logits and generated codes
+(the off arm reproduces the LoRA-only run byte for byte, and clearing the
+adapter afterward reproduces the original no-adapter run byte for byte).
+**Nothing trained with a token or a prefix has been rendered to audio.**
+
+### The MSVC 2 GiB `stat()` trap
+
+MSVC's `stat()` is 32-bit on file size: a model, adapter, or codes file at or
+past 2 GiB reads back as "missing" instead of erroring, because the size field
+wraps. Every such check in `engine/src/minimax/` now routes through
+`hs_stat`/`HS_STAT_T` (`engine/src/hot-step-fsutf8.h`) instead of the bare
+libc call — `mm3-adapter.h`, `mm3-lm-adapter.h`, and `mm3-job.h` were the
+three call sites. Grep for a bare `stat(` in `engine/src/minimax/` before
+adding a new one; the pattern to follow is commit `ae64b19c`.
+
 ## What it is
 
 End-to-end adapter training **entirely in C++/GGML — no Python anywhere**:

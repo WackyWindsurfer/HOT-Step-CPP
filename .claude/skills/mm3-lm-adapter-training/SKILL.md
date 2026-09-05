@@ -96,9 +96,22 @@ alone.
 ### Crop length is QUADRATIC in VRAM, and that is why f16 lost
 
 Peak is `loaded + perRank*rank + 0.2679*S + 0.00044765*S^2 + const`, with
-`S = 1142 + frames`. The backward retains `[S, S, heads]` attention scores and
-**ggml's flash-attn has no backward**, so there is no cheaper path. What fits
-in 30 GB:
+`S = 1142 + frames`. The backward retains `[S, S, heads]` attention scores —
+that was true unconditionally until 2026-09-05. **`ggml's flash-attn has no
+backward` is no longer correct**: HOT-Step's own fused
+`GGML_OP_FLASH_ATTN_TRAIN`/`_BACK` closed that gap on 2026-09-01, and
+`mm3-lm-train` gained `--attn flash|flash-f32` on 2026-09-05, making attention
+memory linear in S instead of quadratic. Measured on this corpus (RTX 5090,
+`mm3-lm-f16`/`mm3-lm-q8_0`, rank 256, checkpointed): flash moves the usable
+crop ceiling from ~4300 frames (exact, table below) to at least 11,178
+frames — this dataset's longest track, no OOM reached — before the same ~29 GB
+practical spill ceiling. **Default is still `exact`, the table below is
+unchanged, and none of this is in the recipe** — the shipped recipe trains at
+crop 750, where flash measures no benefit (checkpointed segments already hide
+the small softmax in allocator slack), and nothing trained under flash has
+been heard. Full numbers: `docs/TRAINING.md` MM3 section,
+`.claude/skills/flash-attn-training/SKILL.md` §3/§7. What fits in 30 GB
+**at `--attn exact`**, the only mode any shipped adapter has trained under:
 
 | config | max crop | covers a 204 s track |
 |---|---|---|
@@ -156,6 +169,32 @@ noise. Whether that matters by ear is untested.
 BF16 is also the SOURCE dtype of the MM3 weights — but it is not better for
 inference than f16, which keeps all 7 of BF16's mantissa bits and adds 3 more.
 Render on q8_0 as always.
+
+### New adapter knobs (2026-09-04/05) — none of this is in the recipe above
+
+`mm3-lm-train` gained the same six parameterizations `train-dit` has:
+`--dora`, `--rslora`, `--hira`, `--loha`, `--pissa` (+ `--pissa-oversample`,
+`--pissa-iters`) and `--hra`, mutually exclusive under the same rules as the
+DiT trainer (HiRA excludes DoRA; LoHa excludes both; PiSSA excludes
+DoRA/HiRA/LoHa; HRA excludes everything including rsLoRA and needs an even
+`--rank`) — plus two soft-prompt flags that now reach MM3 generation as well
+as training: `--artist-token`/`--artist-token-k`/`--artist-token-lr` and
+`--prefix-n` (a **trained** KV prefix, distinct from `--prefix-frames` above,
+which is frozen history with no gradient). All of it passes its
+finite-difference gate except HiRA, which needs `--fd-eps 0.05` to clear the
+default bar on a full 36-layer graph; a default-rank (64) HRA run separately
+crashes before step 1 on the full graph (`ggml` `cgraph->n_nodes <
+cgraph->size` assert) despite passing its FD gate on an isolated 2-layer
+slice. `--prefix-n` and prior preservation (`--reg-*`) are mutually
+exclusive — a trained prefix is non-zero from init, and prior capture needs
+an inert model — and so are `--hra`/`--rslora`; the training routes 400 on
+both pairs rather than letting the job fail after the model loads.
+
+**None of this is in THE CURRENT BEST RECIPE block and none of it is
+ear-validated.** The DiT trainer's own blind listening test found that no
+parameterization beat plain LoRA — treat that as the prior for MM3 too until
+MM3 has run its own test. Full gate numbers and the open HiRA/HRA bugs:
+`docs/TRAINING.md` MM3 section.
 
 ### Supervising fewer positions does NOT buy VRAM
 
