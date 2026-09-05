@@ -1120,8 +1120,20 @@ static ggml_tensor * lm_linear(ggml_context * ctx, ggml_tensor * w, const QwLora
                 // is EXACTLY zero and y is untouched; the other order would give
                 // (y + z) - z, which rounds, and step 0 would perturb the base by
                 // one ulp of the adapter's own output at every site.
-                ggml_tensor * t0 = ggml_scale(ctx, ggml_mul_mat(ctx, pr->A0, x), pr->scale);
-                d                = ggml_sub(ctx, d, ggml_mul_mat(ctx, pr->B0, t0));
+                //
+                // The rank mask goes on THIS branch too, identically. Until
+                // 2026-09-06 it did not, and under --rank-dropout the two
+                // branches stopped cancelling: step 0 was W + s B0 (M - I) A0,
+                // a random tenth of the base's principal subspace deleted and
+                // the rest scaled 1/keep, at every site, every micro-step.
+                // Step-1 loss 3.92 vs 3.32 for every other method on the same
+                // crop, gradient norms 100x, and a run that never converged.
+                ggml_tensor * t0 = ggml_mul_mat(ctx, pr->A0, x);
+                if (opts.rank_mask) {
+                    t0 = ggml_mul(ctx, t0, opts.rank_mask);
+                }
+                t0 = ggml_scale(ctx, t0, pr->scale);
+                d  = ggml_sub(ctx, d, ggml_mul_mat(ctx, pr->B0, t0));
             }
             y               = ggml_add(ctx, y, d);
             // DoRA. Emits nothing when the pair carries no magnitude, so a plain
