@@ -13,11 +13,14 @@ import * as prompts from './prompts.js';
 // is deterministic.
 import { withModelSuffix } from '../../../server/src/services/lireek/modelName.js';
 import { recalculateProfileStats } from '../../../server/src/services/lireek/profilerService.js';
+import { registerCollaborationTools } from './collaboration.js';
 
 const server = new McpServer({
   name: 'lyricstudio',
   version: '1.0.0',
 });
+
+registerCollaborationTools(server);
 
 const MODEL_PARAM_DESC =
   "Name of the model YOU are running as (e.g. 'Fable 5', 'claude-opus-4-8', 'Gemini 3 Pro'). " +
