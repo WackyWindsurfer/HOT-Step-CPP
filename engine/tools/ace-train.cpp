@@ -1850,6 +1850,8 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--crop-start-tiles")) a.crop_start_tiles = atoi(next("--crop-start-tiles"));
         else if (!strcmp(argv[i], "--crop-anchor"))   a.crop_anchor  = next("--crop-anchor");
         else if (!strcmp(argv[i], "--prefix-frames")) a.prefix_frames = atoll(next("--prefix-frames"));
+        else if (!strcmp(argv[i], "--prefix-n"))     a.prefix_n     = atoi(next("--prefix-n"));
+        else if (!strcmp(argv[i], "--prefix-sigma")) a.prefix_sigma = (float) atof(next("--prefix-sigma"));
         else if (!strcmp(argv[i], "--prefix-chunk"))  a.prefix_chunk  = atoi(next("--prefix-chunk"));
         else if (!strcmp(argv[i], "--prefix-selftest")) a.prefix_selftest = true;
         else if (!strcmp(argv[i], "--target-loss"))   a.target_loss  = (float) atof(next("--target-loss"));
@@ -2013,6 +2015,39 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
     }
     if (a.prefix_frames < 0 || a.prefix_chunk < 1) {
         fprintf(stderr, "ace-train mm3-lm-train: --prefix-frames must be >= 0, --prefix-chunk >= 1\n");
+        return 2;
+    }
+    if (a.prefix_n < 0 || a.prefix_n > 512) {
+        fprintf(stderr, "ace-train mm3-lm-train: --prefix-n must be 0..512\n");
+        return 2;
+    }
+    // --prefix-n (learned K/V columns) and --prefix-frames (frozen audio
+    // history) both reach attention through lm_kv_splice, and lm_train_layer
+    // asserts they are never both set. Say so here rather than let the assert.
+    if (a.prefix_n > 0 && a.prefix_frames > 0) {
+        fprintf(stderr,
+                "ace-train mm3-lm-train: --prefix-n %d cannot be combined with --prefix-frames %lld.\n"
+                "  They are different features sharing one KV-splice mechanism: --prefix-n learns\n"
+                "  positionless K/V columns, --prefix-frames places real no-grad history. Pick one.\n",
+                a.prefix_n, (long long) a.prefix_frames);
+        return 2;
+    }
+    if (a.prefix_n > 0 && a.attn != "exact") {
+        fprintf(stderr,
+                "ace-train mm3-lm-train: --attn %s cannot be combined with --prefix-n %d — the mask is\n"
+                "  rectangular (S_kv = n + S), which the fused-op probe does not cover. Use --attn exact.\n",
+                a.attn.c_str(), a.prefix_n);
+        return 2;
+    }
+    // Prior preservation captures the base's distributions BEFORE the first
+    // step, with the adapter still inert. A prefix is not inert: it is
+    // initialised at sigma 0.02 and is in the graph from node one, so the
+    // "base" the teacher captured would already carry it and every reg step
+    // would score the student against a contaminated teacher.
+    if (a.prefix_n > 0 && a.reg_every > 0) {
+        fprintf(stderr,
+                "ace-train mm3-lm-train: --prefix-n cannot be combined with --reg-every. The prior capture\n"
+                "  needs a genuinely inert model, and a prefix is non-zero from initialisation.\n");
         return 2;
     }
     if (a.target_loss_metric != "train" && a.target_loss_metric != "eval") {

@@ -93,6 +93,7 @@
 #include "train/mm3-lm-verify-export.h"
 #include "train/lm-pissa.h"
 #include "train/lm-hra.h"
+#include "train/lm-prefix.h"
 #include "minimax/mm3-tokenizer.h"
 
 #include <algorithm>
@@ -531,6 +532,23 @@ struct MM3LmTrainArgs {
      *  runtime-LoKR audit is the standing reminder that "the math reads right"
      *  is not evidence. */
     bool        prefix_selftest = false;
+
+    // ── TRAINABLE KV PREFIX (train/lm-prefix.h) ────────────────────────────
+    //
+    // A DIFFERENT FEATURE that shares one mechanism with the block above, and
+    // the two names are close enough to be worth spelling out. `prefix_frames`
+    // is FROZEN audio history — real frames of the song, forward-only, no
+    // gradient. `prefix_n` is prefix tuning: n learned K/V columns per layer,
+    // parameters, with no position and no audio behind them. Both arrive at
+    // attention through lm_kv_splice, and lm_train_layer asserts they are never
+    // both set, so the CLI refuses the pair rather than letting that assert
+    // decide.
+    //
+    // Checkpointed path only. Every per-layer opt and the rectangular mask come
+    // from lm-ckpt.h (LmCkptCfg::pfx); the naive path would need its own copy of
+    // both, for a route nobody trains on.
+    int         prefix_n     = 0;
+    float       prefix_sigma = 0.02f;
 
     // ── Pause / resume (mm3-lm-resume.h) ───────────────────────────────────
     //
@@ -987,18 +1005,42 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         return 1;
     }
     const MM3LmSample & smp = samples[0];
+
+    // ── the soft-prompt halves, under the SAME gate as the adapter ─────────
+    //
+    // --artist-token and --prefix-n add parameters the FD arm never saw: the
+    // token sits in the embedding stage (its gradient comes from lm-ckpt.h's
+    // P1B backward, a route nothing else here exercises), and the prefix sits
+    // in every layer's K/V. Both are gated exactly like a LoRA factor —
+    // whole-tensor directional derivative against the measured loss change.
+    //
+    // The placeholder id here is ARBITRARY (0 works): this check never decodes
+    // anything, and the trainer's own splice is the thing under test on the
+    // real run. What matters is that k consecutive ids exist at the front of
+    // the prompt so the acc lands where mm3_lm_build_embed asserts it does.
+    const int fd_art_k = a.artist_token.empty() ? 0 : std::max(1, std::min(a.artist_k, 8));
+    std::vector<int32_t> fd_prompt = smp.prompt;
+    if (fd_art_k > 0) {
+        fd_prompt.insert(fd_prompt.begin(), (size_t) fd_art_k, (int32_t) 0);
+    }
     // TRUNCATE THE PROMPT. A real MM3 prompt is ~1,125 tokens, which would put
     // the NAIVE arm of this check back over the card for exactly the reason
     // the trainer needed checkpointing — and the naive arm is half of what is
     // being compared. A gradient check needs the same graph STRUCTURE, not a
     // meaningful caption; cutting mid-BPE is acceptable here and nowhere else.
-    const int64_t       P   = std::min<int64_t>(prompt_cap, (int64_t) smp.prompt.size());
+    const int64_t       P   = std::min<int64_t>(prompt_cap, (int64_t) fd_prompt.size());
     const int64_t       K   = std::min<int64_t>(frames, smp.n_frames);
     const int64_t       Fin = K - 1;          // never at_end: keep the case simple
     const int64_t       n_sup = K;
     const int64_t       S   = P + Fin;
     fprintf(stderr, "[mm3-fd] %s: prompt %lld (of %zu, truncated) + %lld frames = seq %lld, rank %d, eps %.3g\n",
-            smp.id.c_str(), (long long) P, smp.prompt.size(), (long long) K, (long long) S, a.rank, eps);
+            smp.id.c_str(), (long long) P, fd_prompt.size(), (long long) K, (long long) S, a.rank, eps);
+    if (fd_art_k > 0 && P < fd_art_k) {
+        fprintf(stderr, "[mm3-fd] --fd-prompt %lld is shorter than the artist token span (k=%d)\n",
+                (long long) P, fd_art_k);
+        mm3_train_lm_free(&t);
+        return 1;
+    }
 
     // ── --attn (R3): the SAME gate, run against the fused ops ─────────────
     //
@@ -1104,9 +1146,60 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         }
         fprintf(stderr, "[mm3-fd] LoKr: perturbed %zu w2 tensors to sigma 1e-2 so the w1 gradient is not identically zero\n", perturbed);
     }
+    // ── the soft-prompt parameters ────────────────────────────────────────
+    //
+    // Both are PERTURBED away from their production init, for the reason the
+    // LoKr block above states: a zero-initialised artist token gives dL/dt an
+    // honest value but a zero WEIGHT, and the probe would then compare a
+    // gradient against a loss curve that is flat in the only direction it can
+    // move. The prefix already inits non-zero (lm-prefix.h), so it keeps its
+    // real sigma; the token is given the same 1e-2 the LoRA's B gets.
+    ggml_tensor *         fd_art     = nullptr;
+    ggml_context *        fd_art_ctx = nullptr;
+    ggml_backend_buffer_t fd_art_buf = nullptr;
+    if (fd_art_k > 0) {
+        ggml_init_params ap = { 2 * ggml_tensor_overhead(), nullptr, true };
+        fd_art_ctx          = ggml_init(ap);
+        fd_art              = ggml_new_tensor_2d(fd_art_ctx, GGML_TYPE_F32, H, fd_art_k);
+        ggml_set_name(fd_art, "artist_token");
+        ggml_set_param(fd_art);
+        fd_art_buf = ggml_backend_alloc_ctx_tensors(fd_art_ctx, t.lm.backend);
+        if (!fd_art_buf) {
+            fprintf(stderr, "[mm3-fd] artist-token buffer allocation failed\n");
+            mm3_train_lm_free(&t);
+            return 1;
+        }
+        LmRng              arng;
+        lm_rng_seed(&arng, (uint64_t) a.seed ^ 0xA5A5C0FFEEull);
+        std::vector<float> av((size_t) ggml_nelements(fd_art), 0.0f);
+        lm_rng_fill_normal(&arng, av, 1e-2f);
+        ggml_backend_tensor_set(fd_art, av.data(), 0, av.size() * sizeof(float));
+        fprintf(stderr, "[mm3-fd] artist token: k=%d at the front of the prompt, perturbed to sigma 1e-2 "
+                        "(a zero token would make the numeric side flat)\n", fd_art_k);
+    }
+    LmPrefix fd_pfx;
+    if (a.prefix_n > 0) {
+        std::string perr;
+        if (!lm_prefix_init(&fd_pfx, &t.lm, 0, c.n_layers, a.prefix_n, S, (uint64_t) a.seed, a.prefix_sigma,
+                            &perr)) {
+            fprintf(stderr, "[mm3-fd] trainable prefix init failed: %s\n", perr.c_str());
+            mm3_train_lm_free(&t);
+            return 1;
+        }
+        fprintf(stderr, "[mm3-fd] trainable prefix: n=%d over %d layers, %zu params\n", fd_pfx.n, c.n_layers,
+                fd_pfx.n_params);
+    }
+    std::vector<ggml_tensor *> fd_params = lora.params;
+    if (fd_art) {
+        fd_params.push_back(fd_art);
+    }
+    for (size_t i = 0; i < fd_pfx.params.size(); i++) {
+        fd_params.push_back(fd_pfx.params[i]);
+    }
+
     LmOptim opt;
     opt.optimizer = "adamw";
-    if (!lm_optim_init(&opt, lora.params, t.lm.backend, &err)) {
+    if (!lm_optim_init(&opt, fd_params, t.lm.backend, &err)) {
         fprintf(stderr, "[mm3-fd] optimizer init failed: %s\n", err.c_str());
         lm_lora_detach(&lora, &t.lm);
         lm_lora_free(&lora);
@@ -1126,7 +1219,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     ggml_tensor * t_pos    = ggml_new_tensor_1d(ctx_static, GGML_TYPE_I32, S);
     // F32 under --attn exact (the shipped allocation, byte for byte), F16 under
     // flash: ggml_flash_attn_train asserts mask->type == GGML_TYPE_F16.
-    ggml_tensor * t_msk    = lm_mask_alloc(ctx_static, S * S, fd_flash);
+    ggml_tensor * t_msk    = lm_mask_alloc(ctx_static, (a.prefix_n + S) * S, fd_flash);
     ggml_tensor * t_lab    = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, SL, n_sup);
     ggml_tensor * t_lg     = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
     ggml_tensor * t_clip   = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
@@ -1158,14 +1251,29 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     for (int64_t j = 0; j < n_sup; j++) tgt[(size_t) j] = mm3_lm_train_slice_index(t, smp.codes[(size_t) (j * 8)]);
     for (int64_t i = 0; i < S; i++) pos[(size_t) i] = (int32_t) i;
     std::vector<float> msk;
-    lm_causal_mask((int) S, &msk);
-    ggml_backend_tensor_set(t_prompt, smp.prompt.data(), 0, (size_t) P * sizeof(int32_t));
+    if (fd_pfx.active()) {
+        // Every row sees the whole prefix (pfx_lo 0, n_prompt 0) — lm-prefix.h
+        // contract 2, and the same call lm_ckpt_upload_mask makes.
+        lm_causal_mask_prefix(fd_pfx.n, /*pfx_lo=*/0, (int) S, /*n_prompt=*/0, &msk);
+    } else {
+        lm_causal_mask((int) S, &msk);
+    }
+    ggml_backend_tensor_set(t_prompt, fd_prompt.data(), 0, (size_t) P * sizeof(int32_t));
     ggml_backend_tensor_set(t_sem, sem_in.data(), 0, sem_in.size() * sizeof(int32_t));
     ggml_backend_tensor_set(t_ac, ac_in.data(), 0, ac_in.size() * sizeof(int32_t));
     ggml_backend_tensor_set(t_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
     lm_mask_set(t_msk, msk);   // converts to F16 when the buffer is F16 (--attn flash)
 
-    MM3EmbedCtx embed_ctx{ &t, t_prompt, t_sem, t_ac, P, Fin };
+    MM3EmbedCtx embed_ctx{ &t, t_prompt, t_sem, t_ac, P, Fin, fd_art, fd_art_k };
+    // The naive arm resolves the prefix per layer from these tables, exactly as
+    // lm_ckpt_layer_kv does for the checkpointed one — so both arms of the
+    // comparison below run the same attention.
+    if (fd_pfx.active()) {
+        fd_opts.pfx_k_all = &fd_pfx.k;
+        fd_opts.pfx_v_all = &fd_pfx.v;
+        fd_opts.pfx_zero  = fd_pfx.zero;
+        fd_opts.pfx_n     = fd_pfx.n;
+    }
 
     std::vector<uint8_t> arena((size_t) 512 << 20);
     BackendPair          bp;
@@ -1278,7 +1386,10 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     // never touch pair 2 — a backward can be wrong in exactly the half the
     // probes skip, which is the whole reason this gate exists.
     enum ProbeExtra { PROBE_FACTOR = 0, PROBE_A2, PROBE_B2, PROBE_M };
-    struct Probe { int layer, slot; bool is_a; int extra; };
+    // `direct` names a parameter that is not a LoRA factor at all — the artist
+    // token, or one layer's prefix K/V. When it is set, layer/slot/is_a/extra
+    // are ignored and `dname` is the label.
+    struct Probe { int layer, slot; bool is_a; int extra; ggml_tensor * direct; const char * dname; };
     // `is_a` means FIRST factor, whichever parameterization is in play:
     //   LoRA -> A / B        LoKr -> w1 / (w2 | w2_a)
     // Without this the probes address q.A and q.B, which are null on a LoKr
@@ -1303,6 +1414,22 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         }
         return first ? "A" : "B";
     };
+    // Resolve a probe to the tensor it perturbs and the name it prints under.
+    auto probe_par = [&](const Probe & pr) -> ggml_tensor * {
+        if (pr.direct) {
+            return pr.direct;
+        }
+        return probe_tensor(lora.layers[pr.layer].p[pr.slot], pr.is_a, pr.extra);
+    };
+    auto probe_label = [&](const Probe & pr, char * out, size_t n) {
+        if (pr.direct) {
+            snprintf(out, n, "%s", pr.dname);
+            return;
+        }
+        const QwLoraPair & q = lora.layers[pr.layer].p[pr.slot];
+        snprintf(out, n, "L%d.%s.%s", pr.layer, lm_slot_peft_name(pr.slot),
+                 probe_suffix(q, pr.is_a, pr.extra));
+    };
     std::vector<Probe> probes;
     {
         const int layers[3] = { 0, c.n_layers / 2, c.n_layers - 1 };
@@ -1313,20 +1440,37 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
             // probes would address the identical tensor and the gate would
             // silently cover a third of what it claims.
             if (lora.hra) {
-                probes.push_back(Probe{ layers[(i / 3) % 3], slots[i % 3], true, PROBE_FACTOR });
+                probes.push_back(Probe{ layers[(i / 3) % 3], slots[i % 3], true, PROBE_FACTOR, nullptr, nullptr });
             } else {
-                probes.push_back(Probe{ layers[i % 3], slots[(i / 3) % 3], (i % 2) == 0, PROBE_FACTOR });
+                probes.push_back(
+                    Probe{ layers[i % 3], slots[(i / 3) % 3], (i % 2) == 0, PROBE_FACTOR, nullptr, nullptr });
             }
         }
         // Appended, never substituted: the plain-LoRA probes above still run,
         // so a DoRA/LoHa gate is strictly a superset of the LoRA one.
         if (lora.loha) {
-            probes.push_back(Probe{ 0, QW_LORA_Q, true, PROBE_A2 });
-            probes.push_back(Probe{ 1 % std::max(1, c.n_layers), QW_LORA_GATE, true, PROBE_B2 });
+            probes.push_back(Probe{ 0, QW_LORA_Q, true, PROBE_A2, nullptr, nullptr });
+            probes.push_back(Probe{ 1 % std::max(1, c.n_layers), QW_LORA_GATE, true, PROBE_B2, nullptr, nullptr });
         }
         if (lora.dora) {
-            probes.push_back(Probe{ 0, QW_LORA_Q, true, PROBE_M });
-            probes.push_back(Probe{ 1 % std::max(1, c.n_layers), QW_LORA_DOWN, true, PROBE_M });
+            probes.push_back(Probe{ 0, QW_LORA_Q, true, PROBE_M, nullptr, nullptr });
+            probes.push_back(Probe{ 1 % std::max(1, c.n_layers), QW_LORA_DOWN, true, PROBE_M, nullptr, nullptr });
+        }
+        // The soft-prompt parameters. One probe for the token; for the prefix,
+        // the FIRST and LAST adapted layer's K and V — the prefix is resolved
+        // per layer from a table, so a probe on layer 0 alone would say nothing
+        // about the indexing.
+        if (fd_art) {
+            probes.push_back(Probe{ 0, 0, true, PROBE_FACTOR, fd_art, "artist_token" });
+        }
+        if (fd_pfx.active()) {
+            const int lo = fd_pfx.layer_lo, hi = fd_pfx.layer_hi - 1;
+            probes.push_back(Probe{ 0, 0, true, PROBE_FACTOR, fd_pfx.k[(size_t) lo], "prefix_k.first" });
+            probes.push_back(Probe{ 0, 0, true, PROBE_FACTOR, fd_pfx.v[(size_t) lo], "prefix_v.first" });
+            if (hi != lo) {
+                probes.push_back(Probe{ 0, 0, true, PROBE_FACTOR, fd_pfx.k[(size_t) hi], "prefix_k.last" });
+                probes.push_back(Probe{ 0, 0, true, PROBE_FACTOR, fd_pfx.v[(size_t) hi], "prefix_v.last" });
+            }
         }
     }
 
@@ -1345,8 +1489,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     // Whole-tensor gradients, one vector per probe.
     std::vector<std::vector<float>> g_naive;
     for (const Probe & pr : probes) {
-        const QwLoraPair & q = lora.layers[pr.layer].p[pr.slot];
-        g_naive.push_back(grad_vec(probe_tensor(q, pr.is_a, pr.extra)));
+        g_naive.push_back(grad_vec(probe_par(pr)));
     }
 
     // Checkpointed gradients for the same probes.
@@ -1354,6 +1497,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     {
         LmCkptCfg cc;
         cc.chunk     = 64;
+        cc.pfx       = fd_pfx.active() ? &fd_pfx : nullptr;
         // lm_ckpt_layer_opts copies these into every P2/P3/P7 segment graph, so
         // both arms of the comparison below run the same attention formulation.
         cc.attn_flash = fd_flash;
@@ -1371,10 +1515,14 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
             ckpt_run.t_tok = t_tok; ckpt_run.t_pos = t_pos; ckpt_run.t_msk = t_msk;
             ckpt_run.t_gs = t_gs;   ckpt_run.t_one = t_one; ckpt_run.grad_accum = 1;
             ckpt_run.embed_build = mm3_lm_ckpt_embed; ckpt_run.embed_user = &embed_ctx;
+            // P1B: without this the artist token's gradient is silently zero on
+            // the checkpointed arm, which the route comparison WOULD catch (the
+            // naive arm has it) — that is the point of running both.
+            ckpt_run.embed_trainable = fd_art != nullptr;
+            ckpt_run.embed_has_param = fd_art != nullptr;
             if (backward_ckpt()) {
                 for (const Probe & pr : probes) {
-                    const QwLoraPair & q = lora.layers[pr.layer].p[pr.slot];
-                    g_ckpt.push_back(grad_vec(probe_tensor(q, pr.is_a, pr.extra)));
+                    g_ckpt.push_back(grad_vec(probe_par(pr)));
                 }
             } else {
                 fprintf(stderr, "[mm3-fd] checkpointed backward failed\n");
@@ -1390,9 +1538,8 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     std::vector<double> fd_rel;
     bool                gate_fd_ran = false, gate_fd_pass = false;
     for (size_t i = 0; i < probes.size(); i++) {
-        const Probe &      pr  = probes[i];
-        const QwLoraPair & q   = lora.layers[pr.layer].p[pr.slot];
-        ggml_tensor *      par = probe_tensor(q, pr.is_a, pr.extra);
+        const Probe & pr  = probes[i];
+        ggml_tensor * par = probe_par(pr);
 
         const std::vector<float> & g = g_naive[i];
         double norm2 = 0.0;
@@ -1416,8 +1563,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
 
         const double rel = std::abs(num - gnorm) / std::max(1e-12, gnorm);
         char         nm[64];
-        snprintf(nm, sizeof(nm), "L%d.%s.%s", pr.layer, lm_slot_peft_name(pr.slot),
-                 probe_suffix(q, pr.is_a, pr.extra));
+        probe_label(pr, nm, sizeof(nm));
         fprintf(stderr, "[mm3-fd] %-26s %10zu %13.6e %13.6e %8.3f\n", nm, g.size(), gnorm, num, rel);
         fd_rel.push_back(rel);
         if (!(rel < 0.15)) n_bad++;
@@ -1536,6 +1682,13 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     ggml_backend_buffer_free(buf_static);
     ggml_free(ctx_static);
     lm_optim_free(&opt);
+    if (fd_art_buf) {
+        ggml_backend_buffer_free(fd_art_buf);
+    }
+    if (fd_art_ctx) {
+        ggml_free(fd_art_ctx);
+    }
+    lm_prefix_free(&fd_pfx);
     lm_lora_detach(&lora, &t.lm);
     lm_lora_free(&lora);
     // The isolated tensors are what lm_lora_detach just restored the base
@@ -1868,6 +2021,31 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         ggml_backend_tensor_set(t_art, z.data(), 0, z.size() * sizeof(float));
     }
 
+    // ── Trainable KV prefix (train/lm-prefix.h) ───────────────────────────
+    //
+    // Allocated over EVERY layer, because lm_ckpt_layer_kv indexes the tables
+    // by absolute layer and a null entry at a layer the segment builds would
+    // dereference. Init sigma is on both K and V for the reason lm-prefix.h
+    // states: a zero V pins dL/dK at exactly zero forever.
+    LmPrefix pfx;
+    if (a.prefix_n > 0) {
+        std::string perr;
+        if (!lm_prefix_init(&pfx, &t.lm, 0, c.n_layers, a.prefix_n, S_max, (uint64_t) a.seed, a.prefix_sigma,
+                            &perr)) {
+            fprintf(stderr, "[mm3-lm-train] trainable prefix init failed: %s\n", perr.c_str());
+            lm_lora_detach(&lora, &t.lm);
+            lm_lora_free(&lora);
+            mm3_train_lm_free(&t);
+            return 1;
+        }
+        fprintf(stderr,
+                "[mm3-lm-train] trainable KV prefix: n=%d over %d layers, row %lld, %zu params (%.1f MB), "
+                "sigma %.3g\n",
+                pfx.n, c.n_layers, (long long) pfx.row, pfx.n_params, pfx.n_params * 4.0 / 1048576.0,
+                (double) a.prefix_sigma);
+        jl("{\"type\":\"prefixTune\",\"n\":%d,\"params\":%zu}", pfx.n, pfx.n_params);
+    }
+
     // Freezing the adapter means CLEARING GGML_TENSOR_FLAG_PARAM, not merely
     // omitting it here: lm_ckpt_fill_gacc asserts every PARAM-flagged graph node
     // has an optimizer slot, so flagged-but-unoptimized aborts the run.
@@ -1882,6 +2060,9 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     if (t_art) {
         train_params.push_back(t_art);
     }
+    for (size_t i = 0; i < pfx.params.size(); i++) {
+        train_params.push_back(pfx.params[i]);
+    }
 
     LmOptim opt;
     opt.optimizer     = a.optimizer;
@@ -1894,6 +2075,9 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     if (t_art) {
         opt.adamw_only.push_back(t_art);  // a [H, k] matrix is not a weight; keep it off Muon
     }
+    for (size_t i = 0; i < pfx.params.size(); i++) {
+        opt.adamw_only.push_back(pfx.params[i]);  // same reasoning: K/V columns are not a weight matrix
+    }
     if (!lm_optim_init(&opt, train_params, t.lm.backend, &err)) {
         fprintf(stderr, "[mm3-lm-train] optimizer init failed: %s\n", err.c_str());
         lm_lora_detach(&lora, &t.lm);
@@ -1903,10 +2087,24 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     }
     // A run where Muon classified ZERO parameters trains as AdamW and says
     // nothing about it. Print the split so that is visible.
-    if (t_art && a.artist_lr > 0.0f && a.artist_lr != a.lr) {
-        lm_optim_set_lr_mul(&opt, t_art, a.artist_lr / a.lr);
-        fprintf(stderr, "[mm3-lm-train] artist token LR %.3g (x%.1f the LoRA's %.3g)\n", a.artist_lr,
-                a.artist_lr / a.lr, a.lr);
+    if (a.artist_lr > 0.0f && a.artist_lr != a.lr) {
+        // One dial for BOTH soft-prompt parameterizations, exactly as train-lm
+        // does it: the token and the prefix are the same kind of thing (a
+        // conditioning input, not a weight) and want the same larger LR.
+        const float mul = a.artist_lr / a.lr;
+        size_t      n   = 0;
+        if (t_art) {
+            lm_optim_set_lr_mul(&opt, t_art, mul);
+            n++;
+        }
+        for (size_t i = 0; i < pfx.params.size(); i++) {
+            lm_optim_set_lr_mul(&opt, pfx.params[i], mul);
+            n++;
+        }
+        if (n) {
+            fprintf(stderr, "[mm3-lm-train] soft-prompt LR %.3g (x%.1f the LoRA's %.3g) on %zu tensor(s)\n",
+                    a.artist_lr, mul, a.lr, n);
+        }
     }
     if (a.lora_plus_ratio != 1.0f && !lora.is_lokr) {
         int n_b = 0, n_muon_b = 0;
@@ -1963,7 +2161,9 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     // lm_causal_mask_prefix. Size for the worst case up front; the prefill's
     // own chunk masks live in its store, not here.
     const int64_t PFX_Q   = a.prefix_frames > 0 ? max_prompt + a.prefix_frames : 0;
-    const int64_t MSK_CAP = (PFX_Q + S_max) * S_max;
+    // A TRAINABLE prefix widens the same mask by its own n (lm_ckpt_n_kv), and
+    // the two are mutually exclusive, so one max covers both.
+    const int64_t MSK_CAP = (std::max<int64_t>(PFX_Q, a.prefix_n) + S_max) * S_max;
     ggml_tensor * t_pos    = ggml_new_tensor_1d(ctx_static, GGML_TYPE_I32, S_max);
     // F32 under --attn exact — the shipped allocation, byte for byte — and F16
     // under flash, where ggml_flash_attn_train asserts mask->type == F16. The
@@ -2159,6 +2359,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         }
         LmCkptCfg cc;
         cc.kv           = kv_on ? &kvpfx : nullptr;
+        cc.pfx          = pfx.active() ? &pfx : nullptr;
         cc.chunk        = a.ckpt_chunk;
         cc.weights_bf16 = weights_bf16;                 // Lever A
         // lm_ckpt_layer_opts is the ONLY place the segment graphs get their
@@ -2219,6 +2420,31 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         pfx_ctx.sem_off  = (int64_t) t.semantic_vocab_offset;
     }
 
+    // ── the artist token is a PER-SAMPLE property, not a run-wide one ───────
+    //
+    // A prior-preservation sample is loaded from a different manifest and never
+    // goes through the placeholder splice above, so its prompt does not contain
+    // the token's span. The trainer used to hand the SAME t_art / art_k into
+    // every graph regardless, which accs an artist-specific vector onto the
+    // first k positions of prompts that have nothing to do with the artist —
+    // corrupting the very steps that exist to hold the base model still — and
+    // ran a P1B backward into t_art on those steps too, so the token also
+    // learned from them.
+    //
+    // train-lm has carried the right shape since the token landed there
+    // (`run.embed_has_param = s.artist_off >= 0`). This is the same switch:
+    // art_k == 0 removes the acc from the graph, and embed_has_param stops
+    // lm-ckpt.h building a backward over a stage that now holds no parameter
+    // (ggml_build_backward_expand asserts on a graph with none).
+    int  art_k_step = art_k;
+    auto set_art    = [&](bool on) {
+        art_k_step               = on ? art_k : 0;
+        embed_ctx.art_k          = art_k_step;
+        pfx_ctx.e.art_k          = art_k_step;
+        ckpt_run.embed_has_param = art_k_step > 0;
+    };
+    set_art(art_k > 0);
+
     // ── graph sizing + scheduler ──
     // The scheduler is SHARED with the optimizer step, so it must be sized for
     // whichever graph is larger. This bit a real 4B Muon run: Muon's optimizer
@@ -2230,7 +2456,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     auto build_graph = [&](ggml_context * ctx, ggml_cgraph * gf, int64_t P, int64_t Fin, int64_t n_sup,
                            ggml_tensor ** out_loss) {
         const int64_t S = P + Fin;
-        MM3EmbedCtx   ec{ &t, t_prompt, t_sem, t_ac, P, Fin, t_art, art_k };
+        MM3EmbedCtx   ec{ &t, t_prompt, t_sem, t_ac, P, Fin, t_art, art_k_step };
         ggml_tensor * h_in = mm3_lm_build_embed(ctx, ec);
 
         LmLayerOpts   nopts;
@@ -2337,6 +2563,14 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         jl("{\"type\":\"kvPrefix\",\"frames\":%lld,\"chunk\":%d}", (long long) a.prefix_frames,
            a.prefix_chunk);
     }
+    if (pfx.active() && !a.ckpt) {
+        // Same reason as the frozen prefix's first refusal: the naive path
+        // builds one whole-trunk graph from a single LmLayerOpts and would need
+        // its own copy of the per-layer resolution AND the rectangular mask.
+        fprintf(stderr, "[mm3-lm-train] --prefix-n needs the checkpointed path (drop --no-ckpt)\n");
+        lm_prefix_free(&pfx);
+        return 1;
+    }
     if (a.crop_mode == "structured") {
         fprintf(stderr,
                 "[mm3-lm-train] crop policy: structured - %.0f%% start share (half at frame 0, "
@@ -2394,6 +2628,12 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         // else.
         meta.rslora       = a.rslora;
         meta.dora         = a.dora;
+        // Provenance for the soft-prompt halves, so the config says what was
+        // trained even though the tensors are self-describing.
+        meta.artist_token = a.artist_token;
+        meta.artist_k     = art_k;
+        meta.artist_lr    = a.artist_lr;
+        meta.prefix_n     = pfx.active() ? pfx.n : 0;
         meta.param_method = a.hra    ? "hra"
                             : a.pissa ? "pissa"
                             : a.hira  ? "hira"
@@ -2415,6 +2655,13 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             mx.art_placeholder = art_placeholder;
             mx.site            = 2;  // mm3_lm
         }
+        if (pfx.active()) {
+            mx.pfx_k  = pfx.k;
+            mx.pfx_v  = pfx.v;
+            mx.pfx_n  = pfx.n;
+            mx.pfx_lo = pfx.layer_lo;
+            mx.pfx_hi = pfx.layer_hi;
+        }
         const bool lokr_out = a.is_lokr();
         // PiSSA and HRA go out as ORDINARY PEFT LoRAs — rank 2r and rank r
         // respectively — through the same writer, with their factors
@@ -2428,10 +2675,15 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             fprintf(stderr, "[mm3-lm-train] export failed: %s\n", xerr.c_str());
             return std::string();
         }
-        // The artist token rides in the same checkpoint dir. A checkpoint
-        // without it would be an adapter that silently expects a trigger it
-        // does not ship. Shared writer with the ACE trainers (artist-token-io.h)
-        // so the three sites cannot drift into three formats.
+        // ── the legacy artist_token.safetensors sidecar ────────────────────
+        //
+        // REDUNDANT SINCE 2026-09-05 and kept for ONE release. The token now
+        // ships inside adapter_model.safetensors as hot_step.artist_token.vec /
+        // .meta (site 2, lm-export.h) and minimax/mm3-lm-adapter.h reads it from
+        // there — that is the only path generation uses. This pair of files is
+        // written purely so a checkpoint produced by this build still loads in a
+        // build that predates the unified reader. Delete the block, and
+        // artist-token-io.h's mm3 caller, once no shipped release reads it.
         if (t_art) {
             ArtistTokenMeta am;
             am.name        = a.artist_token;
@@ -2555,7 +2807,10 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                                     ? mm3_lm_train_slice_eos(t)
                                     : mm3_lm_train_slice_index(t, es.codes[(size_t) ((ec.c0 + j) * 8)]);
             }
-            if ((int) S != last_mask_S) {
+            // Skipped entirely under a trainable prefix: lm_ckpt_upload_mask
+            // owns t_msk then (the mask is rectangular, [n + S, S]), and a
+            // square upload here would be silently reinstated over it.
+            if (!pfx.active() && (int) S != last_mask_S) {
                 lm_causal_mask((int) S, &msk);
                 lm_mask_set(t_msk, msk);   // F16 under --attn flash, same bytes under exact
                 last_mask_S = (int) S;
@@ -2574,6 +2829,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
 
             embed_ctx.P   = P;
             embed_ctx.Fin = Fin;
+            // Held-out crops come from the same manifest as the training ones,
+            // so they DO carry the placeholder span. Set explicitly rather than
+            // inherited: the last micro-step before an eval may have been a reg
+            // step, which leaves the token off.
+            set_art(art_k > 0);
             LmSample smp;
             smp.tokens.assign((size_t) S, 0);
             smp.targets  = tgt;
@@ -2994,7 +3254,10 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                                     ? mm3_lm_train_slice_eos(t)
                                     : mm3_lm_train_slice_index(t, rs.codes[(size_t) (j * 8)]);
             }
-            if ((int) S != last_mask_S) {
+            // Skipped entirely under a trainable prefix: lm_ckpt_upload_mask
+            // owns t_msk then (the mask is rectangular, [n + S, S]), and a
+            // square upload here would be silently reinstated over it.
+            if (!pfx.active() && (int) S != last_mask_S) {
                 lm_causal_mask((int) S, &msk);
                 lm_mask_set(t_msk, msk);   // F16 under --attn flash, same bytes under exact
                 last_mask_S = (int) S;
@@ -3007,6 +3270,10 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             ggml_backend_tensor_set(t_ac, ac_in.data(), 0, ac_in.size() * sizeof(int32_t));
             ggml_backend_tensor_set(t_pos, pos.data(), 0, pos.size() * sizeof(int32_t));
             embed_ctx.P = P; embed_ctx.Fin = Fin;
+            // A reg prompt carries no placeholder span, so the token is off for
+            // the capture too — the teacher distribution has to be the one the
+            // reg steps below will be scored against, and those run token-free.
+            set_art(false);
 
             MM3PriorCache pc;
             pc.k = a.reg_topk; pc.n_pos = (int) n_sup; pc.width = W;
@@ -3027,6 +3294,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             ckpt_run.capture_idx = nullptr;
             ckpt_run.capture_p   = nullptr;
             ckpt_run.forward_only = false;
+            set_art(art_k > 0);
             if (!ok || (int) pc.idx.size() != pc.n_pos * pc.k) {
                 fatal_msg = "prior capture failed for " + rs.id;
                 fprintf(stderr, "[mm3-lm-train] %s\n", fatal_msg.c_str());
@@ -3192,7 +3460,10 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                                     : mm3_lm_train_slice_index(t, s.codes[(size_t) ((c0 + j) * 8)]);
             }
 
-            if ((int) S != last_mask_S) {
+            // Skipped entirely under a trainable prefix: lm_ckpt_upload_mask
+            // owns t_msk then (the mask is rectangular, [n + S, S]), and a
+            // square upload here would be silently reinstated over it.
+            if (!pfx.active() && (int) S != last_mask_S) {
                 lm_causal_mask((int) S, &msk);
                 lm_mask_set(t_msk, msk);   // F16 under --attn flash, same bytes under exact
                 last_mask_S = (int) S;
@@ -3246,6 +3517,10 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             }
 
             if (drop_caption) n_dropped++;
+            // The token is on for a style step and off for a reg step — see the
+            // set_art definition. Set here, per micro-step, so the two kinds of
+            // step can alternate inside one grad_accum group.
+            set_art(art_k > 0 && !is_reg);
             // A fresh subnetwork per micro-step, uploaded BEFORE the forward so
             // the checkpoint recompute sees the same one.
             set_rank_mask(true);
@@ -3605,6 +3880,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     if (art_ctx) {
         ggml_free(art_ctx);
     }
+    lm_prefix_free(&pfx);
     lm_lora_detach(&lora, &t.lm);
     lm_lora_free(&lora);
     mm3_train_lm_free(&t);
