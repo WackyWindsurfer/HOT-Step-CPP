@@ -58,7 +58,8 @@
 struct LmResumeSource {
     std::string dir;                    // the --init-adapter dir
     std::string adapter_type = "lora";
-    // Post-LoRA parameterization: "lora" | "dora" | "hira" | "loha"
+    // Post-LoRA parameterization: "lora" | "dora" | "hira" | "loha" | "hra" |
+    // "pissa" (the last of which lm_resume_prepare refuses outright)
     // (lm-export.h `param_method`). Identity, not a knob — a DoRA adapter
     // resumed as a plain LoRA would silently drop its magnitudes.
     std::string method       = "lora";
@@ -187,6 +188,36 @@ static bool lm_resume_fill(const STFile & st, const char * name, ggml_tensor * d
  *  params. Every expected tensor must be present — a partial adapter would
  *  train from a silently-wrong start. Returns the number of tensors loaded. */
 static bool lm_resume_load(LmLora * L, const std::string & dir, int * n_loaded, std::string * err) {
+    if (L->hra) {
+        // The exported LoRA is (W U) Q^T — an orthonormal BASIS of the vectors'
+        // span, not the vectors, so it cannot be inverted back into them. The
+        // sidecar lm_hra_write_vectors left beside it is the resume format.
+        const std::string vpath = dir + "/hra_vectors.safetensors";
+        STFile            vst;
+        if (!st_open(&vst, vpath.c_str())) {
+            *err = "cannot open " + vpath + " — an HRA run resumes from its vector sidecar, not the adapter";
+            return false;
+        }
+        int  vcount = 0;
+        bool vok    = true;
+        for (int l = L->layer_lo; l < L->layer_hi && vok; l++) {
+            for (int s = 0; s < QW_LORA_NSLOTS && vok; s++) {
+                QwLoraPair & pr = L->layers[l].p[s];
+                if (!pr.A) {
+                    continue;
+                }
+                char nm[96];
+                snprintf(nm, sizeof(nm), "L%d.s%d.hra_v", l, s);
+                vok = lm_resume_fill(vst, nm, pr.A, err);
+                vcount++;
+            }
+        }
+        st_close(&vst);
+        if (vok && n_loaded) {
+            *n_loaded = vcount;
+        }
+        return vok;
+    }
     const std::string path =
         dir + (L->is_lokr ? "/lokr_weights.safetensors" : "/adapter_model.safetensors");
     STFile st;
@@ -321,9 +352,31 @@ static bool lm_resume_prepare(ArgsT * a, const LmResumeExplicit & saw, LmResumeS
     // Parameterization identity. Typed-and-different is a refusal; omitted is
     // adopted below, so `--init-adapter <a DoRA run>` continues as DoRA without
     // the user having to remember to re-type --dora.
-    const std::string cli_method = a->hira ? "hira" : a->loha ? "loha" : a->dora ? "dora" : "lora";
+    // PiSSA's whole point is a starting basis derived from the base weight plus
+    // a frozen negative copy of it. The exported rank-2r file has already
+    // folded the two halves together, so there is nothing to recover A0/B0
+    // from — and re-running the init on a run in progress would move the base
+    // the trained factors were fitted against. Refuse rather than resume into a
+    // silently different adapter.
+    if (src->method == "pissa") {
+        *errbuf = "--init-adapter " + a->init_adapter +
+                  " was trained with --pissa, which cannot be resumed: the rank-2r export has already folded the "
+                  "init factors into the delta, and re-deriving them would move the residual the trained factors "
+                  "were fitted against. Start a fresh run.";
+        return false;
+    }
+    const std::string cli_method = a->hra    ? "hra"
+                                   : a->hira ? "hira"
+                                   : a->loha ? "loha"
+                                   : a->dora ? "dora"
+                                             : "lora";
     if (saw.method && cli_method != src->method) {
-        bad.push_back({ "--dora/--hira/--loha", cli_method, src->method });
+        bad.push_back({ "--dora/--hira/--loha/--hra", cli_method, src->method });
+    }
+    if (a->pissa) {
+        *errbuf = "--pissa cannot be combined with --init-adapter: the init rewrites A/B from the base weight's "
+                  "singular vectors, which would discard everything the source run learned.";
+        return false;
     }
     check_i(saw.rank, "--rank", a->rank, src->rank);
     check_i(saw.alpha, "--alpha", a->alpha, src->alpha);
@@ -350,6 +403,7 @@ static bool lm_resume_prepare(ArgsT * a, const LmResumeExplicit & saw, LmResumeS
     a->dora = (src->method == "dora");
     a->hira = (src->method == "hira");
     a->loha = (src->method == "loha");
+    a->hra  = (src->method == "hra");
     if (src->rank > 0) {
         a->rank = src->rank;
     }

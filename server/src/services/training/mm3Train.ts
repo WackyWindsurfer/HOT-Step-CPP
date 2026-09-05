@@ -845,12 +845,17 @@ export const MM3_LM_DEFAULTS = {
   // same combinations train-dit refuses, and reach the runtime and merge
   // loaders (rsLoRA as use_rslora, DoRA as lora_magnitude_vector, HiRA/LoHa as
   // peft_type + merge mode only).
-  // --pissa[-oversample/-iters], --hra and a TRAINABLE --prefix-n still do NOT
-  // exist in that parser — they are being ported separately, to the same names
-  // train-dit and train-lm use. Emitting them here ahead of the engine change
-  // is deliberate: an ace-train that predates a flag exits 2 loudly on the
-  // unknown option, which is a far better failure than a UI control that
-  // silently does nothing.
+  // --pissa and --hra landed on mm3-lm-train (and on train-lm) the same day and
+  // are also real. Both are FD-gated on the MM3 trainer and both export as
+  // ORDINARY PEFT LoRAs — PiSSA at rank 2r, HRA at rank r — so unlike HiRA and
+  // LoHa they need nothing from the runtime or merge loaders and render as they
+  // trained. --pissa is refused together with --resume, which is why the arg
+  // builder below drops it when resumeFrom is set rather than letting the run
+  // exit 2. A TRAINABLE --prefix-n still does NOT exist in that parser (MM3's
+  // --prefix-frames is the FROZEN history prefix, a different thing). Emitting a
+  // flag here ahead of the engine is deliberate where it happens: an ace-train
+  // that predates a flag exits 2 loudly on the unknown option, which is a far
+  // better failure than a UI control that silently does nothing.
   /** 'exact' is the byte-identical graph; 'flash' routes through the fused
    *  FLASH_ATTN_TRAIN/_BACK ops mm3-lm-train-run.h gained mid-session
    *  (2026-09-05) — real and engine-verified, NOT the ahead-of-the-engine

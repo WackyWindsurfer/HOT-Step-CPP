@@ -84,9 +84,35 @@ struct QwLoraPair {
     // runtime cost story as LoHa above — refused in runtime mode, merged.
     bool                 hira = false;
 
+    // ─── PiSSA (Meng et al. 2024), 2026-09-05 ───────────────────────────────
+    //
+    // A/B start on the base weight's top-r singular directions. The DiT moves
+    // that energy out of the base (W_res = W - s B0 A0) and trains against the
+    // residual; the LM CANNOT — the shipped MM3 recipe trains against a q8_0
+    // base, and there is nowhere to write an F32 residual back to. So the
+    // residual is folded into the ADAPTER instead: the frozen base stays
+    // untouched and the forward carries a constant negative copy of the init,
+    //
+    //   y = W x + s (B A - B0 A0) x,
+    //
+    // which is the same function (W_res + s B A) and the same zero delta at
+    // step 0. A0/B0 are INPUTS, never params. Trainer-only: an exported PiSSA
+    // run is a plain rank-2r LoRA (the two halves concatenated), so no loader
+    // ever sees these.
+    struct ggml_tensor * A0 = nullptr;  // [in, r] frozen
+    struct ggml_tensor * B0 = nullptr;  // [r, out] frozen
+
+    // ─── HRA (Yuan et al. 2024) ─────────────────────────────────────────────
+    // y = W (R x), R = H_{r-1}...H_0, H_k = I - 2 v_k v_k^T/||v_k||^2, with the
+    // vectors in A as [in, r] and B null. Trainer-only for the same reason
+    // PiSSA is: W(R-I) has rank <= r, so the export is an exact plain rank-r
+    // LoRA and the runtime needs to know nothing.
+    bool                 hra = false;
+
     bool has_lokr() const { return w1 && (w2 || (w2_a && w2_b)); }
     bool has_dora() const { return m && nrm; }
     bool has_loha() const { return A2 && B2; }
+    bool has_pissa() const { return A0 && B0; }
 };
 
 // LoKr delta: y += kron(w1, w2) . x, contracted factor-by-factor so the full

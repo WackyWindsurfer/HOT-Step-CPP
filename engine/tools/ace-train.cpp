@@ -175,6 +175,20 @@ static void print_usage(void) {
             "                runtime path computes ||W+sBA||_col ONCE at adapter load\n"
             "                (W, A and B are all frozen there) and applies it; merge mode\n"
             "                folds it into the weights. LoRA only.\n"
+            "                [--pissa] PiSSA init: A/B start on the site weight's top-r\n"
+            "                singular directions (randomized SVD on the GPU; a q8_0 site\n"
+            "                gets an F32 view of itself for the two big products). The\n"
+            "                residual is folded into a FROZEN A0/B0 pair rather than\n"
+            "                written back into the base, because there is nowhere to put\n"
+            "                an F32 residual on a quantized base. Exports a plain rank-2r\n"
+            "                LoRA: s(BA - B0A0) = s[B,-B0][A;A0], so no loader learns\n"
+            "                anything. Plain LoRA only, and NOT resumable.\n"
+            "                [--pissa-oversample n] default 8, [--pissa-iters n] default 2.\n"
+            "                [--hra] Householder Reflection Adaptation: --rank (even)\n"
+            "                reflections on each site's INPUT, y = W(Rx). Its own\n"
+            "                parameterization, not a LoRA modifier — no B tensor exists.\n"
+            "                Exports an EXACT rank-r plain LoRA via (W U) Q^T plus\n"
+            "                hra_vectors.safetensors for resume.\n"
             "                [--hira] W (.) (s*BA) and [--loha] (A1B1)(.)(A2B2). Neither\n"
             "                delta is low-rank, so both are MERGE MODE ONLY — runtime\n"
             "                mode refuses them by name rather than loading an adapter it\n"
@@ -521,6 +535,19 @@ static void print_usage(void) {
             "                                            refusal. Use mm3-lm-train for a usable one.\n"
             "    --loha                                  LoHa: (A1B1) (.) (A2B2), LyCORIS hada_w* on\n"
             "                                            disk. Same load caveat as --hira.\n"
+            "    --pissa                                 PiSSA init: A/B start on the weight's top-r\n"
+            "                                            singular directions (randomized SVD), with the\n"
+            "                                            residual folded into a frozen A0/B0 pair rather\n"
+            "                                            than written into the base. Exports a plain\n"
+            "                                            rank-2r LoRA, which this engine CAN load. Plain\n"
+            "                                            LoRA only; not resumable.\n"
+            "    --pissa-oversample <n>      8           extra SVD columns beyond the rank.\n"
+            "    --pissa-iters <n>           2           power iterations (0-4).\n"
+            "    --hra                                   HRA: --rank (even) Householder reflections on\n"
+            "                                            each site's input, y = W(Rx). Exports an exact\n"
+            "                                            rank-r plain LoRA, so unlike --hira/--loha this\n"
+            "                                            engine CAN load the result. Own slot: not with\n"
+            "                                            --dora/--hira/--loha/--pissa/--rslora.\n"
             "    --lora-plus-ratio <f>       1           LoRA+: B at f x A's learning rate (paper: ~16).\n"
             "                                            AdamW-rule tensors only, Muon ignores it.\n"
             "\n"
@@ -1853,6 +1880,10 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--dora"))              a.dora         = true;
         else if (!strcmp(argv[i], "--hira"))              a.hira         = true;
         else if (!strcmp(argv[i], "--loha"))              a.loha         = true;
+        else if (!strcmp(argv[i], "--pissa"))             a.pissa        = true;
+        else if (!strcmp(argv[i], "--pissa-oversample"))  a.pissa_oversample = atoi(next("--pissa-oversample"));
+        else if (!strcmp(argv[i], "--pissa-iters"))       a.pissa_iters  = atoi(next("--pissa-iters"));
+        else if (!strcmp(argv[i], "--hra"))               a.hra          = true;
         else if (!strcmp(argv[i], "--verify-export"))     a.verify_export = true;
         else if (!strcmp(argv[i], "--attn"))              a.attn         = next("--attn");
         else if (!strcmp(argv[i], "--fd-eps"))        fd_eps         = atof(next("--fd-eps"));
@@ -1901,6 +1932,32 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
     // same reason --attn is: the gate builds the same graphs from the same
     // flags, so a combination that fell through here would be gated in one
     // shape and trained in another.
+    // HRA is its own parameterization, not a modifier on the LoRA pair: it has
+    // no B at all, so every flag that describes what to do WITH a B is a
+    // contradiction rather than a combination.
+    if (a.hra && (a.adapter_type != "lora" || a.dora || a.hira || a.loha || a.pissa || a.rslora)) {
+        fprintf(stderr, "ace-train mm3-lm-train: --hra is its own parameterization: plain LoRA slot, not with "
+                        "--dora/--hira/--loha/--pissa/--rslora\n");
+        return 2;
+    }
+    if (a.hra && (a.rank < 2 || (a.rank % 2) != 0)) {
+        fprintf(stderr, "ace-train mm3-lm-train: --hra needs an even --rank (reflection pairs start as the "
+                        "identity, which is what makes step 0 the frozen base)\n");
+        return 2;
+    }
+    if (a.pissa && (a.adapter_type != "lora" || a.dora || a.hira || a.loha)) {
+        fprintf(stderr, "ace-train mm3-lm-train: --pissa is an initialisation for the plain LoRA "
+                        "parameterization only\n");
+        return 2;
+    }
+    // The SVD basis and its frozen negative copy are derived from the base at
+    // step 0. Resuming would rebuild them against a base the trained factors
+    // were never fitted against, and the state file does not carry A0/B0.
+    if (a.pissa && !a.resume_path.empty()) {
+        fprintf(stderr, "ace-train mm3-lm-train: --pissa cannot --resume: the resume state carries the trainable "
+                        "factors but not the frozen PiSSA init they are measured against\n");
+        return 2;
+    }
     if (a.loha && (a.adapter_type != "lora" || a.dora || a.hira)) {
         fprintf(stderr, "ace-train mm3-lm-train: --loha applies to the LoRA parameterization only and cannot "
                         "combine with --dora or --hira\n");
@@ -4000,6 +4057,10 @@ static int cmd_train_lm(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--dora")) { a.dora = true; saw.method = true; }
         else if (!strcmp(argv[i], "--hira")) { a.hira = true; saw.method = true; }
         else if (!strcmp(argv[i], "--loha")) { a.loha = true; saw.method = true; }
+        else if (!strcmp(argv[i], "--hra")) { a.hra = true; saw.method = true; }
+        else if (!strcmp(argv[i], "--pissa")) a.pissa = true;
+        else if (!strcmp(argv[i], "--pissa-oversample") && i + 1 < argc) a.pissa_oversample = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pissa-iters") && i + 1 < argc) a.pissa_iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lora-plus-ratio") && i + 1 < argc) a.lora_plus_ratio = (float) atof(argv[++i]);
         else if (!strcmp(argv[i], "--no-milestones")) a.milestone_step = 0.0f;
         else if (!strcmp(argv[i], "--overwrite")) a.overwrite = true;
@@ -4059,6 +4120,26 @@ static int cmd_train_lm(int argc, char ** argv) {
     // AFTER lm_resume_prepare, so a resumed run validates the ADOPTED method
     // rather than the empty CLI. A refusal names the conflicting pair; nothing
     // here is coerced.
+    if (a.hra && (a.adapter_type != "lora" || a.dora || a.hira || a.loha || a.pissa || a.rslora)) {
+        fprintf(stderr, "ace-train train-lm: --hra is its own parameterization: plain LoRA slot, not with "
+                        "--dora/--hira/--loha/--pissa/--rslora\n");
+        return 2;
+    }
+    if (a.hra && (a.rank < 2 || (a.rank % 2) != 0)) {
+        fprintf(stderr, "ace-train train-lm: --hra needs an even --rank (reflection pairs start as the identity, "
+                        "which is what makes step 0 the frozen base)\n");
+        return 2;
+    }
+    if (a.pissa && (a.adapter_type != "lora" || a.dora || a.hira || a.loha)) {
+        fprintf(stderr, "ace-train train-lm: --pissa is an initialisation for the plain LoRA parameterization "
+                        "only\n");
+        return 2;
+    }
+    if (a.pissa && !a.init_adapter.empty()) {
+        fprintf(stderr, "ace-train train-lm: --pissa cannot --init-adapter: the init rewrites A/B from the base "
+                        "weight's singular vectors, discarding everything the source run learned\n");
+        return 2;
+    }
     if (a.loha && (a.adapter_type != "lora" || a.dora || a.hira)) {
         fprintf(stderr, "ace-train train-lm: --loha applies to the LoRA parameterization only and cannot combine "
                         "with --dora or --hira\n");

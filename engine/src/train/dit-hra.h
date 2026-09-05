@@ -35,30 +35,11 @@ static size_t dit_hra_expected_params(const DiTGGMLConfig & c, int lo, int hi, i
     return (size_t) per_layer * (size_t) std::max(0, hi - lo);
 }
 
-// Apply the site's reflections, in graph order, to a column-major set of
-// `n` vectors of length `in` (vector j at j*in). V is column-major [in, r].
-static void dit_hra_reflect(const std::vector<float> & V, int in, int r, std::vector<double> & X, int n) {
-    for (int k = 0; k < r; k++) {
-        const float * v  = V.data() + (size_t) k * (size_t) in;
-        double        n2 = 0.0;
-        for (int i = 0; i < in; i++) {
-            n2 += (double) v[i] * (double) v[i];
-        }
-        if (n2 <= 0.0) {
-            continue;
-        }
-        for (int j = 0; j < n; j++) {
-            double * x   = X.data() + (size_t) j * (size_t) in;
-            double   dot = 0.0;
-            for (int i = 0; i < in; i++) {
-                dot += (double) v[i] * x[i];
-            }
-            const double f = 2.0 * dot / n2;
-            for (int i = 0; i < in; i++) {
-                x[i] -= f * (double) v[i];
-            }
-        }
-    }
+// Apply the site's reflections to a column-major set of `n` vectors of length
+// `in`. Moved to train/svd-host.h (hs_householder_apply) on 2026-09-05 so the
+// LM's HRA export shares one implementation with this one.
+static inline void dit_hra_reflect(const std::vector<float> & V, int in, int r, std::vector<double> & X, int n) {
+    hs_householder_apply(V, in, r, X, n);
 }
 
 static bool dit_hra_export(const DitAdapterLora & ad, const char * dir, const DitExportMeta & meta,

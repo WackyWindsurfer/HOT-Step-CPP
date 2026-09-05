@@ -19,6 +19,8 @@
 #include "train/lm-optim.h"
 #include "train/lm-prefix.h"
 #include "train/lm-prior.h"
+#include "train/lm-hra.h"
+#include "train/lm-pissa.h"
 #include "train/lm-resume.h"
 #include "train/lm-selftest.h"
 #include "train/lm-vram.h"
@@ -108,6 +110,16 @@ struct LmTrainArgs {
     bool        dora         = false;
     bool        hira         = false;
     bool        loha         = false;
+    //   pissa — SVD init on the plain LoRA slot; the residual is folded into a
+    //           frozen A0/B0 pair, never written into the base (lm-pissa.h).
+    //           Exports a rank-2r plain LoRA. Not resumable.
+    //   hra   — `rank` Householder reflections on each site's input, exported as
+    //           an exact rank-r plain LoRA. Unlike --hira/--loha, this one the
+    //           AS1.5 runtime CAN load: the file is an ordinary LoRA.
+    bool        pissa        = false;
+    int         pissa_oversample = 8;
+    int         pissa_iters      = 2;
+    bool        hra          = false;
     // LoRA+ (Hayou 2024): B at ratio x A's learning rate. 1 = off. Only
     // parameters on the AdamW rule honour it — Muon scales its own update.
     float       lora_plus_ratio = 1.0f;
@@ -1043,7 +1055,7 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
                 ? lm_lokr_init(&lora, &lm, 0, c.n_layers, a.lokr_dim, a.lokr_alpha, a.lokr_factor,
                                a.lokr_decompose_both, (uint64_t) a.seed, &err)
                 : lm_lora_init(&lora, &lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed, /*b_sigma=*/0.0f,
-                               &err, LmLoraOpts{ a.dora, a.hira, a.loha });
+                               &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra });
         if (!init_ok) {
             lm_fatal("vram", err);
             return 1;
@@ -1055,6 +1067,24 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
         snprintf(rb, sizeof(rb), "rsLoRA: scale alpha/sqrt(r) = %.4f (alpha/r would be %.4f)", lora.scale,
                  lora.alpha / (float) lora.rank);
         lm_log("info", rb);
+    }
+    // PiSSA: after the scale is final (the factors are stored so that s*B0A0 is
+    // W's rank-r truncation) and before the optimizer exists, so the init's
+    // scratch is returned before anything else competes for it.
+    if (a.pissa) {
+        LmPissaStats ps;
+        std::string  perr;
+        if (!lm_pissa_init_standalone(&lora, a.pissa_oversample, a.pissa_iters, &ps, &perr)) {
+            lm_fatal("pissa", perr);
+            return 1;
+        }
+        char pb[224];
+        snprintf(pb, sizeof(pb),
+                 "PiSSA: %d sites, captured energy mean %.2f%% min %.2f%% (a random rank-%d subspace would hold "
+                 "~%.2f%%)",
+                 ps.sites, 100.0 * ps.energy_mean, 100.0 * ps.energy_min, a.rank,
+                 100.0 * (double) a.rank / (double) c.hidden_size);
+        lm_log("info", pb);
     }
     // Resume: overwrite the fresh init with the source run's factors. After
     // lm_lora_init/lm_lokr_init so the tensors exist and the RNG stream stays
@@ -2310,8 +2340,11 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
             meta->saved_reason = out->saved_reason;
 
             LmExportResult xr;
-            const bool xok = lora.is_lokr ? lm_export_lokr(lora, *meta, a.out_dir, &xr, &export_err)
-                                          : lm_export_peft(lora, c, *meta, a.out_dir, &xr, &export_err, &lm_extra);
+            const bool xok =
+                lora.is_lokr ? lm_export_lokr(lora, *meta, a.out_dir, &xr, &export_err)
+                : lora.hra   ? lm_export_hra(lora, c, *meta, a.out_dir, sched, &xr, &export_err, &lm_extra)
+                : lora.pissa ? lm_export_pissa(lora, c, *meta, a.out_dir, &xr, &export_err, &lm_extra)
+                             : lm_export_peft(lora, c, *meta, a.out_dir, &xr, &export_err, &lm_extra);
             if (!xok) {
                 lm_fatal("export", export_err);
                 rc = 1;
@@ -2339,8 +2372,11 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
                 const std::string mdir  = lm_join(a.out_dir, rel);
                 LmExportResult    mr;
                 std::string       merr;
-                const bool mok = lora.is_lokr ? lm_export_lokr(lora, *meta, mdir, &mr, &merr)
-                                              : lm_export_peft(lora, c, *meta, mdir, &mr, &merr, &lm_extra);
+                const bool mok =
+                    lora.is_lokr ? lm_export_lokr(lora, *meta, mdir, &mr, &merr)
+                    : lora.hra   ? lm_export_hra(lora, c, *meta, mdir, sched, &mr, &merr, &lm_extra)
+                    : lora.pissa ? lm_export_pissa(lora, c, *meta, mdir, &mr, &merr, &lm_extra)
+                                 : lm_export_peft(lora, c, *meta, mdir, &mr, &merr, &lm_extra);
                 // A milestone without its token would be a LoRA that silently
                 // expects a trigger it does not ship.
                 if (mok && artp.t) {
@@ -2527,7 +2563,12 @@ static int lm_train_main(const LmTrainArgs & a) {
     meta.attn_mode      = a.attn;
     meta.adapter_type   = a.adapter_type;
     meta.dora           = a.dora;
-    meta.param_method   = a.hira ? "hira" : a.loha ? "loha" : a.dora ? "dora" : "lora";
+    meta.param_method   = a.hra    ? "hra"
+                          : a.pissa ? "pissa"
+                          : a.hira  ? "hira"
+                          : a.loha  ? "loha"
+                          : a.dora  ? "dora"
+                                    : "lora";
     meta.lokr_dim       = a.lokr_dim;
     meta.lokr_alpha     = a.lokr_alpha;
     meta.lokr_factor    = a.lokr_factor;

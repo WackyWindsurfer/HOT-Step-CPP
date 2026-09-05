@@ -91,6 +91,8 @@
 #include "train/mm3-depth-train.h"
 #include "minimax/mm3-request.h"
 #include "train/mm3-lm-verify-export.h"
+#include "train/lm-pissa.h"
+#include "train/lm-hra.h"
 #include "minimax/mm3-tokenizer.h"
 
 #include <algorithm>
@@ -316,6 +318,18 @@ struct MM3LmTrainArgs {
     bool        dora     = false;
     bool        hira     = false;
     bool        loha     = false;
+    //   pissa  — SVD init for the plain LoRA slot. The residual is folded into a
+    //            FROZEN A0/B0 pair rather than written into the base, because the
+    //            shipped recipe trains against q8_0 and there is nowhere to put an
+    //            F32 residual (lm-pissa.h). Exports a rank-2r plain LoRA, so no
+    //            loader learns anything. Not resumable.
+    //   hra    — `rank` Householder reflections on each site's INPUT; its own
+    //            parameterization, not a LoRA modifier. Exports an exact rank-r
+    //            plain LoRA plus a vector sidecar for resume.
+    bool        pissa    = false;
+    int         pissa_oversample = 8;
+    int         pissa_iters      = 2;
+    bool        hra      = false;
     /** After each checkpoint export, load it straight back with the RUNTIME
      *  loader and check that the scale, the tensors and the parameterization
      *  flags round-trip (train/mm3-lm-verify-export.h). Off by default: it
@@ -1031,7 +1045,8 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         fd_lokr ? lm_lokr_init(&lora, &t.lm, 0, c.n_layers, a.lokr_dim, a.lokr_alpha, a.lokr_factor,
                                a.lokr_decompose_both, (uint64_t) a.seed, &err)
                 : lm_lora_init(&lora, &t.lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed,
-                               /*b_sigma=*/1e-2f, &err, LmLoraOpts{ a.dora, a.hira, a.loha });
+                               /*b_sigma=*/1e-2f, &err,
+                               LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra });
     if (!fd_init_ok) {
         fprintf(stderr, "[mm3-fd] %s init failed: %s\n", fd_lokr ? "LoKr" : "LoRA", err.c_str());
         mm3_train_lm_free(&t);
@@ -1044,6 +1059,25 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     if (!fd_lokr && a.rslora) {
         lm_lora_apply_rslora(&lora);
         fprintf(stderr, "[mm3-fd] rsLoRA: in-graph scale alpha/sqrt(r) = %.4f\n", (double) lora.scale);
+    }
+    // Same reasoning as rsLoRA above. PiSSA changes what A and B ARE and adds a
+    // frozen -s*B0A0 term at every adapted site, so a gate that skipped the init
+    // would validate a graph the run does not build. It also leaves B non-zero,
+    // which is what makes dL/dA measurable at all.
+    if (!fd_lokr && a.pissa) {
+        LmPissaStats ps;
+        if (!lm_pissa_init_standalone(&lora, a.pissa_oversample, a.pissa_iters, &ps, &err)) {
+            fprintf(stderr, "[mm3-fd] PiSSA init failed: %s\n", err.c_str());
+            lm_lora_detach(&lora, &t.lm);
+            lm_lora_free(&lora);
+            mm3_train_lm_free(&t);
+            return 1;
+        }
+        fprintf(stderr,
+                "[mm3-fd] PiSSA: %d sites, captured energy mean %.2f%% min %.2f%% (a random rank-%d subspace "
+                "would hold ~%.2f%%)\n",
+                ps.sites, 100.0 * ps.energy_mean, 100.0 * ps.energy_min, a.rank,
+                100.0 * (double) a.rank / (double) c.hidden_size);
     }
     if (fd_lokr) {
         // The LoKr equivalent of the LoRA path's b_sigma. lm_lokr_init zeroes w2
@@ -1250,6 +1284,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     // Without this the probes address q.A and q.B, which are null on a LoKr
     // pair, and grad_vec trips GGML_ASSERT on the param_slot lookup.
     auto probe_tensor = [&](const QwLoraPair & q, bool first, int extra) -> ggml_tensor * {
+        if (q.hra) return q.A;  // reflection vectors are the only parameter
         if (extra == PROBE_A2) return q.A2;
         if (extra == PROBE_B2) return q.B2;
         if (extra == PROBE_M)  return q.m;
@@ -1259,6 +1294,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         return first ? q.A : q.B;
     };
     auto probe_suffix = [&](const QwLoraPair & q, bool first, int extra) -> const char * {
+        if (q.hra) return "hra_v";
         if (extra == PROBE_A2) return "hada_A2";
         if (extra == PROBE_B2) return "hada_B2";
         if (extra == PROBE_M)  return "dora_m";
@@ -1272,7 +1308,15 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
         const int layers[3] = { 0, c.n_layers / 2, c.n_layers - 1 };
         const int slots[3]  = { QW_LORA_Q, QW_LORA_GATE, QW_LORA_DOWN };
         for (int i = 0; i < n_probe; i++) {
-            probes.push_back(Probe{ layers[i % 3], slots[(i / 3) % 3], (i % 2) == 0, PROBE_FACTOR });
+            // An HRA pair has ONE parameter, so `is_a` no longer separates two
+            // probes: without swapping which axis varies fastest, consecutive
+            // probes would address the identical tensor and the gate would
+            // silently cover a third of what it claims.
+            if (lora.hra) {
+                probes.push_back(Probe{ layers[(i / 3) % 3], slots[i % 3], true, PROBE_FACTOR });
+            } else {
+                probes.push_back(Probe{ layers[i % 3], slots[(i / 3) % 3], (i % 2) == 0, PROBE_FACTOR });
+            }
         }
         // Appended, never substituted: the plain-LoRA probes above still run,
         // so a DoRA/LoHa gate is strictly a superset of the LoRA one.
@@ -1742,7 +1786,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             ? lm_lokr_init(&lora, &t.lm, 0, c.n_layers, a.lokr_dim, a.lokr_alpha, a.lokr_factor,
                            a.lokr_decompose_both, (uint64_t) a.seed, &err)
             : lm_lora_init(&lora, &t.lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed, 0.0f,
-                           &err, LmLoraOpts{ a.dora, a.hira, a.loha });
+                           &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra });
     if (!init_ok) {
         fprintf(stderr, "[mm3-lm-train] %s init failed: %s\n", want_lokr ? "LoKr" : "LoRA", err.c_str());
         mm3_train_lm_free(&t);
@@ -1756,9 +1800,33 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                 (double) lora.scale, (double) (lora.alpha / (float) lora.rank));
         jl("{\"type\":\"adapter\",\"kind\":\"rslora\",\"scale\":%.6f}", (double) lora.scale);
     }
-    if (!want_lokr && (a.dora || a.hira || a.loha)) {
-        fprintf(stderr, "[mm3-lm-train] parameterization: %s\n", a.dora ? "DoRA" : a.hira ? "HiRA" : "LoHa");
-        jl("{\"type\":\"adapter\",\"kind\":\"%s\"}", a.dora ? "dora" : a.hira ? "hira" : "loha");
+    if (!want_lokr && (a.dora || a.hira || a.loha || a.hra)) {
+        const char * pm = a.hra ? "HRA" : a.dora ? "DoRA" : a.hira ? "HiRA" : "LoHa";
+        fprintf(stderr, "[mm3-lm-train] parameterization: %s\n", pm);
+        jl("{\"type\":\"adapter\",\"kind\":\"%s\"}",
+           a.hra ? "hra" : a.dora ? "dora" : a.hira ? "hira" : "loha");
+    }
+    // PiSSA runs its SVD here, AFTER any rsLoRA rescale (the factors are stored
+    // so that s*B0A0 is W's rank-r truncation, so they depend on the final s)
+    // and BEFORE the optimizer and training graphs exist — the init holds a
+    // ~200 MB scratch and gives it back before anything competes for VRAM.
+    if (!want_lokr && a.pissa) {
+        LmPissaStats ps;
+        if (!lm_pissa_init_standalone(&lora, a.pissa_oversample, a.pissa_iters, &ps, &err)) {
+            fprintf(stderr, "[mm3-lm-train] PiSSA init failed: %s\n", err.c_str());
+            lm_lora_detach(&lora, &t.lm);
+            lm_lora_free(&lora);
+            mm3_train_lm_free(&t);
+            return 1;
+        }
+        fprintf(stderr,
+                "[mm3-lm-train] PiSSA: %d sites, captured energy mean %.2f%% min %.2f%% (a random rank-%d "
+                "subspace would hold ~%.2f%%)\n",
+                ps.sites, 100.0 * ps.energy_mean, 100.0 * ps.energy_min, a.rank,
+                100.0 * (double) a.rank / (double) c.hidden_size);
+        jl("{\"type\":\"adapter\",\"kind\":\"pissa\",\"sites\":%d,\"energyMean\":%.6f,"
+           "\"energyMin\":%.6f}",
+           ps.sites, ps.energy_mean, ps.energy_min);
     }
     if (want_lokr) {
         fprintf(stderr, "[mm3-lm-train] LoKr: dim %d alpha %.0f factor %d, decompose %s\n", a.lokr_dim,
@@ -2326,7 +2394,12 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         // else.
         meta.rslora       = a.rslora;
         meta.dora         = a.dora;
-        meta.param_method = a.hira ? "hira" : a.loha ? "loha" : a.dora ? "dora" : "lora";
+        meta.param_method = a.hra    ? "hra"
+                            : a.pissa ? "pissa"
+                            : a.hira  ? "hira"
+                            : a.loha  ? "loha"
+                            : a.dora  ? "dora"
+                                      : "lora";
         meta.adapter_type = a.adapter_type;
         LmExportResult res;
         std::string    xerr;
@@ -2343,8 +2416,14 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             mx.site            = 2;  // mm3_lm
         }
         const bool lokr_out = a.is_lokr();
-        const bool exported = lokr_out ? lm_export_lokr(lora, meta, dir, &res, &xerr)
-                                       : lm_export_peft(lora, c, meta, dir, &res, &xerr, &mx);
+        // PiSSA and HRA go out as ORDINARY PEFT LoRAs — rank 2r and rank r
+        // respectively — through the same writer, with their factors
+        // substituted. That is what lets the runtime and merge paths stay
+        // completely unaware of either.
+        const bool exported = lokr_out  ? lm_export_lokr(lora, meta, dir, &res, &xerr)
+                              : a.hra   ? lm_export_hra(lora, c, meta, dir, sched, &res, &xerr, &mx)
+                              : a.pissa ? lm_export_pissa(lora, c, meta, dir, &res, &xerr, &mx)
+                                        : lm_export_peft(lora, c, meta, dir, &res, &xerr, &mx);
         if (!exported) {
             fprintf(stderr, "[mm3-lm-train] export failed: %s\n", xerr.c_str());
             return std::string();
@@ -2401,7 +2480,9 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         // catch it.
         if (a.verify_export && !lokr_out) {
             std::string verr;
-            if (!mm3_lm_verify_export(dir, lora, &verr)) {
+            const bool  vok = (a.pissa || a.hra) ? mm3_lm_verify_export_delta(dir, lora, &verr)
+                                                 : mm3_lm_verify_export(dir, lora, &verr);
+            if (!vok) {
                 fprintf(stderr, "[mm3-lm-train] --verify-export FAILED: %s\n", verr.c_str());
                 return std::string();
             }

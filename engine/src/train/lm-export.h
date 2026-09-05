@@ -23,6 +23,7 @@
 #include "train/st-write.h"
 #include "version.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -408,16 +409,47 @@ struct LmExtraExport {
     bool any() const { return art_t || pfx_n > 0; }
 };
 
+// ─── plain-LoRA factor substitution (PiSSA, HRA — 2026-09-05) ───────────────
+//
+// Two parameterizations cannot export their trainer tensors verbatim: PiSSA's
+// delta is s(BA - B0A0), which is a rank-2r LoRA once concatenated, and HRA's
+// is W(R - I), which is an exact rank-r LoRA once projected onto span(v). Both
+// still end up as an ORDINARY PEFT LoRA on disk, so they reuse this writer
+// rather than each getting their own copy of the artist-token / prefix /
+// metadata plumbing that rides along with it. `site` hands back host buffers in
+// the ggml layouts A[in, rr] and B[rr, out]; the scale is expected to be baked
+// in, and the config is written with `rank`/`alpha` from here.
+struct LmPeftFactors {
+    std::vector<float> A, B;
+    int64_t            in = 0, out = 0, rr = 0;
+};
+
+struct LmPeftOverride {
+    int  rank  = 0;
+    int  alpha = 0;
+    // false with *err empty = skip this site; false with *err set = fail.
+    std::function<bool(int l, int s, LmPeftFactors * f, std::string * err)> site;
+};
+
 static bool lm_export_peft(const LmLora & L, const Qwen3LMConfig & cfg, const LmExportMeta & meta,
                            const std::string & out_dir, LmExportResult * res, std::string * err,
-                           const LmExtraExport * extra = nullptr) {
+                           const LmExtraExport * extra = nullptr, const LmPeftOverride * ovr = nullptr) {
     (void) cfg;
     if (!pm_mkdir_p(out_dir)) {
         *err = "cannot create " + out_dir;
         return false;
     }
-    if (!lm_write_adapter_config(out_dir, L.rank, (int) (L.alpha + 0.5f), meta.lm_path, meta.rslora, L.dora,
-                                 L.loha ? "LOHA" : L.hira ? "HIRA" : "LORA")) {
+    if (ovr) {
+        // Always a plain LORA: rsLoRA and DoRA are re-expressed in the factors
+        // themselves (PiSSA bakes the scale into B, HRA's basis is orthonormal
+        // and needs scale 1), so a loader that re-derived either from the file
+        // would apply it twice.
+        if (!lm_write_adapter_config(out_dir, ovr->rank, ovr->alpha, meta.lm_path, false, false, "LORA")) {
+            *err = "cannot write adapter_config.json in " + out_dir;
+            return false;
+        }
+    } else if (!lm_write_adapter_config(out_dir, L.rank, (int) (L.alpha + 0.5f), meta.lm_path, meta.rslora, L.dora,
+                                        L.loha ? "LOHA" : L.hira ? "HIRA" : "LORA")) {
         *err = "cannot write adapter_config.json in " + out_dir;
         return false;
     }
@@ -431,6 +463,33 @@ static bool lm_export_peft(const LmLora & L, const Qwen3LMConfig & cfg, const Lm
     for (int l = L.layer_lo; l < L.layer_hi; l++) {
         for (int s = 0; s < QW_LORA_NSLOTS; s++) {
             const QwLoraPair & pr = L.layers[l].p[s];
+            if (ovr) {
+                LmPeftFactors f;
+                std::string   serr;
+                if (!ovr->site(l, s, &f, &serr)) {
+                    if (!serr.empty()) {
+                        *err = serr;
+                        return false;
+                    }
+                    continue;
+                }
+                const std::vector<float> * src[2]  = { &f.A, &f.B };
+                const char *               sfx2[2] = { "lora_A", "lora_B" };
+                const int64_t              rows[2] = { f.rr, f.out };
+                const int64_t              cols[2] = { f.in, f.rr };
+                for (int k = 0; k < 2; k++) {
+                    store.push_back(*src[k]);
+                    char nm[192];
+                    snprintf(nm, sizeof(nm), "base_model.model.model.layers.%d.%s.%s.weight", l,
+                             lm_slot_peft_name(s), sfx2[k]);
+                    STWTensor st;
+                    st.name  = nm;
+                    st.shape = { rows[k], cols[k] };  // torch [rows, cols]
+                    st.data  = nullptr;               // re-pointed after `store` settles
+                    tensors.push_back(st);
+                }
+                continue;
+            }
             if (!pr.A || !pr.B) {
                 continue;
             }
