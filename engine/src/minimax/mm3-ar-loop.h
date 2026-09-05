@@ -260,6 +260,13 @@ struct MM3ArOptions {
     // (adapter, scales) actually changed.
     const MM3LmAdapter * lm_adapter = nullptr;
     MM3LmAdapterScales   lm_adapter_scales = {};
+
+    // The adapter whose SOFT-PROMPT halves (artist token, trained KV prefix)
+    // apply. Usually the same object as lm_adapter, and deliberately a separate
+    // field because in MERGE mode lm_adapter is null — the low-rank delta has
+    // been folded into the weights, but a token and a prefix cannot be folded
+    // into anything and still have to reach the graph.
+    const MM3LmAdapter * lm_soft = nullptr;
 };
 
 // The sentinel a cancelled run reports. Compared by value, not by prefix, so a
@@ -281,6 +288,10 @@ static MM3LmAdapter * g_mm3_lm_adapter = nullptr;
 static void mm3_lm_adapter_drop() {
     if (g_mm3_lm_adapter) {
         mm3_lm_set_adapter(&g_mm3_lm, nullptr, MM3LmAdapterScales{});
+        // The soft-prompt halves are borrowed from the SAME object, so they go
+        // at the same moment — an adapter switch must never leave a stale token
+        // or prefix installed (artist_token_clear()'s lesson, one file over).
+        mm3_lm_set_soft(&g_mm3_lm, nullptr);
         mm3_lm_adapter_free(g_mm3_lm_adapter);
         g_mm3_lm_adapter = nullptr;
     }
@@ -443,6 +454,9 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
     // reads the LM's hidden rows straight out of the same buffer.
     mm3_lm_set_takes(&g_mm3_lm, K);
     mm3_depth_set_takes(&g_mm3_depth, K);
+    // BEFORE prepare: a trained prefix occupies real KV columns, so the cache
+    // has to be sized with them in it (mm3_lm_prepare adds them to the ask).
+    mm3_lm_set_soft(&g_mm3_lm, opt.lm_soft);
     if (!mm3_lm_prepare(m, &g_mm3_lm, n_prompt + max_frames + 2, err)) {
         return false;
     }

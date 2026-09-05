@@ -684,6 +684,11 @@ struct MM3GenRequest {
     // adapter and outlives the generation); nullptr = base model.
     const MM3LmAdapter * lm_adapter = nullptr;
     MM3LmAdapterScales   lm_adapter_scales = {};
+    // The adapter whose artist token / trained KV prefix apply. Same object as
+    // lm_adapter in runtime mode; set in MERGE mode too, where lm_adapter is
+    // null because the LoRA has been folded into the weights and a soft prompt
+    // cannot be. Borrowed, like lm_adapter.
+    const MM3LmAdapter * lm_soft = nullptr;
 
     // Parity mode: per-window initial noise, 128*L floats channel-major. Entry
     // k applies to window k; an empty entry (or a short vector) falls back to
@@ -879,6 +884,28 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
         return false;
     }
 
+    // ── artist token: reproduce the trainer's splice ───────────────────────
+    //
+    // mm3-lm-train-run.h inserts k copies of one placeholder id at the FRONT of
+    // every training prompt, before the template, and accs the learned [H, k]
+    // onto those positions. Generation has to put them in the same place or the
+    // vectors land on tokens they were never trained against.
+    //
+    // BOTH rows get the ids, and only the conditional row gets the vectors.
+    // They have to be the same length — the two rows are one batched prefill,
+    // and every position's RoPE index comes from its offset in that block — but
+    // the delta belongs to the positive branch alone, so mm3_lm_fill_artist_rows
+    // scans conditional rows only. The uncond row therefore sees k copies of an
+    // ordinary token (the seed word), which is what it saw during training's
+    // caption-dropout rows too.
+    if (req.lm_soft && req.lm_soft->has_artist_token()) {
+        const MM3LmAdapter & sa = *req.lm_soft;
+        ids_cond.insert(ids_cond.begin(), (size_t) sa.art_k, (int32_t) sa.art_placeholder);
+        ids_uncond.insert(ids_uncond.begin(), (size_t) sa.art_k, (int32_t) sa.art_placeholder);
+        fprintf(stderr, "[MM3-Pipe] artist token: spliced %d placeholder id(s) (%d) at the front of the prompt\n",
+                sa.art_k, sa.art_placeholder);
+    }
+
     // ── stage 1: AR plan ──
     MM3ArOptions aopt;
     aopt.max_frames        = req.max_frames;
@@ -900,6 +927,7 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
     aopt.collect_hiddens   = true;  // the whole point: the condition encoder eats these
     aopt.lm_adapter        = req.lm_adapter;
     aopt.lm_adapter_scales = req.lm_adapter_scales;
+    aopt.lm_soft           = req.lm_soft;
     if (!req.forced_semantic.empty()) {
         if ((int64_t) req.forced_acoustic.size() != (int64_t) req.forced_semantic.size() * NCB) {
             if (err) {

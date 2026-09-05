@@ -50,6 +50,7 @@
 // renders. So we read the metadata and swap the B rows when it says to.
 
 #include "adapter-merge.h"
+#include "hot-step-fsutf8.h"  // hs_stat / HS_STAT_T
 #include "safetensors.h"
 #include "timer.h"
 #include "weight-ctx.h"
@@ -567,8 +568,12 @@ static int mm3_adapter_merge(WeightCtx *       wctx,
                              const char *      path,
                              float             scale,
                              ggml_backend_t    backend) {
-    struct stat sb;
-    if (stat(path, &sb) != 0) {
+    // hs_stat, not stat: MSVC's narrow stat is _stat64i32, whose 32-bit st_size
+    // returns -1 for any file >= 2 GiB — so a large adapter reads as MISSING
+    // rather than as itself (commit ae64b19c). It is also the UTF-8-correct
+    // call, which matters for a path that came out of a JSON manifest.
+    HS_STAT_T sb;
+    if (hs_stat(std::string(path), &sb) != 0) {
         fprintf(stderr, "[MM3-Adapter] path does not exist: %s\n", path);
         return -1;
     }
@@ -578,7 +583,7 @@ static int mm3_adapter_merge(WeightCtx *       wctx,
     if (S_ISDIR(sb.st_mode)) {
         sf_path = std::string(path) + "/adapter_model.safetensors";
         cfg_dir = path;
-        if (stat(sf_path.c_str(), &sb) != 0) {
+        if (hs_stat(sf_path, &sb) != 0) {
             fprintf(stderr, "[MM3-Adapter] no adapter_model.safetensors in %s\n", path);
             return -1;
         }

@@ -33,6 +33,7 @@
 // only.
 
 #include "backend.h"
+#include "hot-step-fsutf8.h"  // hs_stat / HS_STAT_T
 #include "safetensors.h"
 #include "yyjson.h"
 
@@ -180,6 +181,35 @@ struct MM3LmAdapter {
     // Which resident LM the norms were computed against, so a pristine reload
     // or a model swap re-runs the pass instead of reusing stale norms.
     const void *     dora_base    = nullptr;
+
+    // ── the soft-prompt halves (2026-09-05) ────────────────────────────────
+    //
+    // train/lm-export.h writes these INTO adapter_model.safetensors, beside the
+    // LoRA pairs, because a checkpoint's adapter and its token are two halves of
+    // one thing and shipping them as separate files is how one of them goes
+    // missing. They are host-side here: the token becomes a small [H, k+1] bank
+    // the prefill graph gathers from (mm3-lm-graph.h), and the prefix is written
+    // straight into the KV cache before the prefill runs, so neither belongs in
+    // this loader's F16 tensor context.
+    //
+    //   art_vec  [k][hidden] row-major, added to the k placeholder positions
+    //   pfx_k/v  indexed by ABSOLUTE layer, [n * row] each, row = Nkv*D
+    //
+    // `art_site` is checked, not assumed: an as15_lm token (site 1) is a delta
+    // on a different model's vocabulary and hidden space, and applying it here
+    // would add a meaningless vector rather than fail.
+    int                            art_k           = 0;
+    int                            art_placeholder = -1;
+    int                            art_hidden      = 0;
+    std::vector<float>             art_vec;
+
+    int                            pfx_n   = 0;
+    int                            pfx_lo  = 0, pfx_hi = 0;
+    int64_t                        pfx_row = 0;
+    std::vector<std::vector<float>> pfx_k, pfx_v;
+
+    bool has_artist_token() const { return art_k > 0 && !art_vec.empty(); }
+    bool has_prefix() const { return pfx_n > 0 && !pfx_k.empty(); }
 
     ggml_context *        ctx         = nullptr;
     ggml_backend_buffer_t buf         = nullptr;
@@ -393,6 +423,86 @@ static MM3LmAdapterCfg mm3_lm_adapter_read_cfg(const std::string & sf_path) {
     return out;
 }
 
+// ─── the soft-prompt half of a unified adapter file (2026-09-05) ────────────
+//
+// The inverse of lm-adapter.h's lm_adapter_read_soft_prompt, and deliberately a
+// SECOND copy rather than a shared one: the AS1.5 reader installs into a
+// process-global ArtistTokenRT and knows QWEN3_LORA_MAX_LAYERS, while this one
+// owns the rows on the adapter object and MM3's layer count is a fixed 36. What
+// the two must agree on is the FORMAT, and that is written in exactly one place
+// (train/lm-export.h).
+//
+// site: 1 = as15_lm, 2 = mm3_lm. Refused by name in both directions — an as15
+// token is a delta on a different vocabulary in a different hidden space, and
+// applying it here would add a meaningless vector instead of failing.
+static void mm3_lm_adapter_read_soft_prompt(const STFile & st, MM3LmAdapter * ad) {
+    const STEntry * vec  = st_find(st, "hot_step.artist_token.vec");
+    const STEntry * meta = st_find(st, "hot_step.artist_token.meta");
+    if (vec && meta && meta->n_dims == 1 && meta->shape[0] == 4 && meta->dtype == "F32" && vec->dtype == "F32" &&
+        vec->n_dims == 2) {
+        const float * m           = (const float *) st_data(st, *meta);
+        const int     k           = (int) m[0];
+        const int     placeholder = (int) m[1];
+        const int     hidden      = (int) m[2];
+        const int     site        = (int) m[3];
+        if (site != 2) {
+            fprintf(stderr,
+                    "[MM3] artist token in %s is site %d (%s), not mm3_lm — ignored. It was trained against a "
+                    "different model's embedding table.\n",
+                    ad->path.c_str(), site, site == 1 ? "as15_lm" : "unknown");
+        } else if (vec->shape[0] != k || vec->shape[1] != hidden || k < 1 || placeholder < 0) {
+            fprintf(stderr, "[MM3] artist token in %s has inconsistent shape/meta — ignored\n", ad->path.c_str());
+        } else {
+            ad->art_k           = k;
+            ad->art_placeholder = placeholder;
+            ad->art_hidden      = hidden;
+            const float * v     = (const float *) st_data(st, *vec);
+            ad->art_vec.assign(v, v + (size_t) k * (size_t) hidden);
+        }
+    }
+
+    const STEntry * pm = st_find(st, "hot_step.prefix.meta");
+    if (pm && pm->n_dims == 1 && pm->shape[0] == 4 && pm->dtype == "F32") {
+        const float * m   = (const float *) st_data(st, *pm);
+        const int     n   = (int) m[0];
+        const int64_t row = (int64_t) m[1];
+        const int     lo = (int) m[2], hi = (int) m[3];
+        if (n > 0 && row > 0 && hi > lo && lo >= 0 && hi <= MM3_LM_ADAPTER_LAYERS) {
+            ad->pfx_k.assign((size_t) hi, {});
+            ad->pfx_v.assign((size_t) hi, {});
+            int got = 0;
+            for (int ly = lo; ly < hi; ly++) {
+                char nk[64], nv[64];
+                snprintf(nk, sizeof(nk), "hot_step.prefix.L%d.k", ly);
+                snprintf(nv, sizeof(nv), "hot_step.prefix.L%d.v", ly);
+                const STEntry * ek = st_find(st, nk);
+                const STEntry * ev = st_find(st, nv);
+                if (!ek || !ev || ek->dtype != "F32" || ev->dtype != "F32" || ek->n_dims != 2 ||
+                    ek->shape[0] != n || ek->shape[1] != row || ev->shape[0] != n || ev->shape[1] != row) {
+                    fprintf(stderr, "[MM3] prefix layer %d missing or malformed in %s — prefix ignored\n", ly,
+                            ad->path.c_str());
+                    got = -1;
+                    break;
+                }
+                const float * pk = (const float *) st_data(st, *ek);
+                const float * pv = (const float *) st_data(st, *ev);
+                ad->pfx_k[(size_t) ly].assign(pk, pk + (size_t) n * (size_t) row);
+                ad->pfx_v[(size_t) ly].assign(pv, pv + (size_t) n * (size_t) row);
+                got++;
+            }
+            if (got > 0) {
+                ad->pfx_n   = n;
+                ad->pfx_lo  = lo;
+                ad->pfx_hi  = hi;
+                ad->pfx_row = row;
+            } else {
+                ad->pfx_k.clear();
+                ad->pfx_v.clear();
+            }
+        }
+    }
+}
+
 // Load a PEFT LM LoRA. Acquires its own backend reference (same shared pool
 // as every other module). Returns nullptr with a message on any structural
 // problem — a half-loaded adapter is worse than none (the LM-echo whitelist
@@ -406,9 +516,12 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
         return nullptr;
     }
 
-    struct stat sb {};
-
-    stat(path, &sb);
+    // hs_stat, not stat: MSVC's narrow stat is _stat64i32 and reports any file
+    // >= 2 GiB as missing (commit ae64b19c). Here that would pin mtime at 0, so
+    // every large adapter would compare "cached" against every other one in
+    // mm3-job.h's revalidation and a retrained checkpoint would never reload.
+    HS_STAT_T sb {};
+    hs_stat(std::string(path), &sb);
 
     MM3LmAdapter * ad = new MM3LmAdapter();
     ad->path          = path;
@@ -619,6 +732,9 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
         ggml_fp32_to_fp16_row(f32.data(), f16.data(), n);
         ggml_backend_tensor_set(t, f16.data(), 0, (size_t) n * sizeof(ggml_fp16_t));
     }
+    // The token / prefix halves, while the file is still mapped. They are
+    // F32 host rows — nothing here goes through the f16 store above.
+    mm3_lm_adapter_read_soft_prompt(st, ad);
     st_close(&st);
 
     // Pass 4: validate pairing + count. Every module with an A must have a B.
@@ -758,5 +874,13 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
             ad->cfg_rslora ? " +rsLoRA" : "", ad->dora_n ? " +DoRA" : "",
             (ad->is_loha || ad->is_hira) ? " (merge mode only)" : "",
             (double) scale_shown, (double) ggml_backend_buffer_get_size(ad->buf) / 1e6);
+    if (ad->has_artist_token()) {
+        fprintf(stderr, "[MM3] LM adapter carries an artist token: k=%d placeholder=%d hidden=%d\n", ad->art_k,
+                ad->art_placeholder, ad->art_hidden);
+    }
+    if (ad->has_prefix()) {
+        fprintf(stderr, "[MM3] LM adapter carries a trained KV prefix: n=%d over layers [%d,%d), row %lld\n",
+                ad->pfx_n, ad->pfx_lo, ad->pfx_hi, (long long) ad->pfx_row);
+    }
     return ad;
 }

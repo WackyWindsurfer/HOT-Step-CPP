@@ -205,6 +205,12 @@ struct MM3LmSlot {
     ggml_tensor * in_ac    = nullptr;  // I32 [T * (num_codebooks-1)]
     ggml_tensor * in_gate  = nullptr;  // F32 [1, T]
     ggml_tensor * in_scale = nullptr;  // F32 [1, T]
+    // Artist token (prefill only): per position, the row of MM3LmGraph::art_bank
+    // to add to that position's embedding. 0 is the bank's permanently-zero row,
+    // so a position with no token costs an add of zeros rather than a branch —
+    // which is what lets ONE cached graph serve prompts whose placeholder span
+    // sits at different offsets, and lets the unconditional CFG row opt out.
+    ggml_tensor * in_art   = nullptr;  // I32 [T*B]
 
     // outputs
     ggml_tensor * out_hidden   = nullptr;  // F32 [H, 1, B] last position, pre-head
@@ -238,6 +244,22 @@ struct MM3LmGraph {
     // callers go through mm3_lm_set_adapter, never assign these directly.
     const MM3LmAdapter * adapter        = nullptr;
     MM3LmAdapterScales   adapter_scales = {};
+
+    // ── the soft-prompt halves (2026-09-05) ────────────────────────────────
+    //
+    // SEPARATE from `adapter` on purpose. `adapter` is the runtime low-rank
+    // delta and is null in merge mode, where the LoRA has been folded into the
+    // weights — but a token and a prefix cannot be folded into anything, so
+    // they have to survive that. mm3-job.h sets this in BOTH modes.
+    //
+    // Everything here is inert when `soft` is null or carries neither half, and
+    // the graphs are then byte-identical to what they were before this existed:
+    // build_slot only emits the extra get_rows+add when art_bank is non-null,
+    // and kv_base stays 0 so every position keeps its old RoPE index.
+    const MM3LmAdapter *  soft     = nullptr;
+    ggml_context *        art_ctx  = nullptr;
+    ggml_backend_buffer_t art_buf  = nullptr;
+    ggml_tensor *         art_bank = nullptr;  // F32 [H, k+1]; row 0 is zero
     // MM3_ALIGN_DUMP=1 — capture EVERY layer's attention for lyric alignment
     // discovery. Forces the manual F32 attention path on all 36 layers (flash
     // fuses the softmax and never produces a score tensor to read).
@@ -268,6 +290,13 @@ struct MM3LmGraph {
     int64_t                    n_ctx    = 0;
     size_t                     kv_bytes = 0;
     int64_t                    kv_pos   = 0;  // shared: all CFG rows advance together
+    // Where the REAL sequence starts. 0 without a trained prefix, and every
+    // position's RoPE index is then kv_pos + i exactly as before. With one, the
+    // prefix occupies KV columns [0, n) but no RoPE positions (train/lm-prefix.h
+    // contract 3), so positions are computed from kv_pos - kv_base while the KV
+    // rows and the mask stay ABSOLUTE — which is what makes the prefix columns
+    // visible to every query.
+    int64_t                    kv_base  = 0;
     // 1 or 2 (note A1), derived from mm3.ar.cfg_scale in mm3_lm_prepare. This is
     // the CFG PAIR size, not the batch: the batch is rows() = cfg_rows * takes.
     // A change invalidates the KV cache and all slots.
@@ -293,6 +322,7 @@ struct MM3LmGraph {
 
     // host staging, reused every step
     std::vector<int32_t>  ids_host;
+    std::vector<int32_t>  art_host;
     std::vector<int32_t>  pos_host;
     std::vector<int64_t>  rows_host;
     std::vector<uint16_t> mask_host;
@@ -335,12 +365,26 @@ static void mm3_lm_free_kv(MM3LmGraph * g) {
     g->n_ctx    = 0;
     g->kv_bytes = 0;
     g->kv_pos   = 0;
+    g->kv_base  = 0;
+}
+
+static void mm3_lm_free_art(MM3LmGraph * g) {
+    if (g->art_buf) {
+        ggml_backend_buffer_free(g->art_buf);
+    }
+    if (g->art_ctx) {
+        ggml_free(g->art_ctx);
+    }
+    g->art_buf  = nullptr;
+    g->art_ctx  = nullptr;
+    g->art_bank = nullptr;
 }
 
 static void mm3_lm_free(MM3LmGraph * g) {
     mm3_lm_free_slot_all(&g->prefill);
     mm3_lm_free_slot_all(&g->decode);
     mm3_lm_free_slot_all(&g->replay);
+    mm3_lm_free_art(g);
     mm3_lm_free_kv(g);
     g->lm_token    = nullptr;
     g->synth_token = nullptr;
@@ -367,6 +411,73 @@ static void mm3_lm_set_adapter(MM3LmGraph * g, const MM3LmAdapter * ad, const MM
     mm3_lm_free_slot_all(&g->prefill);
     mm3_lm_free_slot_all(&g->decode);
     mm3_lm_free_slot_all(&g->replay);
+}
+
+// Set (or clear) the adapter whose SOFT-PROMPT halves apply. Same rules as
+// mm3_lm_set_adapter — the prefill graph bakes in whether the token add exists,
+// so a change tears the slots down — plus the bank itself, which is freed here
+// so an adapter switch can never leave a stale token installed. That is the
+// lesson artist_token_clear() encodes on the AS1.5 side.
+//
+// Call BEFORE mm3_lm_prepare: a trained prefix occupies real KV columns, and
+// the cache has to be sized for them.
+static void mm3_lm_set_soft(MM3LmGraph * g, const MM3LmAdapter * ad) {
+    if (g->soft == ad) {
+        return;
+    }
+    g->soft = ad;
+    mm3_lm_free_art(g);
+    mm3_lm_free_slot_all(&g->prefill);
+    mm3_lm_free_slot_all(&g->decode);
+    mm3_lm_free_slot_all(&g->replay);
+}
+
+// How many KV columns this graph's prefix will consume. 0 without one.
+static int64_t mm3_lm_prefix_cols(const MM3LmGraph * g) {
+    return (g->soft && g->soft->has_prefix()) ? (int64_t) g->soft->pfx_n : 0;
+}
+
+// Materialise the [H, k+1] artist-token bank once per adapter. Row 0 stays
+// zero; rows 1..k are the trained vectors, so `in_art` indexes straight into it.
+static bool mm3_lm_art_ensure(const MM3Model & m, MM3LmGraph * g, std::string * err) {
+    if (!g->soft || !g->soft->has_artist_token() || g->art_bank) {
+        return true;
+    }
+    const MM3LmAdapter & ad = *g->soft;
+    const int64_t        H  = (int64_t) m.lm_cfg.embedding_length;
+    if ((int64_t) ad.art_hidden != H) {
+        if (err) {
+            *err = "artist token hidden " + std::to_string(ad.art_hidden) + " != model hidden " +
+                   std::to_string((long long) H);
+        }
+        return false;
+    }
+    ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, /*no_alloc*/ true };
+    g->art_ctx          = ggml_init(ip);
+    if (!g->art_ctx) {
+        if (err) {
+            *err = "ggml_init failed for the MM3 artist-token bank";
+        }
+        return false;
+    }
+    g->art_bank = ggml_new_tensor_2d(g->art_ctx, GGML_TYPE_F32, H, (int64_t) ad.art_k + 1);
+    ggml_set_name(g->art_bank, "mm3_lm_artist_bank");
+    g->art_buf = ggml_backend_alloc_ctx_tensors(g->art_ctx, g->backend);
+    if (!g->art_buf) {
+        mm3_lm_free_art(g);
+        if (err) {
+            *err = "backend buffer allocation failed for the MM3 artist-token bank";
+        }
+        return false;
+    }
+    ggml_backend_buffer_clear(g->art_buf, 0);   // row 0: the no-token row
+    // art_vec is [k][hidden] row-major, which is [hidden, k] in ggml — exactly
+    // rows 1..k of the bank.
+    ggml_backend_tensor_set(g->art_bank, ad.art_vec.data(), (size_t) H * sizeof(float),
+                            ad.art_vec.size() * sizeof(float));
+    fprintf(stderr, "[MM3-LM] artist token bank: k=%d hidden=%lld, placeholder %d\n", ad.art_k, (long long) H,
+            ad.art_placeholder);
+    return true;
 }
 
 // ── Graph pieces ────────────────────────────────────────────────────────────
@@ -636,6 +747,17 @@ static bool mm3_lm_build_slot(const MM3Model & m, MM3LmGraph * g, MM3LmSlot * s,
         ggml_set_name(s->in_ids, "mm3_lm_token_ids");
         ggml_set_input(s->in_ids);
         h = ggml_get_rows(ctx, m.lm.token_embd, s->in_ids);  // [H, T*B]
+        // Artist token. The trainer accs a [H, k] parameter onto the k
+        // placeholder positions of the prompt (mm3_lm_build_embed); this is the
+        // same add, expressed as a gather so ONE cached graph serves any
+        // offset. Emitted only when a token is loaded, so a run without one
+        // builds the graph it always built.
+        if (g->art_bank) {
+            s->in_art = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T * B);
+            ggml_set_name(s->in_art, "mm3_lm_artist_rows");
+            ggml_set_input(s->in_art);
+            h = ggml_add(ctx, h, ggml_get_rows(ctx, g->art_bank, s->in_art));
+        }
         h = ggml_reshape_3d(ctx, h, H, T, B);
     } else {
         // Decode: the soft feedback embedding (design note E). in_ids is
@@ -840,6 +962,10 @@ static bool mm3_lm_prepare(const MM3Model & m, MM3LmGraph * g, int64_t n_ctx_nee
         }
         return false;
     }
+    // A trained prefix occupies real KV columns in front of the prompt, so the
+    // cache has to cover them. mm3_lm_set_soft is called before this for exactly
+    // that reason; 0 without one, and the ask is unchanged.
+    n_ctx_needed += mm3_lm_prefix_cols(g);
 
     const void * lt = (const void *) m.wctx_lm.buffer;
     // The only non-LM weight this graph touches is depth.audio_embd (the AR
@@ -958,7 +1084,8 @@ static bool mm3_lm_prepare(const MM3Model & m, MM3LmGraph * g, int64_t n_ctx_nee
 }
 
 static void mm3_lm_reset(MM3LmGraph * g) {
-    g->kv_pos = 0;
+    g->kv_pos  = 0;
+    g->kv_base = 0;
 }
 
 // ── Step plumbing ───────────────────────────────────────────────────────────
@@ -972,7 +1099,9 @@ static void mm3_lm_upload_step(MM3LmGraph * g, MM3LmSlot * s, int64_t T, int64_t
     g->mask_host.resize((size_t) (n_kv_pad * T));
     for (int64_t i = 0; i < T; i++) {
         const int64_t abs      = g->kv_pos + i;
-        g->pos_host[(size_t) i]  = (int32_t) abs;
+        // RoPE position is RELATIVE to kv_base; the KV row and the mask column
+        // are ABSOLUTE. Without a prefix kv_base is 0 and this is the identity.
+        g->pos_host[(size_t) i]  = (int32_t) (abs - g->kv_base);
         g->rows_host[(size_t) i] = abs;
         for (int64_t j = 0; j < n_kv_pad; j++) {
             g->mask_host[(size_t) (i * n_kv_pad + j)] = ggml_fp32_to_fp16(j <= abs ? 0.0f : -INFINITY);
@@ -1039,6 +1168,142 @@ static bool mm3_lm_read_attn_slice(const MM3LmConfig & c, const MM3LmSlot & s, s
     return true;
 }
 
+// ── trained KV prefix (train/lm-prefix.h) ───────────────────────────────────
+//
+// n learned K/V columns per layer, which at inference is literally a
+// pre-populated KV cache: write them into columns [0, n) and start the real
+// tokens at column n. Two contracts from the trainer must hold or the run is
+// silently wrong, and they are the same two lm-prefix-runtime.h states for the
+// ACE LM:
+//
+//   1. K goes in RAW. It was trained post-QK-norm and WITHOUT RoPE — a prefix
+//      has no position — and the forward ropes only the window's own K.
+//   2. Real positions stay 0..S-1, so kv_pos starts at n while positions are
+//      computed from kv_pos - kv_base. Rows and mask stay absolute.
+//
+// ONE DELIBERATE DEVIATION FROM THE ACE RUNTIME, and it is worth stating.
+// pipeline-lm.cpp seeds Phase-2 COND KV sets only, keeping the CFG
+// unconditional branch clean so guidance can steer toward the artist. MM3 has
+// ONE KV cache with the CFG pair as batch rows, and its attention mask is
+// [n_kv, T] with no batch axis — so there is no way to hide the prefix columns
+// from the uncond row. Seeding only the cond rows would leave the uncond row
+// attending over n columns of ZERO K and V, which is not "no prefix", it is a
+// uniform attractor diluting every uncond score. So every row is seeded, and
+// the prefix acts on both branches. Revisit if the mask ever grows a batch axis.
+//
+// Layout: the trainer's [Nkv*D, n] column has heads contiguous within a column
+// (index d + h*D); the cache is [D, n_ctx, Nkv, B] F16. So the write is one
+// contiguous [D, n] block per (head, batch row), transposed on the host.
+static int64_t mm3_lm_seed_prefix(const MM3Model & m, MM3LmGraph * g) {
+    const int64_t n = mm3_lm_prefix_cols(g);
+    if (n <= 0) {
+        return 0;
+    }
+    const MM3LmAdapter & ad  = *g->soft;
+    const MM3LmConfig &  c   = m.lm_cfg;
+    const int64_t        D   = (int64_t) c.key_length;
+    const int64_t        Nkv = (int64_t) c.head_count_kv;
+    const int64_t        row = Nkv * D;
+    const int64_t        B   = (int64_t) g->rows();
+    if (ad.pfx_row != row) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            fprintf(stderr, "[MM3-LM] prefix row %lld != model Nkv*D %lld — prefix NOT applied\n",
+                    (long long) ad.pfx_row, (long long) row);
+        }
+        return 0;
+    }
+    if (n >= g->n_ctx) {
+        fprintf(stderr, "[MM3-LM] prefix n=%lld does not fit the KV cache (%lld) — prefix NOT applied\n",
+                (long long) n, (long long) g->n_ctx);
+        return 0;
+    }
+
+    std::vector<uint16_t> blk((size_t) (n * D));
+    for (int l = ad.pfx_lo; l < ad.pfx_hi && l < (int) g->kv_k.size(); l++) {
+        const std::vector<float> & pk = ad.pfx_k[(size_t) l];
+        const std::vector<float> & pv = ad.pfx_v[(size_t) l];
+        if (pk.size() != (size_t) (n * row) || pv.size() != pk.size()) {
+            continue;   // malformed layer: the loader already said so
+        }
+        ggml_tensor * ck = g->kv_k[(size_t) l];
+        ggml_tensor * cv = g->kv_v[(size_t) l];
+        for (int which = 0; which < 2; which++) {
+            const std::vector<float> & src = which ? pv : pk;
+            ggml_tensor *              dst = which ? cv : ck;
+            for (int64_t h = 0; h < Nkv; h++) {
+                for (int64_t col = 0; col < n; col++) {
+                    const float * s = src.data() + (size_t) (col * row + h * D);
+                    uint16_t *    d = blk.data() + (size_t) (col * D);
+                    for (int64_t i = 0; i < D; i++) {
+                        d[i] = ggml_fp32_to_fp16(s[i]);
+                    }
+                }
+                for (int64_t b = 0; b < B; b++) {
+                    ggml_backend_tensor_set(dst, blk.data(), (size_t) h * dst->nb[2] + (size_t) b * dst->nb[3],
+                                            blk.size() * sizeof(uint16_t));
+                }
+            }
+        }
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        fprintf(stderr, "[MM3-LM] seeded %lld prefix columns over layers [%d,%d) into all %lld batch row(s)\n",
+                (long long) n, ad.pfx_lo, ad.pfx_hi, (long long) B);
+    }
+    return n;
+}
+
+// Fill `art_host` for a prefill of `n_prompt` positions across B rows.
+//
+// The placeholder run is FOUND rather than passed in, exactly as
+// artist-token-runtime.h does it on the ACE side: the trainer splices k copies
+// of one id at the front of the prompt, so the applier scans for k consecutive
+// copies. A prompt that never got the splice contains no such run and is left
+// entirely at row 0 — the no-token row — which is also how the unconditional
+// CFG row opts out even when it does carry the ids.
+static void mm3_lm_fill_artist_rows(MM3LmGraph * g, int64_t n_prompt) {
+    const int64_t B = (int64_t) g->rows();
+    g->art_host.assign((size_t) (n_prompt * B), 0);
+    if (!g->art_bank || !g->soft) {
+        return;
+    }
+    const int     k  = g->soft->art_k;
+    const int32_t ph = (int32_t) g->soft->art_placeholder;
+    int           found_rows = 0;
+    for (int64_t b = 0; b < B; b++) {
+        // Conditional rows only. Row b is (take, cfg) with cfg-major inside a
+        // take, so b % cfg_rows == 0 is the conditional one — the same indexing
+        // mm3_lm_prefill writes the two id blocks with.
+        if (g->cfg_rows > 1 && (b % (int64_t) g->cfg_rows) != 0) {
+            continue;
+        }
+        const int32_t * ids = g->ids_host.data() + (size_t) (b * n_prompt);
+        for (int64_t i = 0; i + k <= n_prompt; i++) {
+            int j = 0;
+            while (j < k && ids[i + j] == ph) {
+                j++;
+            }
+            if (j == k) {
+                for (int64_t q = 0; q < k; q++) {
+                    g->art_host[(size_t) (b * n_prompt + i + q)] = (int32_t) (q + 1);
+                }
+                found_rows++;
+                break;
+            }
+        }
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        fprintf(stderr, "[MM3-LM] artist token applied on %d of %lld prefill row(s) (k=%d, placeholder %d)%s\n",
+                found_rows, (long long) B, k, (int) ph,
+                found_rows ? "" : " — NO placeholder run found; the prompt was not spliced");
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 // Prefill both CFG rows of the prompt in one pass and return the last position's
@@ -1066,7 +1331,22 @@ static bool mm3_lm_prefill(const MM3Model & m, MM3LmGraph * g, const int32_t * i
         return false;
     }
 
-    const int64_t n_kv_pad = std::min<int64_t>(mm3_lm_bucket(n_prompt), g->n_ctx);
+    // The token bank has to exist before the slot is built — the graph views it.
+    if (!mm3_lm_art_ensure(m, g, err)) {
+        return false;
+    }
+    // A trained prefix sits in KV columns [0, n): the attention window covers
+    // them too, so the bucket is over n + n_prompt, not n_prompt.
+    const int64_t n_pfx = mm3_lm_prefix_cols(g);
+    if (n_pfx + n_prompt > g->n_ctx) {
+        if (err) {
+            *err = "prompt of " + std::to_string((long long) n_prompt) + " tokens plus a " +
+                   std::to_string((long long) n_pfx) + "-column prefix exceeds the KV cache (" +
+                   std::to_string((long long) g->n_ctx) + ")";
+        }
+        return false;
+    }
+    const int64_t n_kv_pad = std::min<int64_t>(mm3_lm_bucket(n_pfx + n_prompt), g->n_ctx);
     if (!g->prefill.graph || g->prefill.T != n_prompt || g->prefill.n_kv_pad != n_kv_pad) {
         mm3_lm_free_slot(&g->prefill);
         if (!g->prefill.sched) {
@@ -1079,7 +1359,15 @@ static bool mm3_lm_prefill(const MM3Model & m, MM3LmGraph * g, const int32_t * i
                 (long long) n_kv_pad, g->prefill.n_nodes, (double) g->prefill.compute_bytes / (1024.0 * 1024.0));
     }
 
-    g->kv_pos = 0;
+    // A prefill always starts a new sequence — and, when the adapter carries
+    // one, that sequence starts behind a trained prefix.
+    g->kv_pos  = 0;
+    g->kv_base = 0;
+    if (n_pfx > 0) {
+        const int64_t seeded = mm3_lm_seed_prefix(m, g);
+        g->kv_pos            = seeded;
+        g->kv_base           = seeded;
+    }
 
     // The prefill index array is B contiguous blocks of n_prompt (get_rows +
     // reshape to [H, T, B] means block b is row b). Every take starts from the
@@ -1098,6 +1386,11 @@ static bool mm3_lm_prefill(const MM3Model & m, MM3LmGraph * g, const int32_t * i
         }
     }
     ggml_backend_tensor_set(g->prefill.in_ids, g->ids_host.data(), 0, (size_t) (n_prompt * B) * sizeof(int32_t));
+    if (g->prefill.in_art) {
+        mm3_lm_fill_artist_rows(g, n_prompt);
+        ggml_backend_tensor_set(g->prefill.in_art, g->art_host.data(), 0,
+                                (size_t) (n_prompt * B) * sizeof(int32_t));
+    }
     mm3_lm_upload_step(g, &g->prefill, n_prompt, n_kv_pad);
 
     mm3_imatrix_hook(g->prefill.sched);
@@ -1108,7 +1401,7 @@ static bool mm3_lm_prefill(const MM3Model & m, MM3LmGraph * g, const int32_t * i
         return false;
     }
     mm3_lm_read_outputs(c, g->prefill, out_hidden, out_logits, nullptr);
-    g->kv_pos = n_prompt;
+    g->kv_pos = g->kv_base + n_prompt;
     return true;
 }
 
@@ -1348,7 +1641,16 @@ static bool mm3_lm_lrc_replay(const MM3Model & m, MM3LmGraph * g, const int32_t 
     flat->assign((size_t) (MM3_ALIGN_N_HEADS * n_tok * n_steps), 0.0f);
 
     const auto t0 = std::chrono::steady_clock::now();
+    // The replay OVERWRITES the cache from column 0 and builds its own positions
+    // (0..total-1) rather than going through mm3_lm_upload_step, so it neither
+    // reads nor honours kv_base: a trained prefix is not in this pass, and the
+    // seeded columns it wrote are gone afterwards. That is acceptable because
+    // this runs POST-HOC, after the audio's codes are final — the next
+    // generation re-seeds in prefill. It does mean an LRC alignment is measured
+    // on a model without the prefix or the artist token; revisit if alignment
+    // quality ever depends on them.
     g->kv_pos     = 0;
+    g->kv_base    = 0;
 
     std::vector<int32_t> ids, ac;
     std::vector<float>   gate, scl, row((size_t) n_tok);

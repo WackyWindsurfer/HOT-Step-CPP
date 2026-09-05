@@ -62,6 +62,7 @@
 // encoded onto Job::result_body and fetched the usual way, so the song row,
 // the library entry, mastering and stems are untouched.
 
+#include "hot-step-fsutf8.h"  // hs_stat / HS_STAT_T
 #include "mm3-ar-cache.h"
 #include "mm3-hiddens-file.h"
 #include "mm3-lm-merge.h"
@@ -431,8 +432,11 @@ static void mm3_ar_key_add_models(std::string & k, const MM3Model & m, const MM3
     // LM adapter: identity (path + mtime, so a retrained checkpoint under the
     // same name misses), how it is applied, and every dial.
     if (!req.lm_adapter.empty()) {
-        struct stat sb {};
-        const bool  ok = stat(req.lm_adapter.c_str(), &sb) == 0;
+        // hs_stat, not stat — see mm3-adapter.h: MSVC's narrow stat reports any
+        // file >= 2 GiB as missing, which here would silently pin ad_mtime at
+        // -1 and make every large adapter share one cache key.
+        HS_STAT_T  sb {};
+        const bool ok = hs_stat(req.lm_adapter, &sb) == 0;
         add_s("ad", req.lm_adapter);
         add_i("ad_mtime", ok ? (long long) sb.st_mtime : -1);
         add_s("ad_mode", req.lm_adapter_mode);
@@ -939,9 +943,11 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     // hit means "this exact adapter produced this exact block".
     const bool merge_mode = !req.lm_adapter.empty() && req.lm_adapter_mode == "merge";
     if (!ar_hit) {
-        struct stat asb {};
-
-        const bool  stat_ok  = !req.lm_adapter.empty() && stat(req.lm_adapter.c_str(), &asb) == 0;
+        // hs_stat: a >= 2 GiB adapter must not read as missing (see above) —
+        // stat_ok false here means the mtime revalidation below never fires and
+        // a retrained checkpoint under the same path is served from cache.
+        HS_STAT_T   asb {};
+        const bool  stat_ok  = !req.lm_adapter.empty() && hs_stat(req.lm_adapter, &asb) == 0;
         std::string want_tag;  // "" = this render wants a pristine base
         if (merge_mode) {
             want_tag = mm3_lm_merge_make_tag(req.lm_adapter, stat_ok ? (int64_t) asb.st_mtime : 0,
@@ -987,6 +993,11 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
                     g_mm3.lm_merge_tag = want_tag;
                 }
                 req.gen.lm_adapter = nullptr;  // baked in; no runtime deltas on top
+                // The soft-prompt halves survive the merge. A token is a
+                // conditioning input on k prompt positions and a prefix is n KV
+                // columns; neither is a weight delta, so mm3_lm_merge_apply
+                // folds neither and both still have to reach the graph.
+                req.gen.lm_soft    = g_mm3_lm_adapter;
             } else {
                 // Runtime mode cannot express a delta that is not low-rank.
                 // HiRA (W (.) s*BA) and LoHa ((A1B1) (.) (A2B2)) both need a
@@ -1008,9 +1019,11 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
                     return;
                 }
                 req.gen.lm_adapter = g_mm3_lm_adapter;
+                req.gen.lm_soft    = g_mm3_lm_adapter;
             }
         } else {
             req.gen.lm_adapter = nullptr;  // cached adapter stays resident but inert
+            req.gen.lm_soft    = nullptr;  // ...and so are its soft-prompt halves
         }
     }
 

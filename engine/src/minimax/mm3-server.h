@@ -1213,6 +1213,22 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
                 }
             }
             opt.lm_adapter = g_mm3_lm_adapter;
+            // Soft-prompt halves. This endpoint is runtime-only, so lm_soft and
+            // lm_adapter are always the same object here; the split matters on
+            // /mm3/generate, where merge mode nulls lm_adapter.
+            //
+            // `lm_soft_off` runs the adapter's LoRA half ALONE — same weights,
+            // same seed, no token, no prefix. That is the A/B this feature is
+            // provable by: the LoRA is identical between the two arms, so any
+            // difference in the logits is the soft prompt and nothing else.
+            opt.lm_soft = yyjson_obj_get(root, "lm_soft_off") ? nullptr : g_mm3_lm_adapter;
+            if (opt.lm_soft && opt.lm_soft->has_artist_token()) {
+                // The trainer splices at the front of the prompt; reproduce it
+                // (mm3-pipeline.h carries the same block and the reasoning).
+                const MM3LmAdapter & sa = *opt.lm_soft;
+                ids_cond.insert(ids_cond.begin(), (size_t) sa.art_k, (int32_t) sa.art_placeholder);
+                ids_uncond.insert(ids_uncond.begin(), (size_t) sa.art_k, (int32_t) sa.art_placeholder);
+            }
 
             const auto num = [&](const char * key, float dflt) -> float {
                 yyjson_val * v = root ? yyjson_obj_get(root, key) : nullptr;
