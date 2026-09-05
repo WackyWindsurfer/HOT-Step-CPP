@@ -61,6 +61,7 @@ import {
   mm3Synth, mm3SelectModel, type Mm3SynthRequest,
 } from '../src/services/backends/minimax/client.js';
 import { MM3_LM_ADAPTER_DEFAULT_SCALES } from '../src/services/backends/minimax/lmAdapter.js';
+import { applyMm3Trigger, readMm3AdapterTrigger } from '../src/services/backends/minimax/trigger.js';
 import {
   listMm3Runs, resumeOptionsFor, readMm3Run, type Mm3RunSummary,
 } from '../src/services/training/mm3Runs.js';
@@ -511,9 +512,23 @@ type Mm3RenderRequest = Mm3SynthRequest & {
   lm_adapter_scale_late?: number;
 };
 
+/** Adds the adapter's own trigger word to the caption, exactly the way
+ *  generate.ts does for a normal /api/generate render (`readMm3AdapterTrigger`
+ *  + `applyMm3Trigger`, idempotent, skipped when the sidecar says the trigger
+ *  was never trained). Rendering goes straight to the engine here, bypassing
+ *  generate.ts entirely, so this has to be done by hand or a trained
+ *  adapter's identity binding — the whole point of a likeness comparison —
+ *  would silently never reach the model. */
+function withAdapterTrigger(caption: string, adapterFile: string): string {
+  const tg = readMm3AdapterTrigger(adapterFile);
+  if (tg.trigger && tg.prepend) return applyMm3Trigger(caption, tg.trigger);
+  return caption;
+}
+
 function buildRenderRequest(adapterFile: string | null, ov: { caption: string; lyrics: string; seed: number }): Mm3RenderRequest {
+  const caption = adapterFile ? withAdapterTrigger(ov.caption, adapterFile) : ov.caption;
   const req: Mm3RenderRequest = {
-    caption: ov.caption, lyrics: ov.lyrics || '', duration: RENDER_DURATION_SEC, seed: ov.seed, steps: RENDER_STEPS,
+    caption, lyrics: ov.lyrics || '', duration: RENDER_DURATION_SEC, seed: ov.seed, steps: RENDER_STEPS,
   };
   if (adapterFile) {
     const d = MM3_LM_ADAPTER_DEFAULT_SCALES;
