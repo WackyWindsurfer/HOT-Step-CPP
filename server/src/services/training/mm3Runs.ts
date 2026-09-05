@@ -137,6 +137,12 @@ function readJson<T>(file: string): T | null {
 interface LogFacts {
   init?: Record<string, unknown>;
   adapter?: Record<string, unknown>;
+  /** Every `kind` the launch's adapter events reported, not just the first.
+   *  rsLoRA is emitted as its OWN event alongside dora/hira/loha/hra, so the
+   *  single first-wins `adapter` above can only ever describe one of the two —
+   *  and a run whose parameterization is not reconstructed here comes back as a
+   *  plain LoRA, which is a different adapter. */
+  adapterKinds: Set<string>;
   cropAnchor?: string;
   cropPolicy?: Record<string, unknown>;
   kvPrefix?: Record<string, unknown>;
@@ -159,7 +165,7 @@ interface LogFacts {
 /** Read a run's JSONL. Whole-file: a 4000-step run's log is about a megabyte,
  *  and the facts wanted live at both ends of it. */
 function readLog(dir: string): LogFacts {
-  const out: LogFacts = { lastStep: 0, milestones: new Map(), ending: 'none' };
+  const out: LogFacts = { lastStep: 0, milestones: new Map(), ending: 'none', adapterKinds: new Set() };
   let text: string;
   try {
     text = fs.readFileSync(path.join(dir, 'train-log.jsonl'), 'utf-8');
@@ -188,7 +194,14 @@ function readLog(dir: string): LogFacts {
     // otherwise poison every later attempt with its own bad numbers.
     switch (ev.type) {
       case 'init':          out.init ??= ev; break;
-      case 'adapter':       out.adapter ??= ev; break;
+      case 'adapter':
+        out.adapter ??= ev;
+        // Kinds accumulate rather than first-win: one launch can emit `rslora`
+        // AND `dora`. Later launches append to the same file, but a resume runs
+        // the same parameterization by construction (the engine now refuses a
+        // mismatch), so the union is that one recipe.
+        if (typeof ev.kind === 'string') out.adapterKinds.add(ev.kind);
+        break;
       case 'cropAnchor':
         if (out.cropAnchor === undefined && typeof ev.mode === 'string') out.cropAnchor = ev.mode;
         break;
@@ -402,24 +415,19 @@ function optionsFromLog(dir: string, facts: LogFacts): ResolvedMm3TrainLmOptions
     lokrFactor: n(facts.adapter?.factor, D.lokrFactor),
     lokrDim: n(facts.adapter?.dim, D.lokrDim),
     lokrAlpha: n(facts.adapter?.alpha, D.lokrAlpha),
-    // attn IS fingerprinted now (the engine's own `attn` event, landed
-    // 2026-09-05) — 'exact' is the only value this reads back as 'exact' vs
-    // 'flash', which is enough to keep a resume on the formulation the saved
-    // state was actually written under. The LoRA-family methods below are
-    // NOT fingerprinted by the engine's `adapter` event today (it reports
-    // only lora vs lokr, per the adapterType line above), so a pre-manifest
-    // run always reconstructs to today's off defaults for those — same
-    // honesty tradeoff optionsFromLog already makes for everything the log
-    // does not carry (see the function comment above). If the engine's
-    // flag-contract port adds a `kind` value per method, read it here the
-    // same way `adapterType` does.
+    // attn and the parameterization are both fingerprinted by the engine's own
+    // events (`attn`, and `adapter` with a per-method `kind`), so a run with no
+    // manifest still resumes as the adapter it is. Reconstructing these as "off"
+    // was not a smaller lie than reconstructing rank wrong: a DoRA run continued
+    // without --dora has no magnitudes to restore, and an rsLoRA run continued
+    // without --rslora simply gets quieter by sqrt(r).
     attnBackend: facts.attn === 'flash' || facts.attn === 'flash-f32' ? 'flash' : D.attnBackend,
-    rslora: D.rslora,
-    dora: false,
-    hira: false,
-    loha: false,
-    pissa: false,
-    hra: false,
+    rslora: facts.adapterKinds.has('rslora') || D.rslora,
+    dora: facts.adapterKinds.has('dora'),
+    hira: facts.adapterKinds.has('hira'),
+    loha: facts.adapterKinds.has('loha'),
+    pissa: facts.adapterKinds.has('pissa'),
+    hra: facts.adapterKinds.has('hra'),
     loraPlusRatio: D.loraPlusRatio,
     artistToken: '',
     artistTokenK: D.artistTokenK,

@@ -1693,6 +1693,7 @@
     "trainingStudio.mm3.artistTokenLr": "Token LR",
     "trainingStudio.mm3.prefixN": "Prefix columns (trainable)",
     "trainingStudio.mm3.prefixNInfo": "n trainable key/value columns per layer that every position attends to. 0 = off. Not the frozen history prefix below — this one trains.",
+    "trainingStudio.mm3.prefixNVsReg": "Unavailable with a regularisation dataset: the prior capture needs an inert model, and a prefix is non-zero from initialisation. The engine refuses the pair.",
     "trainingStudio.mm3.previewSong": "Preview song",
     "trainingStudio.mm3.previewSongAuto": "Auto (held-out, real lyrics preferred)",
     "trainingStudio.mm3.previewSongTraining": "training",

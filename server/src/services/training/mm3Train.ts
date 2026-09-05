@@ -1111,7 +1111,19 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     if (o.rslora) args.push('--rslora');
     if (o.hira && !o.dora) args.push('--hira');
     if (o.loha && !o.dora && !o.hira) args.push('--loha');
-    if (o.pissa && !o.dora && !o.hira && !o.loha && !o.resumeFrom) args.push('--pissa');
+    // NOT suppressed on a resume. --pissa changes what the frozen base of the
+    // delta IS (y = Wx + s*(BA - B0A0)x), and the A/B tensor set is identical
+    // with and without it — so dropping the flag to make `--pissa --resume`
+    // legal produced a run that looked like a resume and trained against a
+    // different function from step 1. The engine refuses the pair outright
+    // (ace-train.cpp) and the resume route refuses it before spawning; leaving
+    // it on here means the illegal state fails loudly instead of quietly.
+    if (o.pissa && !o.dora && !o.hira && !o.loha) args.push('--pissa');
+    // rslora is in the guard because the engine refuses --hra --rslora, but the
+    // routes refuse that pair with a 400 first: HRA has no B for a rank-scaling
+    // rule to apply to, so silently dropping it here would train a plain rsLoRA
+    // LoRA and label the checkpoint HRA. This line is the backstop, not the
+    // rule.
     if (o.hra && !o.dora && !o.hira && !o.loha && !o.pissa && !o.rslora) args.push('--hra');
   }
   if (o.loraPlusRatio && o.loraPlusRatio !== 1) args.push('--lora-plus-ratio', String(o.loraPlusRatio));

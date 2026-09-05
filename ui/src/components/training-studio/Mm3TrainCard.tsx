@@ -120,11 +120,12 @@ const MM3_METHOD_KEYS: Record<Mm3Method, { label: string; info: string }> = {
 
 const NumField: React.FC<{
   label: string; value: number; onChange: (v: number) => void; step?: number; hint?: string;
-}> = ({ label, value, onChange, step = 1, hint }) => (
-  <label className="flex flex-col gap-1">
+  disabled?: boolean;
+}> = ({ label, value, onChange, step = 1, hint, disabled }) => (
+  <label className={`flex flex-col gap-1${disabled ? ' opacity-50' : ''}`}>
     <span className="text-[11px] font-medium text-zinc-500 uppercase tracking-wider">{label}</span>
     <input
-      type="number" className={INPUT} value={value} step={step}
+      type="number" className={INPUT} value={value} step={step} disabled={disabled}
       onChange={e => onChange(Number(e.target.value))}
     />
     {hint && <span className="text-[10px] text-zinc-500 leading-snug">{hint}</span>}
@@ -378,7 +379,11 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
         // else in this codebase. adapterType==='lora' guards the whole group —
         // the server ignores them under lokr, but sending only the relevant
         // side keeps the request body honest about what actually ran.
-        ...(form.adapterType === 'lora' && form.attnBackend !== 'exact' ? { attnBackend: form.attnBackend } : {}),
+        // NOT gated on adapterType: --attn is orthogonal to the adapter
+        // parameterization and mm3-lm-train accepts it under LoKr too, where the
+        // VRAM saving is identical. Gating it meant the checkbox stayed visibly
+        // ticked while the request omitted the field and the run trained exact.
+        ...(form.attnBackend !== 'exact' ? { attnBackend: form.attnBackend } : {}),
         ...(form.adapterType === 'lora' && form.dora ? { dora: true } : {}),
         ...(form.adapterType === 'lora' && form.hira ? { hira: true } : {}),
         ...(form.adapterType === 'lora' && form.loha ? { loha: true } : {}),
@@ -391,7 +396,10 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
         ...(form.adapterType === 'lora' && form.artistTokenOn
           ? { artistToken: form.artistToken, artistTokenK: form.artistTokenK, artistTokenLr: form.artistTokenLr }
           : {}),
-        ...(form.adapterType === 'lora' && form.prefixN > 0 ? { prefixN: form.prefixN } : {}),
+        // Never sent alongside a regularisation corpus — the engine refuses the
+        // pair, and the route now 400s on it. The control is disabled there too.
+        ...(form.adapterType === 'lora' && form.prefixN > 0 && !form.regDatasetId
+          ? { prefixN: form.prefixN } : {}),
       };
       await startMm3TrainLm(body);
     } finally {
@@ -1013,10 +1021,17 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                     </div>
                   )}
                   <NumField label={t('trainingStudio.mm3.prefixN', 'Prefix columns (trainable)')}
-                    value={form.prefixN} onChange={v => set('prefixN', Math.max(0, Math.min(64, v)))}
-                    hint={t('trainingStudio.mm3.prefixNInfo',
-                      'n trainable key/value columns per layer that every position attends to. 0 = off. '
-                      + 'Not the frozen history prefix below — this one trains.') as string} />
+                    value={form.regDatasetId ? 0 : form.prefixN}
+                    onChange={v => set('prefixN', Math.max(0, Math.min(64, v)))}
+                    disabled={!!form.regDatasetId}
+                    hint={(form.regDatasetId
+                      ? t('trainingStudio.mm3.prefixNVsReg',
+                          'Unavailable with a regularisation dataset: the prior capture needs an inert '
+                          + 'model, and a prefix is non-zero from initialisation. The engine refuses '
+                          + 'the pair.')
+                      : t('trainingStudio.mm3.prefixNInfo',
+                          'n trainable key/value columns per layer that every position attends to. 0 = off. '
+                          + 'Not the frozen history prefix below — this one trains.')) as string} />
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <label className="flex flex-col gap-1">

@@ -1904,7 +1904,22 @@ function mm3MethodConflict(b: Record<string, unknown>, adapterType: 'lora' | 'lo
   if (on.length > 1) {
     return `dora, hira, loha, pissa and hra are mutually exclusive — got ${on.join(' + ')}.`;
   }
-  return '';
+  return hraRsloraConflict(b);
+}
+
+/** hra + rslora, refused everywhere rather than resolved by precedence.
+ *
+ *  This pair is not a precedence question like dora-beats-hira, where one of the
+ *  requested methods still trains. HRA has no B for alpha/sqrt(r) to scale, so
+ *  ace-train exits 2 on the combination — and every arg builder's AND-chain
+ *  drops --hra and keeps --rslora, which trains an ordinary rsLoRA LoRA while
+ *  the manifest and the Training Studio both call the result HRA. Returns ''
+ *  when fine. */
+function hraRsloraConflict(b: Record<string, unknown>): string {
+  return b.hra === true && b.rslora === true
+    ? 'hra and rslora cannot be combined: HRA trains orthogonal reflections and has no B matrix for '
+      + 'alpha/sqrt(r) to scale. Drop one.'
+    : '';
 }
 
 /** Mid-run preview options off the request body, clamped.
@@ -2174,12 +2189,33 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
     // click would otherwise be refused by the engine for a reason the user
     // never touched — same "coerce, don't fail 5 minutes into a model load"
     // choice train-lm's own attnBackendEff makes for its KV prefix.
+    //
+    // The condition MATCHES what buildMm3TrainLmArgs actually emits, which is
+    // not the same as "prefixFrames is nonzero": --prefix-frames is emitted only
+    // under `song` anchoring and only when prefixN is 0. Coercing on the raw
+    // number disabled flash for a conflict the engine would never have seen.
+    const cropAnchorResolved: 'song' | 'zero' = b.cropAnchor === 'zero' ? 'zero' : 'song';
+    const framesWillBeEmitted = prefixFramesResolved > 0 && cropAnchorResolved === 'song'
+                                && prefixNResolved === 0;
     let attnBackendResolved: 'exact' | 'flash' = b.attnBackend === 'flash' ? 'flash' : D.attnBackend;
-    if ((prefixFramesResolved > 0 || prefixNResolved > 0) && attnBackendResolved !== 'exact') {
+    if ((framesWillBeEmitted || prefixNResolved > 0) && attnBackendResolved !== 'exact') {
       console.log(`[Training] mm3-train-lm: attnBackend ${attnBackendResolved} -> exact `
-                 + `(prefixFrames=${prefixFramesResolved}, prefixN=${prefixNResolved} — either one makes the `
+                 + `(prefixFrames=${framesWillBeEmitted ? prefixFramesResolved : 0}, `
+                 + `prefixN=${prefixNResolved} — either one makes the `
                  + 'attention mask rectangular, which the engine refuses under flash)');
       attnBackendResolved = 'exact';
+    }
+    // The engine refuses a trainable prefix together with prior preservation
+    // (the prior capture needs an inert model, and a prefix is non-zero from
+    // initialisation) — exit 2 after the base load. Say so here instead, since
+    // neither side of the pair is a default the user did not choose.
+    if (prefixNResolved > 0 && reg.regEvery && reg.regEvery > 0) {
+      res.status(400).json({
+        error: 'A trainable prefix (prefixN) cannot be combined with a regularisation corpus. The prior '
+             + 'capture needs a genuinely inert model, and a prefix is non-zero from initialisation. '
+             + 'Drop one of the two.',
+      });
+      return;
     }
 
     const job = queue.startMm3TrainLmJob(ds.id, {
@@ -2256,7 +2292,13 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       ...reg,
       preview:     previewOpts,
     });
-    res.json({ jobId: job.id, kind: job.kind, runName, outDir: mm3AdapterRunDir(runName) });
+    // attnBackend is echoed because it is the one field this route can silently
+    // CHANGE (the flash + rectangular-mask coercion above). Without it the card
+    // shows a flash VRAM estimate for a run that trained exact.
+    res.json({
+      jobId: job.id, kind: job.kind, runName, outDir: mm3AdapterRunDir(runName),
+      attnBackend: attnBackendResolved,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || String(err) });
   }
@@ -2363,6 +2405,22 @@ router.post('/datasets/:id/mm3-resume-lm', (req: Request, res: Response) => {
       return;
     }
 
+    // PiSSA is not resumable, and the failure mode is silent rather than loud:
+    // the exported/held A and B have the same names and shapes with and without
+    // it, so a leg that dropped --pissa would load them cleanly and then train
+    // against y = Wx + s*BAx where y = Wx + s*(BA - B0A0)x was fitted — the top-r
+    // singular energy counted twice from step 1. ace-train refuses --pissa
+    // --resume outright; refuse here so the user gets a sentence instead of a
+    // failed job.
+    if (opts.pissa) {
+      res.status(400).json({
+        error: 'This run was trained with PiSSA, which cannot be continued: the exported factors have '
+             + 'already absorbed the frozen SVD init they were measured against, and there is nothing '
+             + 'to re-derive it from. Start a fresh run instead.',
+      });
+      return;
+    }
+
     // How much further. `addSteps` is the natural way to ask ("another 250");
     // `steps` sets the new total outright. Either way the cap has to be ahead
     // of where the state sits, or the engine loads 22 GB of model to do nothing.
@@ -2415,6 +2473,16 @@ router.post('/datasets/:id/mm3-resume-lm', (req: Request, res: Response) => {
     if (b.attnBackend === 'exact' || b.attnBackend === 'flash') opts.attnBackend = b.attnBackend;
     if (Number.isFinite(Number(b.prefixN))) {
       opts.prefixN = Math.min(64, Math.max(0, Math.trunc(Number(b.prefixN))));
+    }
+    // Same engine refusal as the start route: a prefix is non-zero from
+    // initialisation, so the prior capture would score the student against a
+    // teacher that already carries it.
+    if (opts.prefixN > 0 && opts.regEvery && opts.regEvery > 0) {
+      res.status(400).json({
+        error: 'A trainable prefix (prefixN) cannot be combined with the regularisation corpus this run '
+             + 'was trained with. Ask for prefixN 0, or continue it without prior preservation.',
+      });
+      return;
     }
     // Same engine refusal as the start route: --attn flash + a nonzero
     // prefixFrames (the run's own recorded frozen history prefix, fixed —
@@ -2963,6 +3031,15 @@ router.post('/datasets/:id/train-lm', async (req: Request, res: Response) => {
     if (initAdapter && !Array.isArray(body.targetLossStages)) {
       targetLossStages = [targetLoss];
     }
+    // The one method pair whose arg-builder precedence drops a METHOD rather
+    // than picking between two of them (see hraRsloraConflict).
+    {
+      const conflict = hraRsloraConflict(body as unknown as Record<string, unknown>);
+      if (conflict) {
+        res.status(400).json({ error: conflict });
+        return;
+      }
+    }
     // Calibration is OPT-IN (Rob, 2026-08-12) — it was default ON from
     // 2026-08-10. Only an explicit `true` runs it, so the batch pipeline's empty
     // bag no longer appends an eval pass to every adapter in a bulk sweep.
@@ -3409,6 +3486,15 @@ router.post('/datasets/:id/train-dit', async (req: Request, res: Response) => {
     if (body.bwd !== undefined && body.bwd !== 'outprod' && body.bwd !== 'mm') {
       res.status(400).json({ error: 'bwd must be outprod or mm' });
       return;
+    }
+    // The one method pair whose arg-builder precedence drops a METHOD rather
+    // than picking between two of them (see hraRsloraConflict).
+    {
+      const conflict = hraRsloraConflict(body as unknown as Record<string, unknown>);
+      if (conflict) {
+        res.status(400).json({ error: conflict });
+        return;
+      }
     }
     // Attention backend (2026-09-01 flash-attn-backward plan §11). Refused, not
     // coerced, same rule as mirror/optimizer/bwd above. Default stays 'exact' —
