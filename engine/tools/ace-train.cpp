@@ -541,7 +541,7 @@ static void print_usage(void) {
             "                                            than written into the base. Exports a plain\n"
             "                                            rank-2r LoRA, which this engine CAN load. Plain\n"
             "                                            LoRA only; not resumable.\n"
-            "    --hot-pissa                             HOT-PiSSA: PiSSA whose rank-dropout mask hits the\n"
+            "    --hot-pizza                             HOT-PiZZA: PiSSA whose rank-dropout mask hits the\n"
             "                                            principal component itself, not the delta, so a\n"
             "                                            random --rank-dropout share of the base's top-r\n"
             "                                            subspace is deleted every micro-step while the\n"
@@ -729,7 +729,7 @@ static void print_usage(void) {
             "                                            directions (GPU randomized SVD), base keeps the\n"
             "                                            residual. Exports a rank-2r plain LoRA. Plain LoRA\n"
             "                                            only; not resumable.\n"
-            "    --hot-pissa                             HOT-PiSSA: PiSSA with the rank-dropout mask on the\n"
+            "    --hot-pizza                             HOT-PiZZA: PiSSA with the rank-dropout mask on the\n"
             "                                            principal component itself (implies --pissa; same\n"
             "                                            export). MM3's winning recipe 2026-09-06; not yet\n"
             "                                            heard on the AS1.5 LM. Stop on steps, not loss.\n"
@@ -1899,7 +1899,7 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--hira"))              a.hira         = true;
         else if (!strcmp(argv[i], "--loha"))              a.loha         = true;
         else if (!strcmp(argv[i], "--pissa"))             a.pissa        = true;
-        else if (!strcmp(argv[i], "--hot-pissa"))         { a.pissa = true; a.hot_pissa = true; }
+        else if (!strcmp(argv[i], "--hot-pizza") || !strcmp(argv[i], "--hot-pissa")) { a.pissa = true; a.hot_pizza = true; }  // old spelling accepted
         else if (!strcmp(argv[i], "--pissa-cache-dir"))   a.pissa_cache_dir = next("--pissa-cache-dir");
         else if (!strcmp(argv[i], "--pissa-frozen-f16"))  a.pissa_f16    = true;
         else if (!strcmp(argv[i], "--pissa-oversample"))  a.pissa_oversample = atoi(next("--pissa-oversample"));
@@ -4115,7 +4115,7 @@ static int cmd_train_lm(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--loha")) { a.loha = true; saw.method = true; }
         else if (!strcmp(argv[i], "--hra")) { a.hra = true; saw.method = true; }
         else if (!strcmp(argv[i], "--pissa")) a.pissa = true;
-        else if (!strcmp(argv[i], "--hot-pissa")) { a.pissa = true; a.hot_pissa = true; }
+        else if (!strcmp(argv[i], "--hot-pizza") || !strcmp(argv[i], "--hot-pissa")) { a.pissa = true; a.hot_pizza = true; }
         else if (!strcmp(argv[i], "--pissa-cache-dir") && i + 1 < argc) a.pissa_cache_dir = argv[++i];
         else if (!strcmp(argv[i], "--pissa-frozen-f16")) a.pissa_f16 = true;
         else if (!strcmp(argv[i], "--pissa-oversample") && i + 1 < argc) a.pissa_oversample = atoi(argv[++i]);

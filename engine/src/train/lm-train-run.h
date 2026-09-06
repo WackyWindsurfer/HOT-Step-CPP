@@ -119,10 +119,10 @@ struct LmTrainArgs {
     bool        pissa        = false;
     int         pissa_oversample = 8;
     int         pissa_iters      = 2;
-    //   hot_pissa — PiSSA with the rank-dropout mask on the principal component
-    //            itself (QwLoraPair::hot_pissa). Implies pissa. The recipe that
+    //   hot_pizza — PiSSA with the rank-dropout mask on the principal component
+    //            itself (QwLoraPair::hot_pizza). Implies pissa. The recipe that
     //            won the 2026-09-06 MM3 blind tests; export identical to pissa.
-    bool        hot_pissa        = false;
+    bool        hot_pizza        = false;
     //   pissa_cache_dir — directory for the SVD init cache (lm-pissa.h); '' = off.
     //   pissa_f16 — frozen A0/B0 in F16 (halves their VRAM; init cancels to f16).
     std::string pissa_cache_dir;
@@ -1061,7 +1061,7 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
                 ? lm_lokr_init(&lora, &lm, 0, c.n_layers, a.lokr_dim, a.lokr_alpha, a.lokr_factor,
                                a.lokr_decompose_both, (uint64_t) a.seed, &err)
                 : lm_lora_init(&lora, &lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed, /*b_sigma=*/0.0f,
-                               &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra, a.hot_pissa, a.pissa_f16 });
+                               &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra, a.hot_pizza, a.pissa_f16 });
         if (!init_ok) {
             lm_fatal("vram", err);
             return 1;
@@ -2573,7 +2573,7 @@ static int lm_train_main(const LmTrainArgs & a) {
     meta.attn_mode      = a.attn;
     meta.adapter_type   = a.adapter_type;
     meta.param_method   = a.hra    ? "hra"
-                          : a.pissa ? (a.hot_pissa ? "hot-pissa" : "pissa")
+                          : a.pissa ? (a.hot_pizza ? "hot-pizza" : "pissa")
                           : a.hira  ? "hira"
                           : a.loha  ? "loha"
                           : a.dora  ? "dora"

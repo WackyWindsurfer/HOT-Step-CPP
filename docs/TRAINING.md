@@ -62,9 +62,13 @@ top of the 16 GB f16 base — so flash is proven correct only on an F32-isolated
 2-layer slice, not the full model. Full per-frame numbers and fitting caveats:
 `.claude/skills/flash-attn-training/SKILL.md` §3/§7.
 
-### HOT-PiSSA — the MM3 default method (2026-09-06)
+### HOT-PiZZA — the MM3 default method (2026-09-06)
 
-`--hot-pissa` (both LM trainers; implies `--pissa`) is PiSSA with the
+HOT-PiZZA is PiSSA with principal-subspace dropout. It was called HOT-PiSSA on
+its first day; the engine still accepts `--hot-pissa` and reads the
+`hot-pissa` identity from that day's files.
+
+`--hot-pizza` (both LM trainers; implies `--pissa`) is PiSSA with the
 rank-dropout mask applied to the principal component itself rather than to
 the delta. The training forward is `y = W x + s (M B A) x - s (B0 A0) x`: every
 micro-step a random `--rank-dropout` share of the base's own top-r singular

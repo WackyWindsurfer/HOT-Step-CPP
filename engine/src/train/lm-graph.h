@@ -212,9 +212,9 @@ struct LmLora {
     // written back into the base (lm-pissa.h says why). Still a plain LoRA in
     // every other respect — same params, same optimizer, rank-2r export.
     bool  pissa          = false;
-    // HOT-PiSSA (2026-09-06): PiSSA whose rank-dropout mask is applied to the
+    // HOT-PiZZA (2026-09-06): PiSSA whose rank-dropout mask is applied to the
     // principal component itself rather than to the delta — see QwLoraPair.
-    bool  hot_pissa      = false;
+    bool  hot_pizza      = false;
     // Frozen A0/B0 held as F16 instead of F32 (2026-09-06): halves the 1.3 GB
     // the pair costs at r128 on MM3. The cancellation at init is then exact
     // only to f16 (~5e-4 relative on the top-r component); an ear test decides
@@ -238,7 +238,7 @@ struct LmLoraOpts {
     bool loha  = false;
     bool pissa = false;
     bool hra   = false;
-    bool hot_pissa = false;  // requires pissa; see QwLoraPair::hot_pissa
+    bool hot_pizza = false;  // requires pissa; see QwLoraPair::hot_pizza
     bool pissa_f16 = false;  // frozen A0/B0 in F16 (see LmLora::pissa_f16)
 };
 
@@ -414,7 +414,7 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
     L->hira     = lo.hira;
     L->loha     = lo.loha;
     L->pissa    = lo.pissa;
-    L->hot_pissa = lo.hot_pissa;
+    L->hot_pizza = lo.hot_pizza;
     L->pissa_f16 = lo.pissa_f16;
     L->hra      = lo.hra;
     L->model    = lm;
@@ -426,8 +426,8 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
         *err = "PiSSA is an initialisation for the plain LoRA parameterization only";
         return false;
     }
-    if (lo.hot_pissa && !lo.pissa) {
-        *err = "HOT-PiSSA is a masking mode of PiSSA; it needs the PiSSA init";
+    if (lo.hot_pizza && !lo.pissa) {
+        *err = "HOT-PiZZA is a masking mode of PiSSA; it needs the PiSSA init";
         return false;
     }
     if (lo.hra && (rank < 2 || (rank % 2) != 0)) {
@@ -520,7 +520,7 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
                 ggml_set_name(pr.B0, nm);
                 ggml_set_input(pr.A0);
                 ggml_set_input(pr.B0);
-                pr.hot_pissa = lo.hot_pissa;
+                pr.hot_pizza = lo.hot_pizza;
             }
         }
     }
@@ -638,7 +638,7 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
             : lo.dora ? "DoRA"
             : lo.hira ? "HiRA"
             : lo.loha ? "LoHa"
-            : lo.pissa ? (lo.hot_pissa ? "HOT-PiSSA-LoRA" : "PiSSA-LoRA")
+            : lo.pissa ? (lo.hot_pizza ? "HOT-PiZZA-LoRA" : "PiSSA-LoRA")
                        : "LoRA",
             layer_lo, layer_hi, rank,
             (double) alpha, n_par, (double) n_par * 4.0 / 1048576.0);
@@ -1153,7 +1153,7 @@ static ggml_tensor * lm_linear(ggml_context * ctx, ggml_tensor * w, const QwLora
                 // every other method on the same crop, gradient norms 100x, a
                 // run that never reached its target).
                 //
-                // HOT-PiSSA keeps exactly that forward ON PURPOSE: the mask
+                // HOT-PiZZA keeps exactly that forward ON PURPOSE: the mask
                 // stays off this branch, so training is W + s(M B A - B0 A0)
                 // — the principal subspace regularised by stochastic deletion
                 // while the album is fitted. Blind, twice, on alk3_crimson it
@@ -1168,7 +1168,7 @@ static ggml_tensor * lm_linear(ggml_context * ctx, ggml_tensor * w, const QwLora
                 ggml_tensor * A0 = pr->A0->type == GGML_TYPE_F32 ? pr->A0 : ggml_cast(ctx, pr->A0, GGML_TYPE_F32);
                 ggml_tensor * B0 = pr->B0->type == GGML_TYPE_F32 ? pr->B0 : ggml_cast(ctx, pr->B0, GGML_TYPE_F32);
                 ggml_tensor * t0 = ggml_mul_mat(ctx, A0, x);
-                if (opts.rank_mask && !pr->hot_pissa) {
+                if (opts.rank_mask && !pr->hot_pizza) {
                     t0 = ggml_mul(ctx, t0, opts.rank_mask);
                 }
                 t0 = ggml_scale(ctx, t0, pr->scale);

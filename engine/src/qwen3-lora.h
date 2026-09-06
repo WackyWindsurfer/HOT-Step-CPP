@@ -113,14 +113,15 @@ struct QwLoraPair {
     bool has_dora() const { return m && nrm; }
     bool has_loha() const { return A2 && B2; }
     bool has_pissa() const { return A0 && B0; }
-    // HOT-PiSSA (2026-09-06): the rank-dropout mask hits the trained principal
+    // HOT-PiZZA (2026-09-06; named HOT-PiSSA for its first day — PiSSA with
+    // principal-subspace dropout): the rank-dropout mask hits the trained principal
     // component B A but NOT the frozen -B0 A0 term, so under dropout the base's
     // own top-r subspace is stochastically deleted (and the rest scaled
     // 1/keep) every micro-step. Found by accident as a masking bug on
     // 2026-09-05; the adapter it produced beat every correctly-masked method
     // by ear on alk3_crimson twice, so it is kept on purpose behind this flag
     // (train/lm-graph.h says exactly what the forward is). Trainer-only.
-    bool                 hot_pissa = false;
+    bool                 hot_pizza = false;
 };
 
 // LoKr delta: y += kron(w1, w2) . x, contracted factor-by-factor so the full

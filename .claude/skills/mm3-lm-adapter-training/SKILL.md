@@ -170,9 +170,9 @@ BF16 is also the SOURCE dtype of the MM3 weights — but it is not better for
 inference than f16, which keeps all 7 of BF16's mantissa bits and adds 3 more.
 Render on q8_0 as always.
 
-### HOT-PiSSA is the default method since 2026-09-06 (Rob)
+### HOT-PiZZA is the default method since 2026-09-06 (Rob)
 
-`--hot-pissa` (implies `--pissa`): PiSSA with the rank-dropout mask on the
+`--hot-pizza` (implies `--pissa`): PiSSA with the rank-dropout mask on the
 principal component itself, so every micro-step a random `--rank-dropout`
 share of the base's top-128 subspace is deleted while the adapter fits the
 album. Found as a masking bug on 2026-09-05 (lm-graph.h masked one branch of
@@ -181,7 +181,7 @@ method twice (68 and 66.5 of 90; LoRA 60–64, DoRA 63, LoKr 41.5 with a drone
 failure; the CORRECTED PiSSA was worst at 39.5 with drone plans in half its
 renders). Tables: `_experiments/_LISTENING/2026-09-06-mm3-method-ab/alk3_crimson/`.
 Consequences for the recipe block above: `--adapter-type lora --rank 128
---alpha 128 --hot-pissa` replaces the LoKr line; **stop on steps (500 heard;
+--alpha 128 --hot-pizza` replaces the LoKr line; **stop on steps (500 heard;
 250/350 ladder pending), never on loss** — the perturbed forward keeps the
 trailing train loss at 2.7–5, so a loss target never binds. Plain LoRA is
 next in line; LoKr stays selectable. One album so far: the second-artist run
