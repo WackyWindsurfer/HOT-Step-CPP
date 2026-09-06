@@ -673,8 +673,8 @@ export interface TrainLmOptions {
   hira?: boolean;
   loha?: boolean;
   pissa?: boolean;
-  /** HOT-PiSSA: PiSSA with the rank mask on the principal component (implies pissa). */
-  hotPissa?: boolean;
+  /** HOT-PiZZA: PiSSA with the rank mask on the principal component (implies pissa). */
+  hotPizza?: boolean;
   hra?: boolean;
   /** LoRA+: B tensors at ratio x A's learning rate. 1 = off. AdamW-rule tensors only. */
   loraPlusRatio?: number;

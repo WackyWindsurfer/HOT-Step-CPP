@@ -537,7 +537,7 @@ export const MM3_LM_DEFAULTS = {
   steps: 500,
   /** ── Stopping strategy ──────────────────────────────────────────────────
    *
-   *  'steps', 500, since 2026-09-06 (Rob): the default method is HOT-PiSSA
+   *  'steps', 500, since 2026-09-06 (Rob): the default method is HOT-PiZZA
    *  (below), whose training loss reads high by construction — a random
    *  share of the base's principal subspace is deleted every micro-step, so
    *  the trailing mean never reaches a LoRA-style target and a loss stop
@@ -780,7 +780,7 @@ export const MM3_LM_DEFAULTS = {
    *  alk3_crimson (nine arms, three songs, everything locked but the method)
    *  it came last of the arms that rendered all three songs, with one drone
    *  failure, at 1.5x LoRA's step time. Plain LoRA is next in line after
-   *  HOT-PiSSA below; LoKr stays selectable. */
+   *  HOT-PiZZA below; LoKr stays selectable. */
   adapterType: 'lora' as 'lora' | 'lokr',
   lokrFactor: 6,
   lokrDim: 512,
@@ -900,7 +900,7 @@ export const MM3_LM_DEFAULTS = {
   dora: false,
   hira: false,
   loha: false,
-  /** HOT-PiSSA — the default MM3 method since 2026-09-06 (Rob).
+  /** HOT-PiZZA — the default MM3 method since 2026-09-06 (Rob).
    *
    *  PiSSA (A/B start on each weight's top-r singular directions, the
    *  residual frozen as -B0A0) with the rank-dropout mask applied to the
@@ -911,10 +911,10 @@ export const MM3_LM_DEFAULTS = {
    *  correctly-masked method by ear on alk3_crimson, twice (66.5-68/90 vs
    *  LoRA 60-64, DoRA 63, LoKr 41.5; corrected PiSSA 39.5 with drone plans).
    *  One album so far. The export is an ordinary rank-2r LoRA; loaders need
-   *  nothing. Train loss reads high under it — stop on steps. `hotPissa`
-   *  implies `pissa`; the engine flag is --hot-pissa. */
+   *  nothing. Train loss reads high under it — stop on steps. `hotPizza`
+   *  implies `pissa`; the engine flag is --hot-pizza. */
   pissa: true,
-  hotPissa: true,
+  hotPizza: true,
   /** SVD init cache (engine --pissa-cache-dir, lm-pissa.h): the PiSSA init is
    *  a pure function of the base file, rank, oversample, iters and layer
    *  range, so the factors are stored once per base under
@@ -1033,7 +1033,7 @@ export interface ResolvedMm3TrainLmOptions {
   loha: boolean;
   pissa: boolean;
   /** PiSSA with the mask on the principal component (implies pissa). */
-  hotPissa: boolean;
+  hotPizza: boolean;
   /** See MM3_LM_DEFAULTS.pissaCache / pissaFrozenF16. */
   pissaCache: boolean;
   pissaFrozenF16: boolean;
@@ -1167,7 +1167,7 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     // (ace-train.cpp) and the resume route refuses it before spawning; leaving
     // it on here means the illegal state fails loudly instead of quietly.
     if (o.pissa && !o.dora && !o.hira && !o.loha) {
-      args.push(o.hotPissa ? '--hot-pissa' : '--pissa');
+      args.push(o.hotPizza ? '--hot-pizza' : '--pissa');
       if (o.pissaCache) args.push('--pissa-cache-dir', path.join(config.aceServer.adapters, 'mm3-lm-adapters', '_pissa-init-cache'));
       if (o.pissaFrozenF16) args.push('--pissa-frozen-f16');
     }

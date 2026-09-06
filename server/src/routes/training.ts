@@ -2258,15 +2258,16 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       dora:   b.dora === true,
       hira:   b.hira === true,
       loha:   b.loha === true,
-      // hotPissa implies pissa (it is PiSSA with a different mask); a client
-      // that sends only hotPissa gets the init it needs rather than a 400.
+      // hotPizza implies pissa (it is PiSSA with a different mask); a client
+      // that sends only hotPizza gets the init it needs rather than a 400.
       // Both fall back to MM3_LM_DEFAULTS when ABSENT (unlike the other method
-      // booleans, which read absent as off): HOT-PiSSA is the default method,
+      // booleans, which read absent as off): HOT-PiZZA is the default method,
       // and a caller that posts no method at all must get the default, not a
       // plain LoRA. An explicit false still switches it off.
       pissa:  (b.pissa === undefined ? D.pissa : b.pissa === true)
-           || (b.hotPissa === undefined ? D.hotPissa : b.hotPissa === true),
-      hotPissa: b.hotPissa === undefined ? D.hotPissa : b.hotPissa === true,
+           || ((b.hotPizza ?? b.hotPissa) === undefined ? D.hotPizza : (b.hotPizza ?? b.hotPissa) === true),
+      // hotPissa: the method's first-day name, still read as an alias.
+      hotPizza: (b.hotPizza ?? b.hotPissa) === undefined ? D.hotPizza : (b.hotPizza ?? b.hotPissa) === true,
       pissaCache: b.pissaCache === undefined ? D.pissaCache : b.pissaCache === true,
       pissaFrozenF16: b.pissaFrozenF16 === true,
       hra:    b.hra === true,
@@ -3143,8 +3144,8 @@ router.post('/datasets/:id/train-lm', async (req: Request, res: Response) => {
       dora: body.dora === true,
       hira: body.hira === true,
       loha: body.loha === true,
-      pissa: body.pissa === true || body.hotPissa === true,
-      hotPissa: body.hotPissa === true,
+      pissa: body.pissa === true || body.hotPizza === true || (body as { hotPissa?: boolean }).hotPissa === true,
+      hotPizza: body.hotPizza === true || (body as { hotPissa?: boolean }).hotPissa === true,   // first-day name, still read
       hra: body.hra === true,
       loraPlusRatio: numOpt(body.loraPlusRatio, 1),
       // Soft prompt: the name becomes a safetensors key, so keep it to a slug.

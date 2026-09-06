@@ -367,8 +367,8 @@ export interface ResolvedTrainLmOptions {
   hira?: boolean;
   loha?: boolean;
   pissa?: boolean;
-  /** HOT-PiSSA: PiSSA with the rank mask on the principal component (implies pissa). */
-  hotPissa?: boolean;
+  /** HOT-PiZZA: PiSSA with the rank mask on the principal component (implies pissa). */
+  hotPizza?: boolean;
   hra?: boolean;
   /** Soft prompt: '' = no token. Emitted on every leg; the engine adopts the
    *  trained token/prefix from --init-adapter on a resume. */
@@ -445,7 +445,7 @@ export function buildTrainLmArgs(input: {
     ...(o.rslora && o.adapterType === 'lora' ? ['--rslora'] : []),
     ...(o.hira && o.adapterType === 'lora' && !o.dora ? ['--hira'] : []),
     ...(o.loha && o.adapterType === 'lora' && !o.dora && !o.hira ? ['--loha'] : []),
-    ...(o.pissa && o.adapterType === 'lora' && !o.dora && !o.hira && !o.loha && !o.initAdapter ? [o.hotPissa ? '--hot-pissa' : '--pissa'] : []),
+    ...(o.pissa && o.adapterType === 'lora' && !o.dora && !o.hira && !o.loha && !o.initAdapter ? [o.hotPizza ? '--hot-pizza' : '--pissa'] : []),
     ...(o.hra && o.adapterType === 'lora' && !o.dora && !o.hira && !o.loha && !o.pissa && !o.rslora ? ['--hra'] : []),
     ...(o.loraPlusRatio && o.loraPlusRatio !== 1 ? ['--lora-plus-ratio', String(o.loraPlusRatio)] : []),
     // Always emitted so an ace-train that predates --optimizer rejects it loudly
