@@ -853,7 +853,7 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
     if (attn_flash) {
         const float ascale = 1.0f / sqrtf((float) c.head_dim);
         bool        pf = false, pb = false;
-        dit_flash_probe(lm.backend, c.head_dim, c.n_heads, c.n_kv_heads, alloc_seq, alloc_seq, /*B=*/1, ascale, &pf,
+        dit_flash_probe(lm.backend, c.head_dim, c.n_heads, c.n_kv_heads, alloc_seq, alloc_seq + a.prefix_n, /*B=*/1, ascale, &pf,
                         &pb);
         if (!(pf && pb)) {
             char extra[224];
@@ -1009,10 +1009,8 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
     // F16 under flash — the fused op asserts an F16 contiguous mask. Same flat
     // [S_max*S_max] layout either way, so every view below is unchanged apart
     // from sizing its row stride with ggml_element_size().
-    if (a.prefix_n > 0 && attn_flash) {
-        lm_fatal("args", "--prefix-n needs --attn exact: S_kv != S is outside what the flash probe covers");
-        return 1;
-    }
+    // --prefix-n under flash: S_kv = n + S is a shape the fused op takes; the
+    // probe below is asked at that width (2026-09-06).
     // A trainable prefix widens the mask to [n + S, S]; the flat buffer is sized for it.
     ggml_tensor * t_msk = lm_mask_alloc(ctx_static, (int64_t) (alloc_seq + a.prefix_n) * alloc_seq, attn_flash);
     // The [V, s_tr_max] label buffer is a naive-path structure: 1,184 MiB at

@@ -1999,20 +1999,18 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     // never built.
     const bool      attn_flash    = (a.attn == "flash" || a.attn == "flash-f32");
     const ggml_prec attn_prec_req = (a.attn == "flash-f32") ? GGML_PREC_F32 : GGML_PREC_DEFAULT;
-    // Belt to the CLI's braces (cmd_mm3_lm_train exits 2 on this pair). A frozen
-    // KV prefix makes the mask rectangular, which lm_build_trunk_embeds asserts
-    // against under flash and the probe above does not cover.
-    if (attn_flash && a.prefix_frames > 0) {
-        fprintf(stderr, "[mm3-lm-train] --attn %s cannot be combined with --prefix-frames %lld\n",
-                a.attn.c_str(), (long long) a.prefix_frames);
-        jl("{\"type\":\"fatal\",\"message\":\"--attn flash cannot be combined with --prefix-frames\"}");
-        mm3_train_lm_free(&t);
-        return 1;
-    }
+    // A frozen KV prefix makes the attention rectangular: S_kv = n_pfx + S,
+    // with the prompt's stored columns in front of the history. Until
+    // 2026-09-06 this pair was refused; the fused op always took the shape
+    // (mask [S_kv, >= S]), what was missing was probing the backend at the
+    // real key length and giving the prefill an F16 mask. This is where flash
+    // pays on MM3: at crop 750 the shipped recipe attends over ~6000 columns,
+    // and the exact path materialises every [S, S_kv] score matrix.
+    const int64_t S_kv_max = (a.prefix_frames > 0 ? max_prompt + a.prefix_frames : 0) + S_max;
     if (attn_flash) {
         const float ascale = 1.0f / sqrtf((float) c.head_dim);
         bool        pf = false, pb = false;
-        dit_flash_probe(t.lm.backend, c.head_dim, c.n_heads, c.n_kv_heads, (int) S_max, (int) S_max, /*B=*/1,
+        dit_flash_probe(t.lm.backend, c.head_dim, c.n_heads, c.n_kv_heads, (int) S_max, (int) S_kv_max, /*B=*/1,
                         ascale, &pf, &pb);
         if (!(pf && pb)) {
             fprintf(stderr,
@@ -2021,7 +2019,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                     "start: the scheduler would silently run them on the CPU instead, which is correct, "
                     "unusably slow, and looks like a pass on every number this run reports. Use --attn exact.\n",
                     a.attn.c_str(), ggml_backend_name(t.lm.backend), c.head_dim, c.n_heads, c.n_kv_heads,
-                    (long long) S_max, (long long) S_max, pf ? "yes" : "NO", pb ? "yes" : "NO");
+                    (long long) S_max, (long long) S_kv_max, pf ? "yes" : "NO", pb ? "yes" : "NO");
             jl("{\"type\":\"fatal\",\"message\":\"--attn %s unsupported by %s at D %d Nh %d Nkv %d S %lld\"}",
                a.attn.c_str(), ggml_backend_name(t.lm.backend), c.head_dim, c.n_heads, c.n_kv_heads,
                (long long) S_max);
@@ -2030,10 +2028,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         }
         fprintf(stderr,
                 "[mm3-lm-train] --attn %s: %s supports FLASH_ATTN_TRAIN and FLASH_ATTN_TRAIN_BACK at D %d, "
-                "Nh %d, Nkv %d, S %lld, B 1 — no CPU split. Requested arithmetic: %s (the backend resolves it "
-                "per launch; the attn event after step 1 records what actually ran)\n",
+                "Nh %d, Nkv %d, S %lld, S_kv %lld, B 1 — no CPU split. Requested arithmetic: %s (the backend "
+                "resolves it per launch; the attn event after step 1 records what actually ran)\n",
                 a.attn.c_str(), ggml_backend_name(t.lm.backend), c.head_dim, c.n_heads, c.n_kv_heads,
-                (long long) S_max, attn_prec_req == GGML_PREC_F32 ? "strict f32" : "tf32 where available");
+                (long long) S_max, (long long) S_kv_max,
+                attn_prec_req == GGML_PREC_F32 ? "strict f32" : "tf32 where available");
     }
     // The REQUESTED arithmetic. GGML_PREC_DEFAULT is 0, which is also what a
     // zero-initialised op_params gives, and on sm_80+ it resolves to the TF32
@@ -2469,7 +2468,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             mm3_train_lm_free(&t);
             return 1;
         }
-        if (kv_on && !lm_kvprefix_alloc(&kvpfx, &t.lm, 0, c.n_layers, PFX_Q, S_max, a.prefix_chunk, &err)) {
+        if (kv_on && !lm_kvprefix_alloc(&kvpfx, &t.lm, 0, c.n_layers, PFX_Q, S_max, a.prefix_chunk, &err, attn_flash)) {
             fprintf(stderr, "[mm3-lm-train] kv prefix setup failed: %s\n", err.c_str());
             lm_lora_detach(&lora, &t.lm);
             lm_lora_free(&lora);

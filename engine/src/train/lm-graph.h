@@ -1402,7 +1402,11 @@ static ggml_tensor * lm_train_layer(ggml_context * ctx, const Qwen3LMConfig & c,
         attn = lm_attn_head_blocked(ctx, c, ly, q, k, v, positions, mask, S, opts);
     } else {
         GGML_ASSERT(!(opts.kv_k && opts.pfx_k) && "frozen and trainable KV prefixes are mutually exclusive");
-        GGML_ASSERT(!(opts.pfx_k && opts.attn_flash) && "trainable prefix: S_kv != S is outside the flash probe");
+        // A prefix (frozen kv_k or trainable pfx_k) makes S_kv = n_pfx + S. The
+        // fused op takes that shape as it is (mask [S_kv, >= S]), and since
+        // 2026-09-06 both trainers probe the backend at the real S_kv, so the
+        // flash arm below is fed the spliced k/v and the rectangular mask like
+        // the exact arm. Before that this line asserted the pair away.
         const int64_t n_pfx = opts.kv_k ? (int64_t) opts.kv_pfx : (opts.pfx_k ? (int64_t) opts.pfx_n : 0);
         const int64_t n_kv  = n_pfx + S;
 

@@ -2008,15 +2008,8 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
     // lm_build_trunk_embeds' flash arm accepts — it carries a GGML_ASSERT on the
     // pair. Caught here, before the model load, rather than as an assert forty
     // minutes into a run.
-    if (a.attn != "exact" && a.prefix_frames > 0) {
-        fprintf(stderr,
-                "ace-train mm3-lm-train: --attn %s cannot be combined with --prefix-frames %lld.\n"
-                "  A frozen KV prefix makes the attention mask rectangular (S_kv = n_pfx + S), which is\n"
-                "  outside both the fused-op capability probe and the flash arm of the trunk builder.\n"
-                "  Drop --prefix-frames (or pass 0), or use --attn exact.\n",
-                a.attn.c_str(), (long long) a.prefix_frames);
-        return 2;
-    }
+    // --attn flash with --prefix-frames was refused until 2026-09-06; the trainer now probes the
+    // backend at S_kv = n_pfx + S and runs the fused op on the spliced K/V. Nothing to brace here.
     if (fd_probes > 0) {
         // The gate needs a rank small enough that the NAIVE graph fits beside
         // the checkpointed one; --rank still overrides if asked.
@@ -2051,13 +2044,7 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
                 a.prefix_n, (long long) a.prefix_frames);
         return 2;
     }
-    if (a.prefix_n > 0 && a.attn != "exact") {
-        fprintf(stderr,
-                "ace-train mm3-lm-train: --attn %s cannot be combined with --prefix-n %d — the mask is\n"
-                "  rectangular (S_kv = n + S), which the fused-op probe does not cover. Use --attn exact.\n",
-                a.attn.c_str(), a.prefix_n);
-        return 2;
-    }
+    // --prefix-n under flash: same rectangle as --prefix-frames, same probe (2026-09-06).
     // Prior preservation captures the base's distributions BEFORE the first
     // step, with the adapter still inert. A prefix is not inert: it is
     // initialised at sigma 0.02 and is in the graph from node one, so the

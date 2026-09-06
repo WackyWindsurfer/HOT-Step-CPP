@@ -111,7 +111,7 @@ static size_t lm_kvprefix_bytes(const Qwen3LMConfig & c, int layer_lo, int layer
 }
 
 static bool lm_kvprefix_alloc(LmKvPrefix * st, Qwen3LM * lm, int layer_lo, int layer_hi, int64_t q_max,
-                              int64_t s_max, int chunk, std::string * err) {
+                              int64_t s_max, int chunk, std::string * err, bool flash_mask = false) {
     const Qwen3LMConfig & c = lm->cfg;
     if (q_max <= 0 || s_max <= 0 || chunk <= 0) {
         *err = "invalid KV-prefix configuration (q_max / s_max / chunk)";
@@ -163,7 +163,10 @@ static bool lm_kvprefix_alloc(LmKvPrefix * st, Qwen3LM * lm, int layer_lo, int l
         }
     }
     st->t_pos = ggml_new_tensor_1d(st->ctx, GGML_TYPE_I32, chunk);
-    st->t_msk = ggml_new_tensor_1d(st->ctx, GGML_TYPE_F32, st->msk_cap);
+    // F32 under --attn exact (byte-identical to the shipped allocation), F16
+    // under flash: the prefill chunks run the same fused op as the window
+    // (lm_ckpt_layer_opts carries attn_flash), and it asserts an F16 mask.
+    st->t_msk = lm_mask_alloc(st->ctx, st->msk_cap, flash_mask);
     ggml_set_name(st->t_pos, "kvpfx.pos");
     ggml_set_name(st->t_msk, "kvpfx.mask");
     ggml_set_input(st->t_pos);
@@ -226,7 +229,7 @@ static bool lm_kvprefix_run(LmKvPrefix * st, Qwen3LM * lm, ggml_backend_sched_t 
         // its own past. pfx_lo 0 / n_prompt 0 — the prompt is part of the
         // stream here, and only the WINDOW has to skip it.
         lm_causal_mask_prefix((int) i0, 0, (int) n, 0, &st->msk_scratch);
-        ggml_backend_tensor_set(st->t_msk, st->msk_scratch.data(), 0, st->msk_scratch.size() * sizeof(float));
+        lm_mask_set(st->t_msk, st->msk_scratch);   // converts to F16 when the buffer is F16 (--attn flash)
 
         // ── graph A: embedding + every layer, capturing K/V into staging ──
         {
@@ -235,7 +238,7 @@ static bool lm_kvprefix_run(LmKvPrefix * st, Qwen3LM * lm, ggml_backend_sched_t 
             ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 8192, /*grads=*/false);
 
             ggml_tensor * pv = ggml_view_1d(ctx, st->t_pos, n, 0);
-            ggml_tensor * mv = ggml_view_2d(ctx, st->t_msk, i0 + n, n, (size_t) (i0 + n) * sizeof(float), 0);
+            ggml_tensor * mv = ggml_view_2d(ctx, st->t_msk, i0 + n, n, (size_t) (i0 + n) * ggml_element_size(st->t_msk), 0);
             ggml_tensor * h  = embed(ctx, user, i0, n);
             if (!h) {
                 ggml_free(ctx);
