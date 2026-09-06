@@ -915,6 +915,17 @@ export const MM3_LM_DEFAULTS = {
    *  implies `pissa`; the engine flag is --hot-pissa. */
   pissa: true,
   hotPissa: true,
+  /** SVD init cache (engine --pissa-cache-dir, lm-pissa.h): the PiSSA init is
+   *  a pure function of the base file, rank, oversample, iters and layer
+   *  range, so the factors are stored once per base under
+   *  <adapters>/mm3-lm-adapters/_pissa-init-cache/ and every later run at the
+   *  same rank uploads the identical bytes instead of recomputing 252 SVDs.
+   *  Bit-exact by construction; off only for a deliberate recompute. */
+  pissaCache: true,
+  /** Hold the frozen A0/B0 pair in F16 (engine --pissa-frozen-f16): halves the
+   *  ~1.3 GB it costs at r128. The init then cancels to f16 precision rather
+   *  than exactly. UNHEARD — off until the ear test says it is free. */
+  pissaFrozenF16: false,
   hra: false,
   /** LoRA+'s B-side learning-rate multiplier. 1 = off (paper default 16). */
   loraPlusRatio: 1,
@@ -1023,6 +1034,9 @@ export interface ResolvedMm3TrainLmOptions {
   pissa: boolean;
   /** PiSSA with the mask on the principal component (implies pissa). */
   hotPissa: boolean;
+  /** See MM3_LM_DEFAULTS.pissaCache / pissaFrozenF16. */
+  pissaCache: boolean;
+  pissaFrozenF16: boolean;
   hra: boolean;
   loraPlusRatio: number;
   /** Soft prompt. '' = no token. See MM3_LM_DEFAULTS.artistToken. */
@@ -1152,7 +1166,11 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     // different function from step 1. The engine refuses the pair outright
     // (ace-train.cpp) and the resume route refuses it before spawning; leaving
     // it on here means the illegal state fails loudly instead of quietly.
-    if (o.pissa && !o.dora && !o.hira && !o.loha) args.push(o.hotPissa ? '--hot-pissa' : '--pissa');
+    if (o.pissa && !o.dora && !o.hira && !o.loha) {
+      args.push(o.hotPissa ? '--hot-pissa' : '--pissa');
+      if (o.pissaCache) args.push('--pissa-cache-dir', path.join(config.aceServer.adapters, 'mm3-lm-adapters', '_pissa-init-cache'));
+      if (o.pissaFrozenF16) args.push('--pissa-frozen-f16');
+    }
     // rslora is in the guard because the engine refuses --hra --rslora, but the
     // routes refuse that pair with a 400 first: HRA has no B for a rank-scaling
     // rule to apply to, so silently dropping it here would train a plain rsLoRA

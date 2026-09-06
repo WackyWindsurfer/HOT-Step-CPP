@@ -2197,14 +2197,12 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
     const cropAnchorResolved: 'song' | 'zero' = b.cropAnchor === 'zero' ? 'zero' : 'song';
     const framesWillBeEmitted = prefixFramesResolved > 0 && cropAnchorResolved === 'song'
                                 && prefixNResolved === 0;
-    let attnBackendResolved: 'exact' | 'flash' = b.attnBackend === 'flash' ? 'flash' : D.attnBackend;
-    if ((framesWillBeEmitted || prefixNResolved > 0) && attnBackendResolved !== 'exact') {
-      console.log(`[Training] mm3-train-lm: attnBackend ${attnBackendResolved} -> exact `
-                 + `(prefixFrames=${framesWillBeEmitted ? prefixFramesResolved : 0}, `
-                 + `prefixN=${prefixNResolved} — either one makes the `
-                 + 'attention mask rectangular, which the engine refuses under flash)');
-      attnBackendResolved = 'exact';
-    }
+    // Since 7070238e (2026-09-06) the engine composes --attn flash with either
+    // prefix: it probes the fused op at S_kv = n_pfx + S and runs it on the
+    // spliced K/V. The coercion to exact that lived here is gone; an engine
+    // that predates it still exits 2 on the pair, loudly.
+    const attnBackendResolved: 'exact' | 'flash' = b.attnBackend === 'flash' ? 'flash' : D.attnBackend;
+    void framesWillBeEmitted;
     // The engine refuses a trainable prefix together with prior preservation
     // (the prior capture needs an inert model, and a prefix is non-zero from
     // initialisation) — exit 2 after the base load. Say so here instead, since
@@ -2269,6 +2267,8 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       pissa:  (b.pissa === undefined ? D.pissa : b.pissa === true)
            || (b.hotPissa === undefined ? D.hotPissa : b.hotPissa === true),
       hotPissa: b.hotPissa === undefined ? D.hotPissa : b.hotPissa === true,
+      pissaCache: b.pissaCache === undefined ? D.pissaCache : b.pissaCache === true,
+      pissaFrozenF16: b.pissaFrozenF16 === true,
       hra:    b.hra === true,
       loraPlusRatio: num('loraPlusRatio', D.loraPlusRatio, 1, 64),
       artistToken:   artistTokenResolved,

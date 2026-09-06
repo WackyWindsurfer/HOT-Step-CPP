@@ -428,6 +428,8 @@ function optionsFromLog(dir: string, facts: LogFacts): ResolvedMm3TrainLmOptions
     loha: facts.adapterKinds.has('loha'),
     pissa: facts.adapterKinds.has('pissa') || facts.adapterKinds.has('hot-pissa'),
     hotPissa: facts.adapterKinds.has('hot-pissa'),
+    pissaCache: D.pissaCache,
+    pissaFrozenF16: false,
     hra: facts.adapterKinds.has('hra'),
     loraPlusRatio: D.loraPlusRatio,
     artistToken: '',
