@@ -68,6 +68,7 @@ interface FormState {
   hira: boolean;
   loha: boolean;
   pissa: boolean;
+  hotPissa: boolean;
   hra: boolean;
   loraPlusRatio: number;
   /** Soft prompt (a token + a TRAINABLE prefix, both new to MM3). Distinct
@@ -201,6 +202,7 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
     hira: status.defaults.hira ?? false,
     loha: status.defaults.loha ?? false,
     pissa: status.defaults.pissa ?? false,
+    hotPissa: status.defaults.hotPissa ?? false,
     hra: status.defaults.hra ?? false,
     loraPlusRatio: status.defaults.loraPlusRatio ?? 1,
     artistTokenOn: !!status.defaults.artistToken,
@@ -310,6 +312,7 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
       adapterType: 'lora',
       dora: m === 'dora', hira: m === 'hira', loha: m === 'loha', hra: m === 'hra',
       pissa: m === 'lora' ? form.pissa : false,
+      hotPissa: m === 'lora' ? form.hotPissa : false,
       rslora: m === 'hra' ? false : form.rslora,
     }));
   };
@@ -389,7 +392,7 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
         ...(form.adapterType === 'lora' && form.loha ? { loha: true } : {}),
         ...(form.adapterType === 'lora' && form.rslora ? { rslora: true } : {}),
         ...(form.adapterType === 'lora' && form.pissa && !form.dora && !form.hira && !form.loha
-          ? { pissa: true } : {}),
+          ? { pissa: true, ...(form.hotPissa ? { hotPissa: true } : {}) } : {}),
         ...(form.adapterType === 'lora' && form.hra && !form.dora && !form.hira && !form.loha && !form.pissa
           ? { hra: true } : {}),
         ...(form.adapterType === 'lora' && form.loraPlusRatio !== 1 ? { loraPlusRatio: form.loraPlusRatio } : {}),
@@ -902,9 +905,16 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                   </span>
                   {method !== 'lokr' && (
                     <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-zinc-200 dark:border-white/5 px-3 py-2 mt-1">
-                      <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+                      <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300"
+                        title={t('trainingStudio.mm3.hotPissaInfo')}>
+                        <input type="checkbox" checked={form.pissa && form.hotPissa} disabled={method !== 'lora'} className="accent-amber-500"
+                          onChange={e => setEdits(prev => ({ ...prev, hotPissa: e.target.checked, ...(e.target.checked ? { pissa: true } : {}) }))} />
+                        {t('trainingStudio.mm3.hotPissa', 'HOT-PiSSA')}
+                      </label>
+                      <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300"
+                        title={t('trainingStudio.mm3.pissaInfo')}>
                         <input type="checkbox" checked={form.pissa} disabled={method !== 'lora'} className="accent-amber-500"
-                          onChange={e => set('pissa', e.target.checked)} />
+                          onChange={e => setEdits(prev => ({ ...prev, pissa: e.target.checked, ...(e.target.checked ? {} : { hotPissa: false }) }))} />
                         {t('trainingStudio.mm3.pissa', 'PiSSA init')}
                       </label>
                       <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">

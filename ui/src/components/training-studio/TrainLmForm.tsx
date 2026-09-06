@@ -84,6 +84,7 @@ export interface TrainLmFormState {
   hira: boolean;
   loha: boolean;
   pissa: boolean;
+  hotPissa: boolean;
   hra: boolean;
   loraPlusRatio: number;
   artistTokenOn: boolean;    // default on (Rob, 2026-09-04: arm 05 by ear)
@@ -231,6 +232,7 @@ export const TRAIN_LM_DEFAULTS: TrainLmFormState = {
   hira: false,
   loha: false,
   pissa: false,
+  hotPissa: false,
   hra: false,
   loraPlusRatio: 1,
   // ON by default, named after the adapter. k=32 / lr 5e-3 / prefix 8 is the
@@ -365,6 +367,7 @@ export const TrainLmForm: React.FC<Props> = ({
       adapterType: 'lora',
       dora: m === 'dora', hira: m === 'hira', loha: m === 'loha', hra: m === 'hra',
       pissa: m === 'lora' ? value.pissa : false,
+      hotPissa: m === 'lora' ? value.hotPissa : false,
       rslora: m === 'hra' ? false : value.rslora,
     });
   };
@@ -741,9 +744,16 @@ export const TrainLmForm: React.FC<Props> = ({
               LmMethod). */}
           {value.adapterType === 'lora' && (
             <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-zinc-200 dark:border-white/5 px-3 py-2">
-              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300"
+                title={t('trainingStudio.train.lm.hotPissaInfo')}>
+                <input type="checkbox" checked={value.pissa && value.hotPissa} disabled={lock || method !== 'lora'} className="accent-amber-500"
+                  onChange={(e) => onChange(e.target.checked ? { hotPissa: true, pissa: true } : { hotPissa: false })} />
+                {P('lm.hotPissa', method === 'lora' ? 'MM3 default; unheard here' : 'Plain LoRA only', CHECK_LABEL)}
+              </label>
+              <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300"
+                title={t('trainingStudio.train.lm.pissaInfo')}>
                 <input type="checkbox" checked={value.pissa} disabled={lock || method !== 'lora'} className="accent-amber-500"
-                  onChange={(e) => onChange({ pissa: e.target.checked })} />
+                  onChange={(e) => onChange(e.target.checked ? { pissa: true } : { pissa: false, hotPissa: false })} />
                 {P('lm.pissa', method === 'lora' ? 'Default off' : 'Plain LoRA only', CHECK_LABEL)}
               </label>
               <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">

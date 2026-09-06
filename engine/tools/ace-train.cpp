@@ -541,6 +541,13 @@ static void print_usage(void) {
             "                                            than written into the base. Exports a plain\n"
             "                                            rank-2r LoRA, which this engine CAN load. Plain\n"
             "                                            LoRA only; not resumable.\n"
+            "    --hot-pissa                             HOT-PiSSA: PiSSA whose rank-dropout mask hits the\n"
+            "                                            principal component itself, not the delta, so a\n"
+            "                                            random --rank-dropout share of the base's top-r\n"
+            "                                            subspace is deleted every micro-step while the\n"
+            "                                            album is fitted. Implies --pissa; same export.\n"
+            "                                            Won the 2026-09-06 MM3 blind tests. Train loss\n"
+            "                                            reads high under it: stop on steps, not loss.\n"
             "    --pissa-oversample <n>      8           extra SVD columns beyond the rank.\n"
             "    --pissa-iters <n>           2           power iterations (0-4).\n"
             "    --hra                                   HRA: --rank (even) Householder reflections on\n"
@@ -717,6 +724,10 @@ static void print_usage(void) {
             "                                            directions (GPU randomized SVD), base keeps the\n"
             "                                            residual. Exports a rank-2r plain LoRA. Plain LoRA\n"
             "                                            only; not resumable.\n"
+            "    --hot-pissa                             HOT-PiSSA: PiSSA with the rank-dropout mask on the\n"
+            "                                            principal component itself (implies --pissa; same\n"
+            "                                            export). MM3's winning recipe 2026-09-06; not yet\n"
+            "                                            heard on the AS1.5 LM. Stop on steps, not loss.\n"
             "    --pissa-oversample <n>      8           extra SVD columns beyond the rank.\n"
             "    --pissa-iters <n>           2           power iterations (0-4).\n"
             "    --loha                                  LoHa (LyCORIS): W + (B1A1) (.) (B2A2). Two LoRA\n"
@@ -1883,6 +1894,7 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--hira"))              a.hira         = true;
         else if (!strcmp(argv[i], "--loha"))              a.loha         = true;
         else if (!strcmp(argv[i], "--pissa"))             a.pissa        = true;
+        else if (!strcmp(argv[i], "--hot-pissa"))         { a.pissa = true; a.hot_pissa = true; }
         else if (!strcmp(argv[i], "--pissa-oversample"))  a.pissa_oversample = atoi(next("--pissa-oversample"));
         else if (!strcmp(argv[i], "--pissa-iters"))       a.pissa_iters  = atoi(next("--pissa-iters"));
         else if (!strcmp(argv[i], "--hra"))               a.hra          = true;
@@ -4109,6 +4121,7 @@ static int cmd_train_lm(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--loha")) { a.loha = true; saw.method = true; }
         else if (!strcmp(argv[i], "--hra")) { a.hra = true; saw.method = true; }
         else if (!strcmp(argv[i], "--pissa")) a.pissa = true;
+        else if (!strcmp(argv[i], "--hot-pissa")) { a.pissa = true; a.hot_pissa = true; }
         else if (!strcmp(argv[i], "--pissa-oversample") && i + 1 < argc) a.pissa_oversample = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pissa-iters") && i + 1 < argc) a.pissa_iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lora-plus-ratio") && i + 1 < argc) a.lora_plus_ratio = (float) atof(argv[++i]);

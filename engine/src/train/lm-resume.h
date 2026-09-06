@@ -368,7 +368,7 @@ static bool lm_resume_prepare(ArgsT * a, const LmResumeExplicit & saw, LmResumeS
     // from — and re-running the init on a run in progress would move the base
     // the trained factors were fitted against. Refuse rather than resume into a
     // silently different adapter.
-    if (src->method == "pissa") {
+    if (src->method == "pissa" || src->method == "hot-pissa") {
         *errbuf = "--init-adapter " + a->init_adapter +
                   " was trained with --pissa, which cannot be resumed: the rank-2r export has already folded the "
                   "init factors into the delta, and re-deriving them would move the residual the trained factors "

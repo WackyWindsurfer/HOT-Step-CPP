@@ -262,6 +262,7 @@ export interface Mm3TrainLmRequest {
   hira?: boolean;
   loha?: boolean;
   pissa?: boolean;
+  hotPissa?: boolean;              // PiSSA with the rank mask on the principal component (implies pissa)
   hra?: boolean;
   loraPlusRatio?: number;
   /** Soft prompt. '' or absent = no token. */
@@ -773,7 +774,8 @@ export interface TrainDitOptions {
   rslora?: boolean;
   hira?: boolean;
   loha?: boolean;
-  pissa?: boolean;                 // principal-direction init; plain LoRA only
+  pissa?: boolean;
+  hotPissa?: boolean;              // PiSSA with the rank mask on the principal component (implies pissa)                 // principal-direction init; plain LoRA only
   hra?: boolean;                   // Householder reflections; rank must be even
   loraPlusRatio?: number;          // 1 = off
   layers?: number;                 // default 0 = auto (top-K depth)

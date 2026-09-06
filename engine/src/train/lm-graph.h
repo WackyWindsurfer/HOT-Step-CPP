@@ -212,6 +212,9 @@ struct LmLora {
     // written back into the base (lm-pissa.h says why). Still a plain LoRA in
     // every other respect — same params, same optimizer, rank-2r export.
     bool  pissa          = false;
+    // HOT-PiSSA (2026-09-06): PiSSA whose rank-dropout mask is applied to the
+    // principal component itself rather than to the delta — see QwLoraPair.
+    bool  hot_pissa      = false;
     // HRA (2026-09-05): `rank` Householder reflections on each site's INPUT.
     // A holds the vectors, B is null, so nothing downstream that keys off
     // `pr.B` fires. Exact rank-r LoRA on export (lm-hra.h).
@@ -230,6 +233,7 @@ struct LmLoraOpts {
     bool loha  = false;
     bool pissa = false;
     bool hra   = false;
+    bool hot_pissa = false;  // requires pissa; see QwLoraPair::hot_pissa
 };
 
 // rsLoRA: switch a freshly initialised LoRA to alpha/sqrt(r). Every pair
@@ -404,6 +408,7 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
     L->hira     = lo.hira;
     L->loha     = lo.loha;
     L->pissa    = lo.pissa;
+    L->hot_pissa = lo.hot_pissa;
     L->hra      = lo.hra;
     L->model    = lm;
     if ((int) lo.dora + (int) lo.hira + (int) lo.loha + (int) lo.hra > 1) {
@@ -412,6 +417,10 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
     }
     if (lo.pissa && (lo.dora || lo.hira || lo.loha || lo.hra)) {
         *err = "PiSSA is an initialisation for the plain LoRA parameterization only";
+        return false;
+    }
+    if (lo.hot_pissa && !lo.pissa) {
+        *err = "HOT-PiSSA is a masking mode of PiSSA; it needs the PiSSA init";
         return false;
     }
     if (lo.hra && (rank < 2 || (rank % 2) != 0)) {
@@ -503,6 +512,7 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
                 ggml_set_name(pr.B0, nm);
                 ggml_set_input(pr.A0);
                 ggml_set_input(pr.B0);
+                pr.hot_pissa = lo.hot_pissa;
             }
         }
     }
@@ -615,7 +625,7 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
             : lo.dora ? "DoRA"
             : lo.hira ? "HiRA"
             : lo.loha ? "LoHa"
-            : lo.pissa ? "PiSSA-LoRA"
+            : lo.pissa ? (lo.hot_pissa ? "HOT-PiSSA-LoRA" : "PiSSA-LoRA")
                        : "LoRA",
             layer_lo, layer_hi, rank,
             (double) alpha, n_par, (double) n_par * 4.0 / 1048576.0);
@@ -1121,15 +1131,24 @@ static ggml_tensor * lm_linear(ggml_context * ctx, ggml_tensor * w, const QwLora
                 // (y + z) - z, which rounds, and step 0 would perturb the base by
                 // one ulp of the adapter's own output at every site.
                 //
-                // The rank mask goes on THIS branch too, identically. Until
-                // 2026-09-06 it did not, and under --rank-dropout the two
-                // branches stopped cancelling: step 0 was W + s B0 (M - I) A0,
-                // a random tenth of the base's principal subspace deleted and
-                // the rest scaled 1/keep, at every site, every micro-step.
-                // Step-1 loss 3.92 vs 3.32 for every other method on the same
-                // crop, gradient norms 100x, and a run that never converged.
+                // The rank mask goes on THIS branch too, identically, for
+                // plain PiSSA. Until 2026-09-06 it did not, and under
+                // --rank-dropout the two branches stopped cancelling: step 0
+                // was W + s B0 (M - I) A0, a random tenth of the base's
+                // principal subspace deleted and the rest scaled 1/keep, at
+                // every site, every micro-step (step-1 loss 3.92 vs 3.32 for
+                // every other method on the same crop, gradient norms 100x, a
+                // run that never reached its target).
+                //
+                // HOT-PiSSA keeps exactly that forward ON PURPOSE: the mask
+                // stays off this branch, so training is W + s(M B A - B0 A0)
+                // — the principal subspace regularised by stochastic deletion
+                // while the album is fitted. Blind, twice, on alk3_crimson it
+                // beat plain PiSSA (which broke plans), LoRA, DoRA, rsLoRA,
+                // LoRA+ and LoKr. The export is the same rank-2r LoRA either
+                // way; nothing at load time can tell the two apart.
                 ggml_tensor * t0 = ggml_mul_mat(ctx, pr->A0, x);
-                if (opts.rank_mask) {
+                if (opts.rank_mask && !pr->hot_pissa) {
                     t0 = ggml_mul(ctx, t0, opts.rank_mask);
                 }
                 t0 = ggml_scale(ctx, t0, pr->scale);

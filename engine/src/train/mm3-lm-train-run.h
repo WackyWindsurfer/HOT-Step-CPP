@@ -330,6 +330,10 @@ struct MM3LmTrainArgs {
     bool        pissa    = false;
     int         pissa_oversample = 8;
     int         pissa_iters      = 2;
+    //   hot_pissa — PiSSA with the rank-dropout mask on the principal component
+    //            itself (QwLoraPair::hot_pissa). Implies pissa. The recipe that
+    //            won the 2026-09-06 MM3 blind tests; export identical to pissa.
+    bool        hot_pissa        = false;
     bool        hra      = false;
     /** After each checkpoint export, load it straight back with the RUNTIME
      *  loader and check that the scale, the tensors and the parameterization
@@ -1112,7 +1116,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
                                a.lokr_decompose_both, (uint64_t) a.seed, &err)
                 : lm_lora_init(&lora, &t.lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed,
                                /*b_sigma=*/1e-2f, &err,
-                               LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra });
+                               LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra, a.hot_pissa });
     if (!fd_init_ok) {
         fprintf(stderr, "[mm3-fd] %s init failed: %s\n", fd_lokr ? "LoKr" : "LoRA", err.c_str());
         mm3_train_lm_free(&t);
@@ -2042,7 +2046,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             ? lm_lokr_init(&lora, &t.lm, 0, c.n_layers, a.lokr_dim, a.lokr_alpha, a.lokr_factor,
                            a.lokr_decompose_both, (uint64_t) a.seed, &err)
             : lm_lora_init(&lora, &t.lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed, 0.0f,
-                           &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra });
+                           &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra, a.hot_pissa });
     if (!init_ok) {
         fprintf(stderr, "[mm3-lm-train] %s init failed: %s\n", want_lokr ? "LoKr" : "LoRA", err.c_str());
         mm3_train_lm_free(&t);
@@ -2080,9 +2084,9 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                 "subspace would hold ~%.2f%%)\n",
                 ps.sites, 100.0 * ps.energy_mean, 100.0 * ps.energy_min, a.rank,
                 100.0 * (double) a.rank / (double) c.hidden_size);
-        jl("{\"type\":\"adapter\",\"kind\":\"pissa\",\"sites\":%d,\"energyMean\":%.6f,"
+        jl("{\"type\":\"adapter\",\"kind\":\"%s\",\"sites\":%d,\"energyMean\":%.6f,"
            "\"energyMin\":%.6f}",
-           ps.sites, ps.energy_mean, ps.energy_min);
+           a.hot_pissa ? "hot-pissa" : "pissa", ps.sites, ps.energy_mean, ps.energy_min);
     }
     if (want_lokr) {
         fprintf(stderr, "[mm3-lm-train] LoKr: dim %d alpha %.0f factor %d, decompose %s\n", a.lokr_dim,
@@ -2792,7 +2796,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         meta.artist_lr    = a.artist_lr;
         meta.prefix_n     = pfx.active() ? pfx.n : 0;
         meta.param_method = a.hra    ? "hra"
-                            : a.pissa ? "pissa"
+                            : a.pissa ? (a.hot_pissa ? "hot-pissa" : "pissa")
                             : a.hira  ? "hira"
                             : a.loha  ? "loha"
                             : a.dora  ? "dora"
@@ -3206,7 +3210,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     // Adapter identity. Same string the export writes as `param_method`, so a
     // state file and the checkpoint beside it always agree about what they are.
     rstate.param_method   = a.hra     ? "hra"
-                            : a.pissa ? "pissa"
+                            : a.pissa ? (a.hot_pissa ? "hot-pissa" : "pissa")
                             : a.hira  ? "hira"
                             : a.loha  ? "loha"
                             : a.dora  ? "dora"

@@ -62,6 +62,26 @@ top of the 16 GB f16 base — so flash is proven correct only on an F32-isolated
 2-layer slice, not the full model. Full per-frame numbers and fitting caveats:
 `.claude/skills/flash-attn-training/SKILL.md` §3/§7.
 
+### HOT-PiSSA — the MM3 default method (2026-09-06)
+
+`--hot-pissa` (both LM trainers; implies `--pissa`) is PiSSA with the
+rank-dropout mask applied to the principal component itself rather than to
+the delta. The training forward is `y = W x + s (M B A) x - s (B0 A0) x`: every
+micro-step a random `--rank-dropout` share of the base's own top-r singular
+subspace is deleted at every site and the rest scaled `1/keep`, while B A
+(initialised to that subspace) fits the album. Plain `--pissa` masks both
+branches so the mask only touches the delta. It was found as a masking bug
+on 2026-09-05 and kept on purpose: in the blind MM3 method test on
+alk3_crimson (nine methods, three songs, everything else locked) its adapter
+scored 68/90 and, rated again against the corrected PiSSA and LoRA, 66.5,
+top both times with no plan failures, while corrected PiSSA produced drone
+plans in half its renders (39.5) and LoRA sat at 60–64. One album so far; a
+second artist is the pending validation. The export is an ordinary rank-2r
+LoRA, identical in form to `--pissa`, so nothing at load time changes.
+Training loss reads high under it by construction (the trailing mean sat at
+2.7–5 where LoRA reads 1.8–3), so stop on steps: the in-app MM3 default is
+500 steps, the checkpoint Rob rated. Not resumable, like `--pissa`.
+
 ### Six adapter parameterizations, both LM trainers (2026-09-04/05)
 
 `train-lm` and `mm3-lm-train` share one `LmLora` implementation

@@ -119,6 +119,10 @@ struct LmTrainArgs {
     bool        pissa        = false;
     int         pissa_oversample = 8;
     int         pissa_iters      = 2;
+    //   hot_pissa — PiSSA with the rank-dropout mask on the principal component
+    //            itself (QwLoraPair::hot_pissa). Implies pissa. The recipe that
+    //            won the 2026-09-06 MM3 blind tests; export identical to pissa.
+    bool        hot_pissa        = false;
     bool        hra          = false;
     // LoRA+ (Hayou 2024): B at ratio x A's learning rate. 1 = off. Only
     // parameters on the AdamW rule honour it — Muon scales its own update.
@@ -1055,7 +1059,7 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
                 ? lm_lokr_init(&lora, &lm, 0, c.n_layers, a.lokr_dim, a.lokr_alpha, a.lokr_factor,
                                a.lokr_decompose_both, (uint64_t) a.seed, &err)
                 : lm_lora_init(&lora, &lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed, /*b_sigma=*/0.0f,
-                               &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra });
+                               &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra, a.hot_pissa });
         if (!init_ok) {
             lm_fatal("vram", err);
             return 1;
@@ -2567,7 +2571,7 @@ static int lm_train_main(const LmTrainArgs & a) {
     meta.attn_mode      = a.attn;
     meta.adapter_type   = a.adapter_type;
     meta.param_method   = a.hra    ? "hra"
-                          : a.pissa ? "pissa"
+                          : a.pissa ? (a.hot_pissa ? "hot-pissa" : "pissa")
                           : a.hira  ? "hira"
                           : a.loha  ? "loha"
                           : a.dora  ? "dora"

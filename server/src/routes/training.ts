@@ -2260,7 +2260,15 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       dora:   b.dora === true,
       hira:   b.hira === true,
       loha:   b.loha === true,
-      pissa:  b.pissa === true,
+      // hotPissa implies pissa (it is PiSSA with a different mask); a client
+      // that sends only hotPissa gets the init it needs rather than a 400.
+      // Both fall back to MM3_LM_DEFAULTS when ABSENT (unlike the other method
+      // booleans, which read absent as off): HOT-PiSSA is the default method,
+      // and a caller that posts no method at all must get the default, not a
+      // plain LoRA. An explicit false still switches it off.
+      pissa:  (b.pissa === undefined ? D.pissa : b.pissa === true)
+           || (b.hotPissa === undefined ? D.hotPissa : b.hotPissa === true),
+      hotPissa: b.hotPissa === undefined ? D.hotPissa : b.hotPissa === true,
       hra:    b.hra === true,
       loraPlusRatio: num('loraPlusRatio', D.loraPlusRatio, 1, 64),
       artistToken:   artistTokenResolved,
@@ -3135,7 +3143,8 @@ router.post('/datasets/:id/train-lm', async (req: Request, res: Response) => {
       dora: body.dora === true,
       hira: body.hira === true,
       loha: body.loha === true,
-      pissa: body.pissa === true,
+      pissa: body.pissa === true || body.hotPissa === true,
+      hotPissa: body.hotPissa === true,
       hra: body.hra === true,
       loraPlusRatio: numOpt(body.loraPlusRatio, 1),
       // Soft prompt: the name becomes a safetensors key, so keep it to a slug.

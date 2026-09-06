@@ -534,8 +534,17 @@ export const MM3_LM_DEFAULTS = {
    *  250 on 2026-08-26 to give a target-loss run room to reach one; a 250-step
    *  cap would have ended almost every run before the target could bind, which
    *  is the same as not having a target. */
-  steps: 1000,
+  steps: 500,
   /** ── Stopping strategy ──────────────────────────────────────────────────
+   *
+   *  'steps', 500, since 2026-09-06 (Rob): the default method is HOT-PiSSA
+   *  (below), whose training loss reads high by construction — a random
+   *  share of the base's principal subspace is deleted every micro-step, so
+   *  the trailing mean never reaches a LoRA-style target and a loss stop
+   *  would run to the cap anyway. The adapter Rob rated best twice was that
+   *  method's step-500 checkpoint; the 250/350 ladder is under test. Switch
+   *  the method to plain LoRA and 'loss' with targetLoss below is the
+   *  measured rule again.
    *
    *  'steps' is the default and the one every measured recipe was run under.
    *  'loss' trains until the loss reaches `targetLoss` instead, with `steps`
@@ -550,7 +559,7 @@ export const MM3_LM_DEFAULTS = {
    *  A NOTE THE UI REPEATS: at 1.0 held-out these adapters were already good,
    *  and a training loss under ~0.05 was pure sequence memorisation on the
    *  runs that got there. Down is not automatically better. */
-  stopMode: 'loss' as 'steps' | 'loss',
+  stopMode: 'steps' as 'steps' | 'loss',
   /** 0.1 on the trailing training mean — Rob, 2026-08-26.
    *
    *  Measured trajectories at the shipped recipe (trailing-25 mean):
@@ -767,9 +776,12 @@ export const MM3_LM_DEFAULTS = {
    *  turned lyrics to gibberish. Factor 6 / dim 512 gives 264M, between rank 64
    *  and rank 128.
    *
-   *  UNVALIDATED BY EAR: no LoKr adapter has been auditioned. Default on at
-   *  Rob's request so it can be tested in-app. */
-  adapterType: 'lokr' as 'lora' | 'lokr',
+   *  LoKr was the default until 2026-09-06. In the blind method test on
+   *  alk3_crimson (nine arms, three songs, everything locked but the method)
+   *  it came last of the arms that rendered all three songs, with one drone
+   *  failure, at 1.5x LoRA's step time. Plain LoRA is next in line after
+   *  HOT-PiSSA below; LoKr stays selectable. */
+  adapterType: 'lora' as 'lora' | 'lokr',
   lokrFactor: 6,
   lokrDim: 512,
   lokrAlpha: 512,
@@ -888,7 +900,21 @@ export const MM3_LM_DEFAULTS = {
   dora: false,
   hira: false,
   loha: false,
-  pissa: false,
+  /** HOT-PiSSA — the default MM3 method since 2026-09-06 (Rob).
+   *
+   *  PiSSA (A/B start on each weight's top-r singular directions, the
+   *  residual frozen as -B0A0) with the rank-dropout mask applied to the
+   *  principal component itself rather than to the delta: every micro-step a
+   *  random `rankDropout` share of the base's own top-128 subspace is deleted
+   *  and the rest scaled 1/keep while the album is fitted. Found as a masking
+   *  bug on 2026-09-05; kept on purpose because its adapter beat every
+   *  correctly-masked method by ear on alk3_crimson, twice (66.5-68/90 vs
+   *  LoRA 60-64, DoRA 63, LoKr 41.5; corrected PiSSA 39.5 with drone plans).
+   *  One album so far. The export is an ordinary rank-2r LoRA; loaders need
+   *  nothing. Train loss reads high under it — stop on steps. `hotPissa`
+   *  implies `pissa`; the engine flag is --hot-pissa. */
+  pissa: true,
+  hotPissa: true,
   hra: false,
   /** LoRA+'s B-side learning-rate multiplier. 1 = off (paper default 16). */
   loraPlusRatio: 1,
@@ -995,6 +1021,8 @@ export interface ResolvedMm3TrainLmOptions {
   hira: boolean;
   loha: boolean;
   pissa: boolean;
+  /** PiSSA with the mask on the principal component (implies pissa). */
+  hotPissa: boolean;
   hra: boolean;
   loraPlusRatio: number;
   /** Soft prompt. '' = no token. See MM3_LM_DEFAULTS.artistToken. */
@@ -1124,7 +1152,7 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     // different function from step 1. The engine refuses the pair outright
     // (ace-train.cpp) and the resume route refuses it before spawning; leaving
     // it on here means the illegal state fails loudly instead of quietly.
-    if (o.pissa && !o.dora && !o.hira && !o.loha) args.push('--pissa');
+    if (o.pissa && !o.dora && !o.hira && !o.loha) args.push(o.hotPissa ? '--hot-pissa' : '--pissa');
     // rslora is in the guard because the engine refuses --hra --rslora, but the
     // routes refuse that pair with a 400 first: HRA has no B for a rank-scaling
     // rule to apply to, so silently dropping it here would train a plain rsLoRA
