@@ -82,6 +82,15 @@ Training loss reads high under it by construction (the trailing mean sat at
 2.7–5 where LoRA reads 1.8–3), so stop on steps: the in-app MM3 default is
 500 steps, the checkpoint Rob rated. Not resumable, like `--pissa`.
 
+Two cost knobs for any PiSSA-family run (2026-09-06): `--pissa-cache-dir <dir>`
+stores the SVD init factors once per base file / rank / oversample / iters /
+layer range and uploads the identical bytes on the next run (the init is a
+pure function of those, so a hit is bit-exact; the in-app trainer keeps the
+cache under `<adapters>/mm3-lm-adapters/_pissa-init-cache/`); the init now
+logs its wall time either way. `--pissa-frozen-f16` holds the frozen A0/B0
+pair in F16, halving the ~1.3 GB it costs at r128, at the price of an init
+that cancels to f16 precision rather than exactly — unheard, off by default.
+
 ### Six adapter parameterizations, both LM trainers (2026-09-04/05)
 
 `train-lm` and `mm3-lm-train` share one `LmLora` implementation

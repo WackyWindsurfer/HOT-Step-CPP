@@ -47,22 +47,157 @@
 #include "train/lm-export.h"
 #include "train/lm-graph.h"
 #include "train/svd-host.h"
+#include "hot-step-fsutf8.h"
+#include "train/preprocess-io.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
 struct LmPissaStats {
     double energy_min = 1.0, energy_mean = 0.0;  // captured / ||W||_F^2 over sites
     int    sites      = 0;
+    double seconds    = 0.0;                     // wall time of the init, SVD or cache
+    bool   from_cache = false;
 };
+
+// F16-aware upload/download of a frozen factor: the tensor may be F16 under
+// --pissa-frozen-f16, the host side is always F32.
+static void lm_pissa_tensor_set_f32(ggml_tensor * t, const std::vector<float> & v) {
+    if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> h(v.size());
+        ggml_fp32_to_fp16_row(v.data(), h.data(), (int64_t) v.size());
+        ggml_backend_tensor_set(t, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
+    } else {
+        ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+    }
+}
+static void lm_pissa_tensor_get_f32(const ggml_tensor * t, std::vector<float> & v) {
+    if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> h(v.size());
+        ggml_backend_tensor_get(t, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
+        ggml_fp16_to_fp32_row(h.data(), v.data(), (int64_t) v.size());
+    } else {
+        ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+    }
+}
+
+// ── SVD init cache (2026-09-06) ─────────────────────────────────────────────
+//
+// The randomized SVD is deterministic (fixed RNG seed, fixed base, fixed
+// rank/oversample/iters), so its output is a pure function of the base file
+// and four integers. One MM3 run at r128 spends its whole init recomputing
+// 252 sites that every previous run at the same rank already computed. The
+// cache stores the F32 host factors and each site's captured-energy fraction;
+// a hit skips the GPU stages entirely and uploads the same bytes the SVD
+// would have produced. Keyed on the base's file name + size + mtime, so a
+// re-quantized base of the same name misses rather than poisons.
+//
+// Layout (little-endian): magic "HPIS", u32 version=1, i32 rank, i32 q,
+// i32 iters, i32 layer_lo, i32 layer_hi, i32 n_sites, then per site:
+// i32 layer, i32 slot, i32 in, i32 out, f64 frac, f32 A0[in*r], f32 B0[r*out].
+struct LmPissaCacheSite {
+    int                l = 0, s = 0, in = 0, out = 0;
+    double             frac = 0.0;
+    std::vector<float> A0, B0;
+};
+static std::string lm_pissa_cache_path(const std::string & dir, const std::string & lm_path, int rank, int q, int iters,
+                                       int layer_lo, int layer_hi) {
+    if (dir.empty() || lm_path.empty()) {
+        return "";
+    }
+    HS_STAT_T sb {};
+    if (hs_stat(lm_path, &sb) != 0) {
+        return "";
+    }
+    std::string base = lm_path;
+    const size_t cut = base.find_last_of("/\\");
+    if (cut != std::string::npos) {
+        base = base.substr(cut + 1);
+    }
+    char tail[160];
+    snprintf(tail, sizeof(tail), ".%lld.%lld.r%d.q%d.i%d.L%d-%d.v1.pissa", (long long) sb.st_size, (long long) sb.st_mtime,
+             rank, q, iters, layer_lo, layer_hi);
+    return dir + "/" + base + tail;
+}
+static bool lm_pissa_cache_read(const std::string & path, int rank, int q, int iters, int layer_lo, int layer_hi,
+                                std::vector<LmPissaCacheSite> * out) {
+    FILE * f = hs_fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    auto rd = [&](void * p, size_t n) { return fread(p, 1, n, f) == n; };
+    char     magic[4] = { 0, 0, 0, 0 };
+    uint32_t ver      = 0;
+    int32_t  hdr[6]   = { 0, 0, 0, 0, 0, 0 };
+    bool ok = rd(magic, 4) && rd(&ver, 4) && rd(hdr, sizeof(hdr)) && memcmp(magic, "HPIS", 4) == 0 && ver == 1 &&
+              hdr[0] == rank && hdr[1] == q && hdr[2] == iters && hdr[3] == layer_lo && hdr[4] == layer_hi && hdr[5] > 0;
+    if (ok) {
+        out->resize((size_t) hdr[5]);
+        for (LmPissaCacheSite & c : *out) {
+            int32_t h[4];
+            ok = rd(h, sizeof(h)) && rd(&c.frac, sizeof(double));
+            if (!ok) {
+                break;
+            }
+            c.l = h[0]; c.s = h[1]; c.in = h[2]; c.out = h[3];
+            if (c.in <= 0 || c.out <= 0 || c.in > (1 << 20) || c.out > (1 << 20)) {
+                ok = false;
+                break;
+            }
+            c.A0.resize((size_t) c.in * (size_t) rank);
+            c.B0.resize((size_t) rank * (size_t) c.out);
+            ok = rd(c.A0.data(), c.A0.size() * sizeof(float)) && rd(c.B0.data(), c.B0.size() * sizeof(float));
+            if (!ok) {
+                break;
+            }
+        }
+    }
+    fclose(f);
+    if (!ok) {
+        out->clear();
+    }
+    return ok;
+}
+static bool lm_pissa_cache_write(const std::string & path, int rank, int q, int iters, int layer_lo, int layer_hi,
+                                 const std::vector<LmPissaCacheSite> & sites) {
+    const std::string tmp = path + ".tmp";
+    FILE *            f   = hs_fopen(tmp.c_str(), "wb");
+    if (!f) {
+        return false;
+    }
+    auto wr = [&](const void * p, size_t n) { return fwrite(p, 1, n, f) == n; };
+    const uint32_t ver = 1;
+    const int32_t  hdr[6] = { rank, q, iters, layer_lo, layer_hi, (int32_t) sites.size() };
+    bool ok = wr("HPIS", 4) && wr(&ver, 4) && wr(hdr, sizeof(hdr));
+    for (const LmPissaCacheSite & c : sites) {
+        if (!ok) {
+            break;
+        }
+        const int32_t h[4] = { c.l, c.s, c.in, c.out };
+        ok = wr(h, sizeof(h)) && wr(&c.frac, sizeof(double)) && wr(c.A0.data(), c.A0.size() * sizeof(float)) &&
+             wr(c.B0.data(), c.B0.size() * sizeof(float));
+    }
+    ok = (fclose(f) == 0) && ok;
+    if (ok) {
+        hs_remove(path.c_str());
+        ok = hs_rename(tmp.c_str(), path.c_str()) == 0;
+    }
+    if (!ok) {
+        hs_remove(tmp.c_str());
+    }
+    return ok;
+}
 
 // Fills A/B with the SVD factors and A0/B0 with a frozen copy of them. The base
 // is not written. `sched` runs the GPU stages; it is reset around every graph,
 // so call this before the training graphs exist.
 static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample, int iters, LmPissaStats * stats,
-                          std::string * err) {
+                          std::string * err, const std::string & cache_path = "") {
     Qwen3LM * lm = L->model;
     if (!lm || !L->pissa || L->layer_lo >= L->layer_hi) {
         *err = "PiSSA: adapter not initialised for it";
@@ -71,6 +206,63 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
     const int r = L->rank;
     const int q = r + std::max(0, oversample);
     iters       = std::max(0, std::min(4, iters));
+    const auto t_start = std::chrono::steady_clock::now();
+    auto elapsed = [&]() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    };
+
+    // ── cache hit: upload the stored factors and skip the SVD ─────────────
+    std::vector<LmPissaCacheSite> cached;
+    if (!cache_path.empty() && lm_pissa_cache_read(cache_path, r, q, iters, L->layer_lo, L->layer_hi, &cached)) {
+        size_t idx = 0;
+        double e_sum = 0.0;
+        int    n_e   = 0;
+        bool   ok    = true;
+        for (int l = L->layer_lo; l < L->layer_hi && ok; l++) {
+            for (int s = 0; s < QW_LORA_NSLOTS; s++) {
+                QwLoraPair & pr = L->layers[l].p[s];
+                if (!pr.A || !pr.B || !pr.A0 || !pr.B0) {
+                    continue;
+                }
+                if (idx >= cached.size()) {
+                    ok = false;
+                    break;
+                }
+                const LmPissaCacheSite & c = cached[idx++];
+                if (c.l != l || c.s != s || c.in != (int) pr.A->ne[0] || c.out != (int) pr.B->ne[1]) {
+                    ok = false;
+                    break;
+                }
+                ggml_backend_tensor_set(pr.A, c.A0.data(), 0, c.A0.size() * sizeof(float));
+                ggml_backend_tensor_set(pr.B, c.B0.data(), 0, c.B0.size() * sizeof(float));
+                lm_pissa_tensor_set_f32(pr.A0, c.A0);
+                lm_pissa_tensor_set_f32(pr.B0, c.B0);
+                if (stats) {
+                    stats->energy_min = std::min(stats->energy_min, c.frac);
+                    stats->sites++;
+                }
+                e_sum += c.frac;
+                n_e++;
+            }
+        }
+        if (ok && idx == cached.size()) {
+            if (stats) {
+                stats->energy_mean = n_e > 0 ? e_sum / (double) n_e : 0.0;
+                stats->seconds     = elapsed();
+                stats->from_cache  = true;
+            }
+            fprintf(stderr, "[pissa] init: %zu sites from cache in %.1f s (%s)\n", cached.size(), elapsed(),
+                    cache_path.c_str());
+            return true;
+        }
+        // A stale or mismatched file: fall through to the SVD and overwrite it.
+        fprintf(stderr, "[pissa] cache %s does not match this run; recomputing\n", cache_path.c_str());
+        if (stats) {
+            stats->energy_min = 1.0;
+            stats->sites      = 0;
+        }
+    }
+    std::vector<LmPissaCacheSite> to_cache;
 
     // Scratch sized by the largest site in the trained window.
     int64_t in_max = 0, out_max = 0;
@@ -305,8 +497,8 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
             }
             ggml_backend_tensor_set(pr.A, A0.data(), 0, A0.size() * sizeof(float));
             ggml_backend_tensor_set(pr.B, B0.data(), 0, B0.size() * sizeof(float));
-            ggml_backend_tensor_set(pr.A0, A0.data(), 0, A0.size() * sizeof(float));
-            ggml_backend_tensor_set(pr.B0, B0.data(), 0, B0.size() * sizeof(float));
+            lm_pissa_tensor_set_f32(pr.A0, A0);
+            lm_pissa_tensor_set_f32(pr.B0, B0);
 
             // A NaN here would silently poison the adapter — A0/B0 are frozen
             // inputs, so the very first forward would be non-finite and the run
@@ -328,10 +520,27 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
             }
             e_sum += frac;
             n_e++;
+            if (!cache_path.empty()) {
+                LmPissaCacheSite c;
+                c.l = l; c.s = s; c.in = in; c.out = out; c.frac = frac;
+                c.A0 = A0;
+                c.B0 = B0;
+                to_cache.push_back(std::move(c));
+            }
         }
     }
     if (stats && n_e > 0) {
         stats->energy_mean = e_sum / (double) n_e;
+    }
+    if (stats) {
+        stats->seconds = elapsed();
+    }
+    if (!cache_path.empty()) {
+        const bool wrote = lm_pissa_cache_write(cache_path, r, q, iters, L->layer_lo, L->layer_hi, to_cache);
+        fprintf(stderr, "[pissa] init: %d sites by SVD in %.1f s (%s %s)\n", n_e, elapsed(),
+                wrote ? "cached to" : "cache NOT written:", cache_path.c_str());
+    } else {
+        fprintf(stderr, "[pissa] init: %d sites by SVD in %.1f s\n", n_e, elapsed());
     }
     return done(true);
 }
@@ -340,17 +549,24 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
 // is built long after the adapter bank exists — so the init gets one of its
 // own, and the ~200 MB of scratch it holds is returned before anything else is
 // allocated.
-static bool lm_pissa_init_standalone(LmLora * L, int oversample, int iters, LmPissaStats * stats, std::string * err) {
+static bool lm_pissa_init_standalone(LmLora * L, int oversample, int iters, LmPissaStats * stats, std::string * err,
+                                     const std::string & cache_dir = "", const std::string & lm_path = "") {
     if (!L->model) {
         *err = "PiSSA: the adapter bank is not attached to a model";
         return false;
+    }
+    std::string cache_path;
+    if (!cache_dir.empty()) {
+        pm_mkdir_p(cache_dir);
+        cache_path = lm_pissa_cache_path(cache_dir, lm_path, L->rank, L->rank + std::max(0, oversample),
+                                         std::max(0, std::min(4, iters)), L->layer_lo, L->layer_hi);
     }
     BackendPair bp;
     bp.backend     = L->model->backend;
     bp.cpu_backend = L->model->cpu_backend;
     bp.has_gpu     = bp.backend != bp.cpu_backend;
     ggml_backend_sched_t sc = backend_sched_new(bp, 2048);
-    const bool           ok = lm_pissa_init(L, sc, oversample, iters, stats, err);
+    const bool           ok = lm_pissa_init(L, sc, oversample, iters, stats, err, cache_path);
     ggml_backend_sched_free(sc);
     return ok;
 }
@@ -399,8 +615,8 @@ static bool lm_export_pissa(const LmLora & L, const Qwen3LMConfig & cfg, const L
         b0.assign(b.size(), 0.0f);
         ggml_backend_tensor_get(pr.A, a.data(), 0, a.size() * sizeof(float));
         ggml_backend_tensor_get(pr.B, b.data(), 0, b.size() * sizeof(float));
-        ggml_backend_tensor_get(pr.A0, a0.data(), 0, a0.size() * sizeof(float));
-        ggml_backend_tensor_get(pr.B0, b0.data(), 0, b0.size() * sizeof(float));
+        lm_pissa_tensor_get_f32(pr.A0, a0);
+        lm_pissa_tensor_get_f32(pr.B0, b0);
 
         f->in  = in;
         f->out = out;

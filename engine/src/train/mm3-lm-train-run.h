@@ -334,6 +334,10 @@ struct MM3LmTrainArgs {
     //            itself (QwLoraPair::hot_pissa). Implies pissa. The recipe that
     //            won the 2026-09-06 MM3 blind tests; export identical to pissa.
     bool        hot_pissa        = false;
+    //   pissa_cache_dir — directory for the SVD init cache (lm-pissa.h); '' = off.
+    //   pissa_f16 — frozen A0/B0 in F16 (halves their VRAM; init cancels to f16).
+    std::string pissa_cache_dir;
+    bool        pissa_f16        = false;
     bool        hra      = false;
     /** After each checkpoint export, load it straight back with the RUNTIME
      *  loader and check that the scale, the tensors and the parameterization
@@ -1116,7 +1120,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
                                a.lokr_decompose_both, (uint64_t) a.seed, &err)
                 : lm_lora_init(&lora, &t.lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed,
                                /*b_sigma=*/1e-2f, &err,
-                               LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra, a.hot_pissa });
+                               LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra, a.hot_pissa, a.pissa_f16 });
     if (!fd_init_ok) {
         fprintf(stderr, "[mm3-fd] %s init failed: %s\n", fd_lokr ? "LoKr" : "LoRA", err.c_str());
         mm3_train_lm_free(&t);
@@ -1136,7 +1140,7 @@ static int mm3_lm_fdcheck_main(const MM3LmTrainArgs & a, int n_probe, double eps
     // which is what makes dL/dA measurable at all.
     if (!fd_lokr && a.pissa) {
         LmPissaStats ps;
-        if (!lm_pissa_init_standalone(&lora, a.pissa_oversample, a.pissa_iters, &ps, &err)) {
+        if (!lm_pissa_init_standalone(&lora, a.pissa_oversample, a.pissa_iters, &ps, &err, a.pissa_cache_dir, a.lm_path)) {
             fprintf(stderr, "[mm3-fd] PiSSA init failed: %s\n", err.c_str());
             lm_lora_detach(&lora, &t.lm);
             lm_lora_free(&lora);
@@ -2046,7 +2050,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             ? lm_lokr_init(&lora, &t.lm, 0, c.n_layers, a.lokr_dim, a.lokr_alpha, a.lokr_factor,
                            a.lokr_decompose_both, (uint64_t) a.seed, &err)
             : lm_lora_init(&lora, &t.lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed, 0.0f,
-                           &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra, a.hot_pissa });
+                           &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra, a.hot_pissa, a.pissa_f16 });
     if (!init_ok) {
         fprintf(stderr, "[mm3-lm-train] %s init failed: %s\n", want_lokr ? "LoKr" : "LoRA", err.c_str());
         mm3_train_lm_free(&t);
@@ -2072,7 +2076,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     // ~200 MB scratch and gives it back before anything competes for VRAM.
     if (!want_lokr && a.pissa) {
         LmPissaStats ps;
-        if (!lm_pissa_init_standalone(&lora, a.pissa_oversample, a.pissa_iters, &ps, &err)) {
+        if (!lm_pissa_init_standalone(&lora, a.pissa_oversample, a.pissa_iters, &ps, &err, a.pissa_cache_dir, a.lm_path)) {
             fprintf(stderr, "[mm3-lm-train] PiSSA init failed: %s\n", err.c_str());
             lm_lora_detach(&lora, &t.lm);
             lm_lora_free(&lora);

@@ -215,6 +215,11 @@ struct LmLora {
     // HOT-PiSSA (2026-09-06): PiSSA whose rank-dropout mask is applied to the
     // principal component itself rather than to the delta — see QwLoraPair.
     bool  hot_pissa      = false;
+    // Frozen A0/B0 held as F16 instead of F32 (2026-09-06): halves the 1.3 GB
+    // the pair costs at r128 on MM3. The cancellation at init is then exact
+    // only to f16 (~5e-4 relative on the top-r component); an ear test decides
+    // whether that is free. The trained A/B stay F32 either way.
+    bool  pissa_f16      = false;
     // HRA (2026-09-05): `rank` Householder reflections on each site's INPUT.
     // A holds the vectors, B is null, so nothing downstream that keys off
     // `pr.B` fires. Exact rank-r LoRA on export (lm-hra.h).
@@ -234,6 +239,7 @@ struct LmLoraOpts {
     bool pissa = false;
     bool hra   = false;
     bool hot_pissa = false;  // requires pissa; see QwLoraPair::hot_pissa
+    bool pissa_f16 = false;  // frozen A0/B0 in F16 (see LmLora::pissa_f16)
 };
 
 // rsLoRA: switch a freshly initialised LoRA to alpha/sqrt(r). Every pair
@@ -409,6 +415,7 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
     L->loha     = lo.loha;
     L->pissa    = lo.pissa;
     L->hot_pissa = lo.hot_pissa;
+    L->pissa_f16 = lo.pissa_f16;
     L->hra      = lo.hra;
     L->model    = lm;
     if ((int) lo.dora + (int) lo.hira + (int) lo.loha + (int) lo.hra > 1) {
@@ -504,8 +511,9 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
                 // Frozen copies of the SVD init. INPUTS, not params: they carry
                 // no gradient and must never reach lm_optim_init, or AdamW would
                 // walk the term that is supposed to hold the base still.
-                pr.A0 = ggml_new_tensor_2d(L->ctx, GGML_TYPE_F32, in_dim, rank);
-                pr.B0 = ggml_new_tensor_2d(L->ctx, GGML_TYPE_F32, rank, out_dim);
+                const ggml_type ft = lo.pissa_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+                pr.A0 = ggml_new_tensor_2d(L->ctx, ft, in_dim, rank);
+                pr.B0 = ggml_new_tensor_2d(L->ctx, ft, rank, out_dim);
                 snprintf(nm, sizeof(nm), "L%d.s%d.pissa_A0", l, s);
                 ggml_set_name(pr.A0, nm);
                 snprintf(nm, sizeof(nm), "L%d.s%d.pissa_B0", l, s);

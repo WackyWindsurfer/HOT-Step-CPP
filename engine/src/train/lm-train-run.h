@@ -123,6 +123,10 @@ struct LmTrainArgs {
     //            itself (QwLoraPair::hot_pissa). Implies pissa. The recipe that
     //            won the 2026-09-06 MM3 blind tests; export identical to pissa.
     bool        hot_pissa        = false;
+    //   pissa_cache_dir — directory for the SVD init cache (lm-pissa.h); '' = off.
+    //   pissa_f16 — frozen A0/B0 in F16 (halves their VRAM; init cancels to f16).
+    std::string pissa_cache_dir;
+    bool        pissa_f16        = false;
     bool        hra          = false;
     // LoRA+ (Hayou 2024): B at ratio x A's learning rate. 1 = off. Only
     // parameters on the AdamW rule honour it — Muon scales its own update.
@@ -1059,7 +1063,7 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
                 ? lm_lokr_init(&lora, &lm, 0, c.n_layers, a.lokr_dim, a.lokr_alpha, a.lokr_factor,
                                a.lokr_decompose_both, (uint64_t) a.seed, &err)
                 : lm_lora_init(&lora, &lm, 0, c.n_layers, a.rank, (float) a.alpha, (uint64_t) a.seed, /*b_sigma=*/0.0f,
-                               &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra, a.hot_pissa });
+                               &err, LmLoraOpts{ a.dora, a.hira, a.loha, a.pissa, a.hra, a.hot_pissa, a.pissa_f16 });
         if (!init_ok) {
             lm_fatal("vram", err);
             return 1;
@@ -1078,7 +1082,7 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
     if (a.pissa) {
         LmPissaStats ps;
         std::string  perr;
-        if (!lm_pissa_init_standalone(&lora, a.pissa_oversample, a.pissa_iters, &ps, &perr)) {
+        if (!lm_pissa_init_standalone(&lora, a.pissa_oversample, a.pissa_iters, &ps, &perr, a.pissa_cache_dir, a.lm_path)) {
             lm_fatal("pissa", perr);
             return 1;
         }

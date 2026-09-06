@@ -548,6 +548,11 @@ static void print_usage(void) {
             "                                            album is fitted. Implies --pissa; same export.\n"
             "                                            Won the 2026-09-06 MM3 blind tests. Train loss\n"
             "                                            reads high under it: stop on steps, not loss.\n"
+            "    --pissa-cache-dir <dir>                 cache the SVD init factors per base file / rank /\n"
+            "                                            oversample / iters / layer range; a hit skips the\n"
+            "                                            SVD and uploads identical bytes.\n"
+            "    --pissa-frozen-f16                      hold the frozen A0/B0 pair in F16 (half the VRAM;\n"
+            "                                            init cancels to f16 precision). Unheard.\n"
             "    --pissa-oversample <n>      8           extra SVD columns beyond the rank.\n"
             "    --pissa-iters <n>           2           power iterations (0-4).\n"
             "    --hra                                   HRA: --rank (even) Householder reflections on\n"
@@ -1895,6 +1900,8 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--loha"))              a.loha         = true;
         else if (!strcmp(argv[i], "--pissa"))             a.pissa        = true;
         else if (!strcmp(argv[i], "--hot-pissa"))         { a.pissa = true; a.hot_pissa = true; }
+        else if (!strcmp(argv[i], "--pissa-cache-dir"))   a.pissa_cache_dir = next("--pissa-cache-dir");
+        else if (!strcmp(argv[i], "--pissa-frozen-f16"))  a.pissa_f16    = true;
         else if (!strcmp(argv[i], "--pissa-oversample"))  a.pissa_oversample = atoi(next("--pissa-oversample"));
         else if (!strcmp(argv[i], "--pissa-iters"))       a.pissa_iters  = atoi(next("--pissa-iters"));
         else if (!strcmp(argv[i], "--hra"))               a.hra          = true;
@@ -4122,6 +4129,8 @@ static int cmd_train_lm(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--hra")) { a.hra = true; saw.method = true; }
         else if (!strcmp(argv[i], "--pissa")) a.pissa = true;
         else if (!strcmp(argv[i], "--hot-pissa")) { a.pissa = true; a.hot_pissa = true; }
+        else if (!strcmp(argv[i], "--pissa-cache-dir") && i + 1 < argc) a.pissa_cache_dir = argv[++i];
+        else if (!strcmp(argv[i], "--pissa-frozen-f16")) a.pissa_f16 = true;
         else if (!strcmp(argv[i], "--pissa-oversample") && i + 1 < argc) a.pissa_oversample = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pissa-iters") && i + 1 < argc) a.pissa_iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lora-plus-ratio") && i + 1 < argc) a.lora_plus_ratio = (float) atof(argv[++i]);
