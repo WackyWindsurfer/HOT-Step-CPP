@@ -1160,12 +1160,19 @@ static ggml_tensor * lm_linear(ggml_context * ctx, ggml_tensor * w, const QwLora
                 // beat plain PiSSA (which broke plans), LoRA, DoRA, rsLoRA,
                 // LoRA+ and LoKr. The export is the same rank-2r LoRA either
                 // way; nothing at load time can tell the two apart.
-                ggml_tensor * t0 = ggml_mul_mat(ctx, pr->A0, x);
+                // Under --pissa-frozen-f16 the pair is stored F16 and cast to
+                // F32 per use: the transient [in, r] / [r, out] casts cost ~2 MB
+                // in the graph arena, while feeding F16 straight into mul_mat
+                // sent the backward through a path ten times slower (50 s
+                // steps against 5 s). Storage saving kept, speed kept.
+                ggml_tensor * A0 = pr->A0->type == GGML_TYPE_F32 ? pr->A0 : ggml_cast(ctx, pr->A0, GGML_TYPE_F32);
+                ggml_tensor * B0 = pr->B0->type == GGML_TYPE_F32 ? pr->B0 : ggml_cast(ctx, pr->B0, GGML_TYPE_F32);
+                ggml_tensor * t0 = ggml_mul_mat(ctx, A0, x);
                 if (opts.rank_mask && !pr->hot_pissa) {
                     t0 = ggml_mul(ctx, t0, opts.rank_mask);
                 }
                 t0 = ggml_scale(ctx, t0, pr->scale);
-                d  = ggml_sub(ctx, d, ggml_mul_mat(ctx, pr->B0, t0));
+                d  = ggml_sub(ctx, d, ggml_mul_mat(ctx, B0, t0));
             }
             y               = ggml_add(ctx, y, d);
             // DoRA. Emits nothing when the pair carries no magnitude, so a plain
