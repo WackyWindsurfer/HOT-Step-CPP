@@ -731,7 +731,12 @@ export const MM3_LM_DEFAULTS = {
    *  Green Day it converged within 2.4% of the hand-tuned 8e-5), resumes as of
    *  format v2 so checkpoint-cadence previews work, and `lr` becomes a
    *  schedule multiplier the trainer forces to 1.0. */
-  optimizer: 'prodigy' as 'muon' | 'adamw' | 'prodigy',
+  /** adamw since 2026-09-06 (Rob): in the blind HOT-PiZZA recipe test on
+   *  alk3_crimson, AdamW at lr 8e-5 tied Prodigy by ear (69.5 vs 72 of 90,
+   *  inside the noise floor) and saved 2.3 GB of optimizer state. The stacked
+   *  recipe (prefix 2048 + flash + AdamW + f16 factors) was rated "fantastic"
+   *  sighted and is the shipped default. Prodigy stays selectable. */
+  optimizer: 'adamw' as 'muon' | 'adamw' | 'prodigy',
   muonLrScale: 64,
   /** q8_0, not f16 — see the note on Mm3TrainModels. Same step time since the
    *  cpy-q-occupancy patch, ~8.5 GB less resident, and therefore the only one
@@ -826,7 +831,10 @@ export const MM3_LM_DEFAULTS = {
    *  +856 MB and about +60% step time for 750 frames. Matching prefixFrames to
    *  maxFrames doubles the history the model sees for a fraction of what
    *  doubling the crop would cost. */
-  prefixFrames: 4096,
+  /** 2048 since 2026-09-06 (Rob): tied 4096 blind (71 vs 72 of 90) and takes
+   *  14% off the step, 0.8 GB off the peak. The per-step cost of a prefix is
+   *  the prefill through every layer, not the attention over it. */
+  prefixFrames: 2048,
   /** Prefill positions per graph. Trades host graph-build overhead against the
    *  transient attention scores of one chunk; 256 is a middle setting and has
    *  no effect on the result, only on speed and peak. */
@@ -892,7 +900,11 @@ export const MM3_LM_DEFAULTS = {
    *  click is never refused for a setting the user never touched. Only the
    *  non-default value is emitted, so a build that predates --attn on this
    *  subcommand stays compatible for every existing caller. */
-  attnBackend: 'exact' as 'exact' | 'flash',
+  /** flash since 2026-09-06 (Rob): the engine composes it with the KV prefix
+   *  (7070238e; probe at S_kv = n_pfx + S, F16 prefill mask), gates passed
+   *  (self-test, FD, step-1 loss within tf32 rounding), tied exact blind
+   *  (68 vs 72 of 90) and takes 14% off the step, 1 GB off the peak. */
+  attnBackend: 'flash' as 'exact' | 'flash',
   /** LoRA-family parameterizations, mutually exclusive with each other and
    *  with LoKr (adapterType). Same semantics as train-dit's dora/hira/loha/
    *  pissa/hra — see DitMethod in TrainDitForm.tsx. */
@@ -924,8 +936,8 @@ export const MM3_LM_DEFAULTS = {
   pissaCache: true,
   /** Hold the frozen A0/B0 pair in F16 (engine --pissa-frozen-f16): halves the
    *  ~1.3 GB it costs at r128. The init then cancels to f16 precision rather
-   *  than exactly. UNHEARD — off until the ear test says it is free. */
-  pissaFrozenF16: false,
+   *  than exactly. Heard as part of the stacked recipe (2026-09-06). */
+  pissaFrozenF16: true,   // on since 2026-09-06: part of the stacked recipe Rob rated; 0.6 GB back, same speed
   hra: false,
   /** LoRA+'s B-side learning-rate multiplier. 1 = off (paper default 16). */
   loraPlusRatio: 1,

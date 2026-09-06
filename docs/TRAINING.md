@@ -86,6 +86,13 @@ Training loss reads high under it by construction (the trailing mean sat at
 2.7–5 where LoRA reads 1.8–3), so stop on steps: the in-app MM3 default is
 500 steps, the checkpoint Rob rated. Not resumable, like `--pissa`.
 
+The shipped MM3 recipe since 2026-09-06 stacks four cost levers on top of
+HOT-PiZZA, each first tied against the default in a blind set and then heard
+together: `--prefix-frames 2048` (was 4096), `--attn flash` (composes with the
+prefix since 7070238e), `--optimizer adamw --lr 8e-5` (was Prodigy) and
+`--pissa-frozen-f16`. On alk3_crimson that is 4.7 s/step, 39 min for 500
+steps and a 25.9 GB peak against 5.9 s, 49 min and 30.4 GB.
+
 Two cost knobs for any PiSSA-family run (2026-09-06): `--pissa-cache-dir <dir>`
 stores the SVD init factors once per base file / rank / oversample / iters /
 layer range and uploads the identical bytes on the next run (the init is a

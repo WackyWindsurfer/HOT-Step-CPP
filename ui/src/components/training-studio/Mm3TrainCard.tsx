@@ -386,7 +386,9 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
         // parameterization and mm3-lm-train accepts it under LoKr too, where the
         // VRAM saving is identical. Gating it meant the checkbox stayed visibly
         // ticked while the request omitted the field and the run trained exact.
-        ...(form.attnBackend !== 'exact' ? { attnBackend: form.attnBackend } : {}),
+        // Always sent: the default is flash since 2026-09-06, so an omitted
+        // field would turn a deliberate 'exact' back into flash on the route.
+        attnBackend: form.attnBackend,
         ...(form.adapterType === 'lora' && form.dora ? { dora: true } : {}),
         ...(form.adapterType === 'lora' && form.hira ? { hira: true } : {}),
         ...(form.adapterType === 'lora' && form.loha ? { loha: true } : {}),

@@ -23,12 +23,14 @@ survives a fresh clone.
 
 ```
 --lm mm3-lm-q8_0.gguf
---rank 128 --alpha 128 --adapter-type lokr --lokr-factor 6 --lokr-dim 512 --lokr-alpha 512
---optimizer prodigy --lr-end-frac 0.005 --warmup 25   # prodigy sets its own lr
+--rank 128 --alpha 128 --adapter-type lora --hot-pizza          # HOT-PiZZA: PiSSA with principal-subspace dropout (2026-09-06)
+--pissa-frozen-f16 --pissa-cache-dir <adapters>/mm3-lm-adapters/_pissa-init-cache
+--optimizer adamw --lr 8e-5 --lr-end-frac 0.005 --warmup 25    # AdamW tied Prodigy by ear, 2.3 GB lighter
+--attn flash --prefix-frames 2048                              # flash + prefix compose since 7070238e; 2048 tied 4096
 --max-frames 750 --crop-mode structured --crop-start-frac 0.55 --crop-end-frac 0.15
 --crop-start-tiles 3 --crop-anchor song
---rank-dropout 0.1
---steps 500 --save-every 50
+--rank-dropout 0.1                                             # the mask IS the method under --hot-pizza; never 0
+--steps 500 --save-every 50                                    # stop on STEPS: train loss reads 2.7-5 under HOT-PiZZA
 --depth-loss-weight 1.0 --depth-loss-frames 128
 # captions: per-track <stem>.mm3.txt from MOSS/Gemini (the default input);
 # --caption-file <shared caption> is the FALLBACK when tracks have none
@@ -39,7 +41,14 @@ survives a fresh clone.
 Previews: every 50 steps (= every checkpoint), 40 s, control + baseline off,
 rendered on q8_0 at MLP 1.0 — the same dials generation uses.
 
-**Rob, 2026-08-25, on this configuration: "the closest we've ever gotten to
+**Rob, 2026-09-06, on the stacked HOT-PiZZA recipe above (blind-hotpissa-recipe
+letter F): "sounds fantastic, this should be the default in-app."** Cost on
+alk3_crimson: 4.7 s/step, 39 min for 500 steps, peak 25.9 GB — against the
+2026-09-05 LoKr/Prodigy/exact/4096 line's 5.9 s, 49 min, 30.4 GB. Every
+lever was first tied individually in a blind set, then stacked and heard.
+The earlier LoKr line stays in the git history of this file.
+
+**Rob, 2026-08-25, on the LoKr configuration this replaced: "the closest we've ever gotten to
 artist replication."** Crop 750 = 30 s = ~3 s/step; he set it by ear after
 finding 15 s steps at crop 4272 unworkable and the shorter crop *better*, not
 merely faster.
