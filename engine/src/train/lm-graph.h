@@ -598,8 +598,13 @@ static bool lm_lora_init(LmLora * L, Qwen3LM * lm, int layer_lo, int layer_hi, i
                 // than a base perturbed by whatever the allocator left behind.
                 std::fill(a.begin(), a.end(), 0.0f);
                 std::fill(b.begin(), b.end(), 0.0f);
-                ggml_backend_tensor_set(pr.A0, a.data(), 0, a.size() * sizeof(float));
-                ggml_backend_tensor_set(pr.B0, b.data(), 0, b.size() * sizeof(float));
+                // Zero BYTES, sized by the tensor: A0/B0 are F16 under
+                // --pissa-frozen-f16 and a float-sized write overran them.
+                {
+                    std::vector<uint8_t> z(std::max(ggml_nbytes(pr.A0), ggml_nbytes(pr.B0)), 0);
+                    ggml_backend_tensor_set(pr.A0, z.data(), 0, ggml_nbytes(pr.A0));
+                    ggml_backend_tensor_set(pr.B0, z.data(), 0, ggml_nbytes(pr.B0));
+                }
             }
         }
         lm->layers[l].lora = &L->layers[l];
