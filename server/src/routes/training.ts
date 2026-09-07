@@ -1976,6 +1976,32 @@ function resolveMm3Regularisation(raw: unknown, styleDatasetId: string): Partial
   if (!raw || typeof raw !== 'object') return {};
   const r = raw as Record<string, unknown>;
   const every = Number.isFinite(Number(r.every)) ? Math.trunc(Number(r.every)) : MM3_LM_DEFAULTS.regEvery;
+  // Stage C (2026-09-07): a corpus that is not a Training Studio dataset — a
+  // folder holding dataset.json, <stem>.mm3.txt captions and codes/<id>.codes,
+  // e.g. the base-plan ENDING EXCERPTS built by tools/mm3-reg-corpus. Same
+  // three inputs the trainer needs, without a scan of audio that does not exist.
+  if (typeof r.corpusDir === 'string' && r.corpusDir) {
+    if (every <= 0) return {};
+    if (every < 2) {
+      throw new Error('Regularisation cadence must be at least 2 — at 1 every step would be a '
+                    + 'regularisation step and nothing would learn the artist.');
+    }
+    const dir = r.corpusDir;
+    const manifest = path.join(dir, 'dataset.json');
+    const codes = path.join(dir, 'codes');
+    if (!fs.existsSync(manifest)) throw new Error(`Regularisation corpus has no dataset.json: ${dir}`);
+    const n = fs.existsSync(codes) ? fs.readdirSync(codes).filter(f => f.endsWith('.codes')).length : 0;
+    if (n === 0) throw new Error(`Regularisation corpus has no codes/*.codes: ${dir}`);
+    const topK = Number.isFinite(Number(r.topK)) ? Math.trunc(Number(r.topK)) : MM3_LM_DEFAULTS.regTopK;
+    return {
+      regManifest:    manifest,
+      regCaptionsDir: dir,
+      regCodesDir:    codes,
+      regPriorDir:    path.join(dir, 'prior'),
+      regEvery:       every,
+      regTopK:        Math.min(256, Math.max(1, topK)),
+    };
+  }
   const id = typeof r.datasetId === 'string' ? r.datasetId : '';
   if (!id || every <= 0) return {};
   if (every < 2) {
@@ -2240,6 +2266,7 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       cropStartFrac: num('cropStartFrac', D.cropStartFrac, 0, 1),
       cropEndFrac:   num('cropEndFrac', D.cropEndFrac, 0, 1),
       cropStartTiles: num('cropStartTiles', D.cropStartTiles, 1, 64),
+      trimTrailingSilence: b.trimTrailingSilence === true,
       depthLossWeight: num('depthLossWeight', D.depthLossWeight, 0, 10),
       depthLossFrames: num('depthLossFrames', D.depthLossFrames, 1, 1024),
       optimizer,

@@ -98,6 +98,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -515,6 +516,14 @@ struct MM3LmTrainArgs {
     // the pacing. Kept switchable because it changes the recipe: a run trained
     // under "zero" is not comparable with one trained under "song".
     std::string crop_anchor = "song";     // song | zero
+    /** Stage A of the end-of-song work (2026-09-07). When set, the style corpus
+     *  loader reads `<codes_dir>/trim.json` ({"<id>": keep_frames}) and drops
+     *  every frame after keep_frames, so the EOS target follows the last
+     *  MUSICAL frame instead of the 2-4 s of digital silence most rips carry.
+     *  The file is produced from the AUDIO (tools/mm3-trim-silence) and is
+     *  inspected before use; the trainer only applies it. Reg corpora are never
+     *  trimmed. Off by default. */
+    bool        trim_trailing_silence = false;
 
     // ── FROZEN KV PREFIX (train/lm-kvprefix.h) ─────────────────────────────
     //
@@ -607,6 +616,13 @@ struct MM3LmSample {
     std::vector<int32_t> prompt_trigger_only;
     std::vector<int32_t> codes;           // [n_frames * 8], warm-up row already dropped
     int64_t              n_frames = 0;
+    /** Absolute frame index of codes[0] in the track this sample was cut from.
+     *  0 for ordinary corpora. A regularisation corpus of EXCERPTS (the last K
+     *  frames of a base-model plan, so the excerpt ends at a real EOS) carries
+     *  the excerpt's true start here, read from the manifest's `frame_offset`,
+     *  so under --crop-anchor song the teacher capture and the reg step both
+     *  place the frames at the positions the base saw. */
+    int64_t              frame_offset = 0;
 };
 
 // ── data ────────────────────────────────────────────────────────────────────
@@ -772,10 +788,36 @@ static bool mm3_lm_load_samples_from(const std::string & manifest, const std::st
                                      const std::string & codes_dir, const std::string & lm_path,
                                      const std::string & trigger_prefix,
                                      const std::string & caption_override,
+                                     bool trim_trailing,
                                      const MM3TrainLm & t,
                                      std::vector<MM3LmSample> * out, std::string * err) {
     struct { std::string manifest, captions_dir, codes_dir, lm_path; } a {
         manifest, captions_dir, codes_dir, lm_path };
+    // Stage A: per-track keep_frames from <codes_dir>/trim.json, applied below.
+    std::map<std::string, int64_t> trim;
+    if (trim_trailing) {
+        std::string tbuf;
+        if (!mm3_lm_read_file(a.codes_dir + "/trim.json", &tbuf)) {
+            if (err) *err = "--trim-trailing-silence set but " + a.codes_dir + "/trim.json is missing";
+            return false;
+        }
+        yyjson_doc * td = yyjson_read(tbuf.c_str(), tbuf.size(), 0);
+        yyjson_val * tr = td ? yyjson_doc_get_root(td) : nullptr;
+        if (!tr || !yyjson_is_obj(tr)) {
+            if (td) yyjson_doc_free(td);
+            if (err) *err = a.codes_dir + "/trim.json is not a JSON object";
+            return false;
+        }
+        yyjson_obj_iter ti = yyjson_obj_iter_with(tr);
+        yyjson_val *    tk;
+        while ((tk = yyjson_obj_iter_next(&ti))) {
+            yyjson_val * tv = yyjson_obj_iter_get_val(tk);
+            if (tv && yyjson_is_num(tv)) trim[yyjson_get_str(tk)] = (int64_t) yyjson_get_num(tv);
+        }
+        yyjson_doc_free(td);
+        fprintf(stderr, "[mm3-lm-train] trailing-silence trim: %zu entries from %s/trim.json\n", trim.size(),
+                a.codes_dir.c_str());
+    }
     std::vector<MM3LmSample> & samples = *out;
         std::string jbuf;
         if (!mm3_lm_read_file(a.manifest, &jbuf)) {
@@ -834,6 +876,20 @@ static bool mm3_lm_load_samples_from(const std::string & manifest, const std::st
             sm.n_frames = n_rows - 1;                        // drop the warm-up row
             sm.codes.resize((size_t) (sm.n_frames * 8));
             memcpy(sm.codes.data(), cbuf.data() + 8 * sizeof(int32_t), sm.codes.size() * sizeof(int32_t));
+            {
+                auto tit = trim.find(id);
+                if (tit != trim.end() && tit->second > 0 && tit->second < sm.n_frames) {
+                    fprintf(stderr, "[mm3-lm-train] trim %s: %lld -> %lld frames (-%.1f s of trailing silence)\n",
+                            id.c_str(), (long long) sm.n_frames, (long long) tit->second,
+                            (double) (sm.n_frames - tit->second) / 25.0);
+                    sm.n_frames = tit->second;
+                    sm.codes.resize((size_t) (sm.n_frames * 8));
+                }
+            }
+            {
+                yyjson_val * ov = yyjson_obj_get(s, "frame_offset");
+                if (ov && yyjson_is_num(ov)) sm.frame_offset = (int64_t) yyjson_get_num(ov);
+            }
             if (!trigger_prefix.empty()) {
                 // Front of the FIRST line, comma + space — the training-row shape.
                 size_t lead = caption.find_first_not_of(" \t\r\n\xEF\xBB\xBF");
@@ -887,7 +943,7 @@ static bool mm3_lm_load_samples(const MM3LmTrainArgs & a, const MM3TrainLm & t,
     }
     return mm3_lm_load_samples_from(a.manifest, a.captions_dir, a.codes_dir, a.lm_path,
                                     a.trigger_prepend && !a.trigger.empty() ? a.trigger + ", " : "",
-                                    shared, t, out, err);
+                                    shared, a.trim_trailing_silence, t, out, err);
 }
 
 // ── finite-difference gradient check ────────────────────────────────────────
@@ -3353,7 +3409,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     if (reg_on && rc == 0) {
         std::string rerr;
         if (!mm3_lm_load_samples_from(a.reg_manifest, a.reg_captions_dir, a.reg_codes_dir, a.lm_path,
-                                      /*trigger_prefix=*/"", /*caption_override=*/"", t,
+                                      /*trigger_prefix=*/"", /*caption_override=*/"", /*trim_trailing=*/false, t,
                                       &reg_samples, &rerr)
             || reg_samples.empty()) {
             fatal_msg = "regularisation set has no usable samples"
@@ -3392,7 +3448,12 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                         rs.id.c_str(), (long long) S, (long long) S_max);
                 continue;
             }
-            const std::string path = mm3_prior_path(prior_dir, rs.id, a.lm_path, a.reg_topk);
+            // An excerpt's teacher was captured at ITS positions; a cache for the
+            // same id at another offset is a different teacher, so the offset is
+            // in the name like the base model and K already are.
+            const std::string path = mm3_prior_path(
+                prior_dir, rs.frame_offset ? rs.id + ".o" + std::to_string((long long) rs.frame_offset) : rs.id,
+                a.lm_path, a.reg_topk);
             std::string       lerr;
             if (mm3_prior_load(path, a.reg_topk, (int) n_sup, W, &reg_priors[i], &lerr)) {
                 loaded++;
@@ -3437,7 +3498,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             }
             pos.resize((size_t) S);
             for (int64_t j = 0; j < P; j++)   pos[(size_t) j] = (int32_t) j;
-            for (int64_t j = 0; j < Fin; j++) pos[(size_t) (P + j)] = (int32_t) (P + j);
+            // Excerpt corpora carry their true start; under --crop-anchor song the
+            // teacher sees the frames where the base saw them (frame_offset is 0
+            // for ordinary corpora, so this is the old P + j there).
+            const int64_t cap_off = anchor_song ? rs.frame_offset : 0;
+            for (int64_t j = 0; j < Fin; j++) pos[(size_t) (P + j)] = (int32_t) (P + cap_off + j);
             ggml_backend_tensor_set(t_prompt, rs.prompt.data(), 0, (size_t) P * sizeof(int32_t));
             ggml_backend_tensor_set(t_sem, sem_in.data(), 0, sem_in.size() * sizeof(int32_t));
             ggml_backend_tensor_set(t_ac, ac_in.data(), 0, ac_in.size() * sizeof(int32_t));
@@ -3600,7 +3665,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             const int64_t f0     = c0 - lead;               // first INPUT frame
             const int64_t Finw   = Fin + lead;
             const int64_t S      = P + Finw;
-            const int64_t anchor0 = anchor_song ? f0 : 0;
+            const int64_t anchor0 = anchor_song ? (s.frame_offset + f0) : 0;   // frame_offset: excerpt corpora only
 
             // Acoustic loss inputs for this micro-step. Reg steps opt out: the
             // prior path scores soft targets from the base model and has no

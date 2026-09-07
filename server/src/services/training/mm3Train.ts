@@ -1069,6 +1069,10 @@ export interface ResolvedMm3TrainLmOptions {
   cropStartFrac: number;
   cropEndFrac: number;
   cropStartTiles: number;
+  /** Stage A (2026-09-07): drop each style track's trailing digital silence
+   *  before the EOS target, from <codes>/trim.json (tools/mm3-trim-silence).
+   *  Off unless the request asks; the file must exist when it does. */
+  trimTrailingSilence?: boolean;
   depthLossWeight: number;
   depthLossFrames: number;
   optimizer: 'muon' | 'adamw' | 'prodigy';
@@ -1187,6 +1191,7 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     args.push('--crop-end-frac', String(o.cropEndFrac));
     args.push('--crop-start-tiles', String(o.cropStartTiles));
   }
+  if (o.trimTrailingSilence) args.push('--trim-trailing-silence');
   // The second stopping strategy. --steps is still passed above and is still
   // the cap: a target the run never reaches has to end somewhere, and "runs
   // forever" is not an acceptable answer to "train until the loss is 0.2".

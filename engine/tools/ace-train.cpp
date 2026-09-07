@@ -818,6 +818,10 @@ static void print_usage(void) {
             "                                            crop's coverage of a track (see\n"
             "                                            --crop-endpoint-k), so a short crop relaxes\n"
             "                                            toward uniform instead of spiking frame 0.\n"
+            "    --trim-trailing-silence     off         drop frames after <codes>/trim.json's keep_frames\n"
+            "                                            (audio-derived, tools/mm3-trim-silence) so EOS\n"
+            "                                            follows the last musical frame, not the rip's\n"
+            "                                            digital-silence tail. Style corpus only.\n"
             "    --crop-end-frac <f>         0.2         same ceiling scaling as the start share.\n"
             "                                            Splits half flush-jitter (crop flush with\n"
             "                                            the track end, length jittered crop/2..crop\n"
@@ -1870,6 +1874,7 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--prefix-sigma")) a.prefix_sigma = (float) atof(next("--prefix-sigma"));
         else if (!strcmp(argv[i], "--prefix-chunk"))  a.prefix_chunk  = atoi(next("--prefix-chunk"));
         else if (!strcmp(argv[i], "--prefix-selftest")) a.prefix_selftest = true;
+        else if (!strcmp(argv[i], "--trim-trailing-silence")) a.trim_trailing_silence = true;
         else if (!strcmp(argv[i], "--target-loss"))   a.target_loss  = (float) atof(next("--target-loss"));
         else if (!strcmp(argv[i], "--target-loss-epochs"))
                                                      a.target_loss_epochs = atoi(next("--target-loss-epochs"));
