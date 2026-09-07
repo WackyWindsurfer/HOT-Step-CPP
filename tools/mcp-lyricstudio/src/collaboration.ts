@@ -27,7 +27,7 @@ Each join returns a participant_id for this chat; retain it and identify yoursel
 After reading a page, retain next_after_id. If has_more is true, read the next page before replying. Never use your posted message ID as the read cursor: other messages may have arrived before it.
 Reads are compact by default: brief and participant list arrive on the initial read only; decision text arrives initially and with a new decision event. Retain earlier values. Older decision bodies are revision references. Use compact=false for full historical text or refreshed participant metadata. Write results acknowledge IDs without echoing your text.
 Use collab_wait_for_message with that cursor between responses. A timeout is not a message: do not post filler or respond repeatedly to your own messages.
-Stop waiting after 3 consecutive timeouts, at the user's deadline, or after 8 substantive replies from you, whichever comes first. Summarize remaining questions in your chat.
+An empty wait ends only that tool call, not your participation. Keep calling collab_wait_for_message while the discussion is active, including while another participant researches. There is no automatic idle-time or reply-count cutoff. Stop when the requested discussion is complete, the room is paused or closed, or the user asks you to stop or sets a deadline that has arrived. Do not end your chat turn merely because repeated waits return no messages. Keep individual waits short so user steering stays responsive.
 Pause or close the room when asked; all participants must stop discussion work when its status is paused or closed. Resume only on user direction.
 record_decision saves an agent proposal and unresolved disagreements; it does not confer user approval or permission to implement.
 MCP does not automatically wake a chat after its turn ends. The user must start or resume participation in each chat.
@@ -350,7 +350,7 @@ export function registerCollaborationTools(server: McpServer, dbPath = process.e
   server.tool('collab_decline_request', 'Resolve your pending ping when no substantive reply is appropriate. Read it first. Does not consume or unlock a discussion turn.',
     { ...identity, reason: z.string().trim().min(1).max(240), read_after_id: z.number().int().min(0) },
     async ({ room, participant_id, request_id, reason, read_after_id }) => result(() => get().declineRequest(room, participant_id, request_id, reason, read_after_id)));
-  server.tool('collab_wait_for_message', 'Wait for new messages in this active turn; does not wake idle chats. Retain next_after_id; stop after 3 consecutive timeouts or when paused/closed. Never post filler on timeout.',
+  server.tool('collab_wait_for_message', 'Wait for new messages in this active turn; does not wake idle chats. Retain next_after_id and repeat empty waits while active, including during peer research. No automatic idle or reply-count cutoff. Stop on completion, pause/close, or user stop/deadline. Never post filler on timeout.',
     { ...cursor, timeout_ms: z.number().int().min(0).max(25000).default(20000) },
     async ({ room, after_id, limit, timeout_ms, compact }, extra) => result(async () => { const page = await get().wait(room, after_id, timeout_ms, limit, extra.signal); return compact ? { ...compactPage(page, after_id), timed_out: page.timed_out } : page; }));
   server.tool('collab_set_status', 'Pause/close on user request or completion; resume (active) only on user direction. Status changes are visible to all waiting participants.',

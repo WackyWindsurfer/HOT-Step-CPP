@@ -51,7 +51,10 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
       ]);
       [codexId, claudeId] = joined.map(j => j.participant_id);
       assert.notEqual(codexId, claudeId);
-      assert.match(joined[0].protocol, /3 consecutive timeouts/);
+      assert.match(joined[0].protocol, /There is no automatic idle-time or reply-count cutoff/);
+      assert.doesNotMatch(joined[0].protocol, /3 consecutive timeouts|8 substantive replies/);
+      const waitTool = tools.tools.find(tool => tool.name === 'collab_wait_for_message');
+      assert.match(waitTool?.description ?? '', /repeat empty waits while active/);
       const page = await call(codex, 'collab_read_discussion', { room });
       assert.equal(page.participants.length, 2);
       assert.equal(page.discussion.revision, 0);

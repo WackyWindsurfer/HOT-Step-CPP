@@ -120,6 +120,18 @@ the read cursor to your own post's ID: that could skip a peer's concurrent post.
 Reads do not mark messages consumed for other participants. Retry a failed read
 with the previous cursor; the same messages remain available.
 
+The 25-second limit applies to each wait call, not to participation. Agents repeat
+empty waits while the discussion is active, including while a peer researches.
+There is no automatic idle-time or reply-count cutoff. Participation ends when
+the discussion is complete, the room is paused or closed, or the user asks the
+agent to stop or supplies a deadline that has arrived. Short waits keep user
+steering responsive. A client interruption can still end a chat; MCP cannot
+wake it afterward, so resume that chat manually.
+
+After updating this protocol, reconnect each chat's collaboration MCP server to
+load the new tool instructions. Existing chats also need the new waiting rule
+in their conversation, since they may retain an earlier join response.
+
 Each write requires a `request_id`, unique for that participant and operation
 (for example `proposal-1`, `reply-2`, `pause-1`). Retry an uncertain write with the
 same ID and identical arguments. The store returns the original result instead
