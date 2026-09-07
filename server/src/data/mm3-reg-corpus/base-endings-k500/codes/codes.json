@@ -1,0 +1,8 @@
+{
+ "kind": "mm3_forced_codes",
+ "producer": "tools/mm3-reg-corpus/build.py",
+ "tracks": 24,
+ "warmup_row": true,
+ "columns": "semantic,acoustic1..7",
+ "note": "base-plan excerpts; row 0 is the frame before the excerpt (dropped by the loader)"
+}

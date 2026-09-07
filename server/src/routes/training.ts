@@ -63,7 +63,8 @@
 import { Router, Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
-import { config } from '../config.js';
+import { fileURLToPath } from 'url';
+import { config, PORTABLE_MODE, PROJECT_ROOT } from '../config.js';
 import { engineReady } from '../engineState.js';
 import { aceClient } from '../services/aceClient.js';
 import { listProviders, getProvider } from '../services/lireek/llm/registry.js';
@@ -2105,6 +2106,25 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
     // fields: `{preset:'thorough'}` alone trains Thorough, `{preset:'thorough',
     // steps: 800}` trains Thorough for 800 steps. No name = the defaults = Fast.
     const D = applyMm3Preset(MM3_LM_DEFAULTS, b.preset);
+    // Prior preservation on BASE-MODEL ENDINGS is part of the default recipe
+    // (2026-09-07 evening): without it a Green Day adapter on this recipe hit
+    // the 300 s ceiling in 6 of 6 renders, with it 3 of 6 ended naturally and
+    // every ending Rob heard was a real outro. The corpus is base-plan
+    // excerpts (tools/mm3-reg-corpus) shipped under the training data dir; a
+    // request that names its own corpus, or sends `regularisation: null`,
+    // overrides this. Reg steps are EXTRA: the default step count grows so
+    // the artist still gets D.steps updates (every 3rd step is a reg step).
+    // A user-built corpus under the training dir wins; otherwise the shipped one
+    // (server/src/data in dev, copied to server/data by the release packager).
+    const defaultRegDir = [
+      path.join(trainingBaseDir, 'mm3-reg-corpus', 'base-endings-k500'),
+      PORTABLE_MODE
+        ? path.join(PROJECT_ROOT, 'server', 'data', 'mm3-reg-corpus', 'base-endings-k500')
+        : path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'data', 'mm3-reg-corpus', 'base-endings-k500'),
+    ].find(d => fs.existsSync(path.join(d, 'dataset.json'))) ?? '';
+    const regDefaulted = b.regularisation === undefined && defaultRegDir !== '';
+    const regRaw = regDefaulted ? { corpusDir: defaultRegDir, every: 3 } : (b.regularisation ?? undefined);
+    const stepsDefault = regDefaulted ? D.steps + Math.floor(D.steps / 2) : D.steps;
     // Three-way now. The old two-way collapsed anything that was not 'adamw'
     // onto the default, which with a prodigy default would have silently
     // ignored a request for muon.
@@ -2171,7 +2191,7 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
     // the user can act on, not a 500 from inside the queue.
     let reg: ReturnType<typeof resolveMm3Regularisation>;
     try {
-      reg = resolveMm3Regularisation(b.regularisation, ds.id);
+      reg = resolveMm3Regularisation(regRaw, ds.id);
     } catch (err: any) {
       res.status(400).json({ error: err?.message || String(err) });
       return;
@@ -2256,7 +2276,7 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       rank:        num('rank', D.rank, 1, 512),
       alpha:       num('alpha', D.alpha, 1, 2048),
       lr:          num('lr', D.lr, 1e-7, 1e-2),
-      steps:       num('steps', D.steps, 1, 100000),
+      steps:       num('steps', stepsDefault, 1, 100000),
       saveEvery:   num('saveEvery', D.saveEvery, 0, 100000),
       warmup:      num('warmup', D.warmup, 0, 100000),
       gradAccum:   num('gradAccum', D.gradAccum, 1, 64),

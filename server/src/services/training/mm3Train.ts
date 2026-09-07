@@ -508,7 +508,7 @@ export const MM3_LM_DEFAULTS = {
   // copy, are on MM3LmTrainArgs in engine/src/train/mm3-lm-train-run.h.
   rank: 128,
   alpha: 128,
-  lr: 1.6e-4,   // the Fast preset (2026-09-07); Balanced/Thorough use 8e-5 — see MM3_LM_PRESETS
+  lr: 8e-5,     // the default (Balanced) recipe; Fast's 1.6e-4 is experimental — see MM3_LM_PRESETS
   /** 1200, down from 2500, because a step is no longer the same size. At the
    *  128-frame crop a step supervised 5 seconds; at 4272 it supervises 171, so
    *  2500 steps went from 320k supervised frames to 10.7M — 312 epochs over 8
@@ -534,7 +534,7 @@ export const MM3_LM_DEFAULTS = {
    *  250 on 2026-08-26 to give a target-loss run room to reach one; a 250-step
    *  cap would have ended almost every run before the target could bind, which
    *  is the same as not having a target. */
-  steps: 300,   // the Fast preset (2026-09-07); Balanced/Thorough use 500 — see MM3_LM_PRESETS
+  steps: 500,   // the default (Balanced) recipe; Fast's 300 is experimental — see MM3_LM_PRESETS
   /** ── Stopping strategy ──────────────────────────────────────────────────
    *
    *  'steps', 500, since 2026-09-06 (Rob): the default method is HOT-PiZZA
@@ -642,7 +642,7 @@ export const MM3_LM_DEFAULTS = {
    *  blind (67.5 vs 68 of 90) and the combined safe stack (crop 500 + prefix
    *  1024 + prefill chunk 1024) tied the crop-750 recipe again (67 vs 70.5,
    *  noise ~6) at 3.1 s/step against 4.5: 26 min per 500 steps instead of 37. */
-  maxFrames: 500,
+  maxFrames: 750,
   /** `structured`: a fixed share of steps pinned to frame 0, a fixed share
    *  flush to the track's end, the rest random.
    *
@@ -774,7 +774,7 @@ export const MM3_LM_DEFAULTS = {
    *  only comparable ACROSS runs while the crop it is measured at stays put. */
   /** = maxFrames (the route clamps it there anyway; stating it avoids the
    *  silently-skipped-eval trap this comment block documents). */
-  evalCrop: 500,
+  evalCrop: 750,
   /** LyCORIS-style rank masking, part of bghira's published config. */
   rankDropout: 0.1,
   /** LoKr: dW = kron(w1, w2) instead of a low-rank pair.
@@ -840,13 +840,13 @@ export const MM3_LM_DEFAULTS = {
    *  the prefill through every layer, not the attention over it. */
   /** 1024 since 2026-09-07 (Rob): tied 2048 blind (69 vs 68 of 90) and takes
    *  another 12% off the step; part of the safe stack with crop 500. */
-  prefixFrames: 1024,
+  prefixFrames: 2048,
   /** Prefill positions per graph. Trades host graph-build overhead against the
    *  transient attention scores of one chunk; 256 is a middle setting and has
    *  no effect on the result, only on speed and peak. 1024 since 2026-09-07:
    *  3.72 vs 4.46 s/step at 256 with the same step-1 loss and peak, then
    *  heard inside the safe stack. */
-  prefixChunk: 1024,
+  prefixChunk: 256,
   /** Prove the prefix before training on it. Attention over [prefix ; window]
    *  is mathematically identical to one long crop covering both, so the
    *  supervised CE must not care which way it was produced. It caught two real
@@ -961,39 +961,44 @@ export const MM3_LM_DEFAULTS = {
   prefixN: 0,
 } as const;
 
-/** The three MM3 training presets (Rob, 2026-09-07). Each is a set of
- *  overrides on MM3_LM_DEFAULTS; everything not listed is shared. All three
- *  were heard blind on alk3_crimson against each other and tied inside the
- *  ~6/90 noise floor, so the presets trade time, not audible quality — with
- *  one caveat carried in the Fast blurb.
+/** The three MM3 training presets. Each is a set of overrides on
+ *  MM3_LM_DEFAULTS; everything not listed is shared.
  *
- *   fast      2x LR over 300 steps, prefix 1024, crop 500: 15 min per album
- *             (3.1 s/step). Across two seeds 5 of 6 songs were as good as
- *             the slower presets and one planned a song with no vocals.
- *   balanced  the same window at the measured LR over 500 steps: 26 min.
- *             No plan failure on record.
+ *   balanced  THE DEFAULT (Rob, 2026-09-07 evening): the recipe that made
+ *             the rock-10 adapters — crop 750, a 2048-frame history prefilled
+ *             in 256-token chunks, 500 steps at 8e-5. ~35 min per album.
+ *             Retrained on the same day's binary it reproduced the morning's
+ *             adapter to three decimals and Rob heard intelligible vocals.
+ *   fast      EXPERIMENTAL. The 2026-09-07 speed stack (crop 500, history
+ *             1024, chunk 1024, 300 steps at 2x LR) tied blind on 90 s
+ *             previews of alk3_crimson, then failed on greenday_warning in
+ *             three different ways across five runs: Simlish vocals, a
+ *             vocal-free plan, an out-of-tune organ. Neither the LR nor the
+ *             chunk size alone was the lever (lr 8e-5 and chunk 256 arms both
+ *             failed), so crop 500 / history 1024 / 300 steps remain suspect.
+ *             Left selectable for the bisect; not for real adapters.
  *   thorough  crop 750 and a 4096-frame history over 1000 steps: ~80 min.
  *             The window and history behind the highest scores recorded
- *             here (72 and 70.5 of 90); 1000 steps was the top-scoring depth
- *             (72 vs 68 at 500, inside noise, no collapse). Rob's call.
+ *             here (72 and 70.5 of 90). Carries the chunk-1024 prefill that
+ *             Fast also has; not implicated on its own, not re-verified.
  *
- *  MM3_LM_DEFAULTS carries the Fast values, so an empty request and the
+ *  MM3_LM_DEFAULTS carries the Balanced values, so an empty request and the
  *  form's initial state are the same recipe. The route applies a named
  *  preset UNDER the request's own fields (applyMm3Preset). */
 export type Mm3PresetName = 'fast' | 'balanced' | 'thorough';
-export const MM3_LM_DEFAULT_PRESET: Mm3PresetName = 'fast';
+export const MM3_LM_DEFAULT_PRESET: Mm3PresetName = 'balanced';
 export const MM3_LM_PRESETS: Record<Mm3PresetName, {
   steps: number; lr: number; maxFrames: number; prefixFrames: number; prefixChunk: number;
 }> = {
   fast:     { steps: 300, lr: 1.6e-4, maxFrames: 500, prefixFrames: 1024, prefixChunk: 1024 },
-  balanced: { steps: 500, lr: 8e-5,   maxFrames: 500, prefixFrames: 1024, prefixChunk: 1024 },
+  balanced: { steps: 500, lr: 8e-5,   maxFrames: 750, prefixFrames: 2048, prefixChunk: 256 },
   thorough: { steps: 1000, lr: 8e-5,  maxFrames: 750, prefixFrames: 4096, prefixChunk: 1024 },
 };
 export function isMm3PresetName(v: unknown): v is Mm3PresetName {
   return v === 'fast' || v === 'balanced' || v === 'thorough';
 }
 /** Defaults with a named preset laid over them; an unknown or absent name
- *  returns the defaults untouched (which are the Fast preset). */
+ *  returns the defaults untouched (which are the Balanced preset). */
 type Mm3PresetFields = (typeof MM3_LM_PRESETS)[Mm3PresetName];
 /** The defaults with the preset-governed fields widened to plain numbers. */
 export type Mm3EffectiveDefaults = Omit<typeof MM3_LM_DEFAULTS, keyof Mm3PresetFields> & Mm3PresetFields;

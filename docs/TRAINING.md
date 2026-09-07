@@ -101,13 +101,25 @@ peak. Raising the learning rate to shorten the run was tried and rejected:
 every 2x-LR arm scored a few points under, and one such run planned a song
 with no vocals. Turning the acoustic loss off was the lowest-scored arm.
 
-The Training Studio offers the result as three recipes (Recipe row on the
-MM3 card; `preset` on the API): **Fast** (default: 300 steps at `--lr
-1.6e-4`, crop 500, history 1024, about 15 min per album, one instrumental
-plan in six blind songs), **Balanced** (500 steps at 8e-5, same window, 26
-min, no failures on record) and **Thorough** (1000 steps, crop 750, history
-4096, about 80 min). All three tied blind; they trade minutes, not audible
-quality, with the caveat noted on Fast.
+The Training Studio offers three recipes (Recipe row on the MM3 card;
+`preset` on the API): **Balanced** (default: 500 steps at `--lr 8e-5`, crop
+750, history 2048 prefilled in 256-token chunks, about 35 min per album; the
+recipe behind every adapter that has passed a listening test here),
+**Thorough** (1000 steps, crop 750, history 4096, about 80 min) and **Fast**
+(experimental: 300 steps at `1.6e-4`, crop 500, history 1024, about 15 min).
+Fast tied the others blind on 90 s previews of one album, then produced
+unintelligible or missing vocals on a full album in five runs out of five
+(2026-09-07); the learning rate and the prefill chunk were each cleared as
+the sole cause, so it stays selectable only for the bisect.
+
+Since 2026-09-07 the default recipe also runs **prior preservation against
+base-model endings**: every 3rd step scores a 20 s excerpt of a base-model
+plan (its opening or its natural ending) against the frozen base, from a
+corpus shipped under `<training>/mm3-reg-corpus/base-endings-k500`
+(`tools/mm3-reg-corpus`). Without it, adapters on this recipe ran to the
+300 s ceiling in 6 of 6 renders; with it 3 of 6 ended naturally. The step
+count grows by half so the artist still gets 500 updates. Send
+`regularisation: null` to turn it off, or name your own corpus.
 
 Two cost knobs for any PiSSA-family run (2026-09-06): `--pissa-cache-dir <dir>`
 stores the SVD init factors once per base file / rank / oversample / iters /

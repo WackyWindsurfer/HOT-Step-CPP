@@ -431,7 +431,7 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
   // whichever preset the four governing fields currently equal, and shows
   // Custom otherwise. Editing a field therefore leaves the preset row honest
   // without a second piece of state that could disagree with the form.
-  const PRESET_ORDER: Mm3PresetName[] = ['fast', 'balanced', 'thorough'];
+  const PRESET_ORDER: Mm3PresetName[] = ['balanced', 'thorough', 'fast'];   // default first; Fast is experimental
   const presets = status?.presets;
   const activePreset: Mm3PresetName | 'custom' = (() => {
     if (!presets || !form) return 'custom';
