@@ -1,0 +1,26 @@
+"Roots Reggae"
+"caption": "Classic roots reggae groove with offbeat guitar skank, warm organ bubble, steady one-drop drum feel, and deep melodic bass. Positive conscious vibe, sunny mix, relaxed tempo.",
+"thinking": true,
+"enable_lm": true,
+"parallel_thinking": true,
+"main_model_path": "acestep-v15-sft",
+"lm_model": "acestep-5HZ-lm-1.7B",
+
+
+"Dub": {
+          "caption": "Dub reggae with heavy melodic bass, one-drop drums, and lots of space: spring reverb, tape echoes, and dropouts. Minimal vocals, more instrumental focus, with occasional chopped vocal snippets. Warm analog tone, deep low end, and hypnotic groove.",
+  (rest is same)
+
+
+        "Dancehall": {
+          "caption": "Modern dancehall rhythm with punchy kick, crisp snare, syncopated percussion, and a rolling bassline. Energetic toasting style vocal, callouts and swagger. Bright but tight mix, strong groove for dancing, with minimal melodic clutter.",
+
+(rest is same from 1st preset)
+
+
+       "Lovers Rock": {
+          "caption": "Lovers rock with smooth reggae groove, warm bass, gentle skank guitar, soft keys, and a romantic, laid-back feel. Light percussion, sweet melodies, and a silky vocal delivery with tasteful reverb. Cozy, warm mix with rounded highs.",
+ 
+
+       "Reggae Fusion": {
+          "caption": "Reggae fusion blending classic skank and bass with contemporary pop/R&B rhythm elements. Clean drums, warm keys, catchy melodic hooks, and an upbeat feel. Modern mix with clear vocals, but keeps reggae swing and offbeat emphasis.",
