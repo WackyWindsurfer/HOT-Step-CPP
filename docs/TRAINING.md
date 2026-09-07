@@ -105,8 +105,8 @@ The Training Studio offers the result as three recipes (Recipe row on the
 MM3 card; `preset` on the API): **Fast** (default: 300 steps at `--lr
 1.6e-4`, crop 500, history 1024, about 15 min per album, one instrumental
 plan in six blind songs), **Balanced** (500 steps at 8e-5, same window, 26
-min, no failures on record) and **Thorough** (500 steps, crop 750, history
-4096, about 40 min). All three tied blind; they trade minutes, not audible
+min, no failures on record) and **Thorough** (1000 steps, crop 750, history
+4096, about 80 min). All three tied blind; they trade minutes, not audible
 quality, with the caveat noted on Fast.
 
 Two cost knobs for any PiSSA-family run (2026-09-06): `--pissa-cache-dir <dir>`

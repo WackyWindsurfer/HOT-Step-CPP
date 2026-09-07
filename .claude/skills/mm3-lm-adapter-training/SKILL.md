@@ -69,7 +69,7 @@ fields, so `{preset:'thorough'}` alone trains Thorough):**
 |---|---|---|---|---|---|---|
 | **Fast** (default) | 300 | 1.6e-4 | 500 | 1024 | 15 | tied blind 5/6 songs over two seeds; 1 vocal-free plan |
 | Balanced | 500 | 8e-5 | 500 | 1024 | 26 | tied the crop-750 recipe, no failures |
-| Thorough | 500 | 8e-5 | 750 | 4096 | ~40 | the config behind the top scores (72, 70.5), never separable from Balanced |
+| Thorough | 1000 | 8e-5 | 750 | 4096 | ~80 | crop/history of the top scores (72, 70.5) at the top-scoring depth (1000 = 72 vs 68 at 500, inside noise); Rob's call over my 500 |
 
 All three share prefill chunk 1024, flash, AdamW, HOT-PiZZA r128, f16 factors,
 structured crops and the acoustic loss. `MM3_LM_DEFAULTS` carries the Fast

@@ -972,9 +972,10 @@ export const MM3_LM_DEFAULTS = {
  *             the slower presets and one planned a song with no vocals.
  *   balanced  the same window at the measured LR over 500 steps: 26 min.
  *             No plan failure on record.
- *   thorough  crop 750 and a 4096-frame history, 500 steps: ~40 min. The
- *             configuration behind the highest scores ever recorded here
- *             (72 and 70.5 of 90), though never separable from balanced.
+ *   thorough  crop 750 and a 4096-frame history over 1000 steps: ~80 min.
+ *             The window and history behind the highest scores recorded
+ *             here (72 and 70.5 of 90); 1000 steps was the top-scoring depth
+ *             (72 vs 68 at 500, inside noise, no collapse). Rob's call.
  *
  *  MM3_LM_DEFAULTS carries the Fast values, so an empty request and the
  *  form's initial state are the same recipe. The route applies a named
@@ -986,7 +987,7 @@ export const MM3_LM_PRESETS: Record<Mm3PresetName, {
 }> = {
   fast:     { steps: 300, lr: 1.6e-4, maxFrames: 500, prefixFrames: 1024, prefixChunk: 1024 },
   balanced: { steps: 500, lr: 8e-5,   maxFrames: 500, prefixFrames: 1024, prefixChunk: 1024 },
-  thorough: { steps: 500, lr: 8e-5,   maxFrames: 750, prefixFrames: 4096, prefixChunk: 1024 },
+  thorough: { steps: 1000, lr: 8e-5,  maxFrames: 750, prefixFrames: 4096, prefixChunk: 1024 },
 };
 export function isMm3PresetName(v: unknown): v is Mm3PresetName {
   return v === 'fast' || v === 'balanced' || v === 'thorough';
