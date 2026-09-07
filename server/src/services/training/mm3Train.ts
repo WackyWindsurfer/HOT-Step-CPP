@@ -508,7 +508,7 @@ export const MM3_LM_DEFAULTS = {
   // copy, are on MM3LmTrainArgs in engine/src/train/mm3-lm-train-run.h.
   rank: 128,
   alpha: 128,
-  lr: 8e-5,
+  lr: 1.6e-4,   // the Fast preset (2026-09-07); Balanced/Thorough use 8e-5 — see MM3_LM_PRESETS
   /** 1200, down from 2500, because a step is no longer the same size. At the
    *  128-frame crop a step supervised 5 seconds; at 4272 it supervises 171, so
    *  2500 steps went from 320k supervised frames to 10.7M — 312 epochs over 8
@@ -534,7 +534,7 @@ export const MM3_LM_DEFAULTS = {
    *  250 on 2026-08-26 to give a target-loss run room to reach one; a 250-step
    *  cap would have ended almost every run before the target could bind, which
    *  is the same as not having a target. */
-  steps: 500,
+  steps: 300,   // the Fast preset (2026-09-07); Balanced/Thorough use 500 — see MM3_LM_PRESETS
   /** ── Stopping strategy ──────────────────────────────────────────────────
    *
    *  'steps', 500, since 2026-09-06 (Rob): the default method is HOT-PiZZA
@@ -960,6 +960,45 @@ export const MM3_LM_DEFAULTS = {
    *  real audio history (train/mm3-lm-kvprefix.h). 0 = off. */
   prefixN: 0,
 } as const;
+
+/** The three MM3 training presets (Rob, 2026-09-07). Each is a set of
+ *  overrides on MM3_LM_DEFAULTS; everything not listed is shared. All three
+ *  were heard blind on alk3_crimson against each other and tied inside the
+ *  ~6/90 noise floor, so the presets trade time, not audible quality — with
+ *  one caveat carried in the Fast blurb.
+ *
+ *   fast      2x LR over 300 steps, prefix 1024, crop 500: 15 min per album
+ *             (3.1 s/step). Across two seeds 5 of 6 songs were as good as
+ *             the slower presets and one planned a song with no vocals.
+ *   balanced  the same window at the measured LR over 500 steps: 26 min.
+ *             No plan failure on record.
+ *   thorough  crop 750 and a 4096-frame history, 500 steps: ~40 min. The
+ *             configuration behind the highest scores ever recorded here
+ *             (72 and 70.5 of 90), though never separable from balanced.
+ *
+ *  MM3_LM_DEFAULTS carries the Fast values, so an empty request and the
+ *  form's initial state are the same recipe. The route applies a named
+ *  preset UNDER the request's own fields (applyMm3Preset). */
+export type Mm3PresetName = 'fast' | 'balanced' | 'thorough';
+export const MM3_LM_DEFAULT_PRESET: Mm3PresetName = 'fast';
+export const MM3_LM_PRESETS: Record<Mm3PresetName, {
+  steps: number; lr: number; maxFrames: number; prefixFrames: number; prefixChunk: number;
+}> = {
+  fast:     { steps: 300, lr: 1.6e-4, maxFrames: 500, prefixFrames: 1024, prefixChunk: 1024 },
+  balanced: { steps: 500, lr: 8e-5,   maxFrames: 500, prefixFrames: 1024, prefixChunk: 1024 },
+  thorough: { steps: 500, lr: 8e-5,   maxFrames: 750, prefixFrames: 4096, prefixChunk: 1024 },
+};
+export function isMm3PresetName(v: unknown): v is Mm3PresetName {
+  return v === 'fast' || v === 'balanced' || v === 'thorough';
+}
+/** Defaults with a named preset laid over them; an unknown or absent name
+ *  returns the defaults untouched (which are the Fast preset). */
+type Mm3PresetFields = (typeof MM3_LM_PRESETS)[Mm3PresetName];
+/** The defaults with the preset-governed fields widened to plain numbers. */
+export type Mm3EffectiveDefaults = Omit<typeof MM3_LM_DEFAULTS, keyof Mm3PresetFields> & Mm3PresetFields;
+export function applyMm3Preset(defaults: typeof MM3_LM_DEFAULTS, preset: unknown): Mm3EffectiveDefaults {
+  return isMm3PresetName(preset) ? { ...defaults, ...MM3_LM_PRESETS[preset] } : defaults;
+}
 
 /** Where a regularisation corpus's captured base distributions live.
  *

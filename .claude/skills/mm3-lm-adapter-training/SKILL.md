@@ -25,12 +25,12 @@ survives a fresh clone.
 --lm mm3-lm-q8_0.gguf
 --rank 128 --alpha 128 --adapter-type lora --hot-pizza          # HOT-PiZZA: PiSSA with principal-subspace dropout (2026-09-06)
 --pissa-frozen-f16 --pissa-cache-dir <adapters>/mm3-lm-adapters/_pissa-init-cache
---optimizer adamw --lr 8e-5 --lr-end-frac 0.005 --warmup 25    # AdamW tied Prodigy by ear, 2.3 GB lighter
+--optimizer adamw --lr 8e-5 --lr-end-frac 0.005 --warmup 25    # AdamW tied Prodigy by ear, 2.3 GB lighter (Balanced; Fast = 1.6e-4)
 --attn flash --prefix-frames 1024 --prefix-chunk 1024          # flash + prefix compose since 7070238e; 1024 tied 2048 tied 4096
 --max-frames 500 --crop-mode structured --crop-start-frac 0.55 --crop-end-frac 0.15   # 500 tied 750 blind (2026-09-07)
 --crop-start-tiles 3 --crop-anchor song
 --rank-dropout 0.1                                             # the mask IS the method under --hot-pizza; never 0
---steps 500 --save-every 50                                    # stop on STEPS: train loss reads 2.7-5 under HOT-PiZZA
+--steps 500 --save-every 50                                    # stop on STEPS: train loss reads 2.7-5 under HOT-PiZZA (Balanced; Fast = 300)
 --depth-loss-weight 1.0 --depth-loss-frames 128
 # captions: per-track <stem>.mm3.txt from MOSS/Gemini (the default input);
 # --caption-file <shared caption> is the FALLBACK when tracks have none
@@ -60,6 +60,22 @@ produced a vocal-free plan on 1 of 6 songs across two seeds) and turning the
 acoustic loss off (lowest score). Held-out loss every 50 has the same shape in
 every arm — it follows the seed's crop order, not the adapter — so it is not a
 stopping signal.
+
+**Presets (Rob, 2026-09-07, `MM3_LM_PRESETS` in mm3Train.ts, a Recipe row in
+the Training Studio card; the route lays `preset` under the request's own
+fields, so `{preset:'thorough'}` alone trains Thorough):**
+
+| preset | steps | lr | crop | history | min/album (5090) | record |
+|---|---|---|---|---|---|---|
+| **Fast** (default) | 300 | 1.6e-4 | 500 | 1024 | 15 | tied blind 5/6 songs over two seeds; 1 vocal-free plan |
+| Balanced | 500 | 8e-5 | 500 | 1024 | 26 | tied the crop-750 recipe, no failures |
+| Thorough | 500 | 8e-5 | 750 | 4096 | ~40 | the config behind the top scores (72, 70.5), never separable from Balanced |
+
+All three share prefill chunk 1024, flash, AdamW, HOT-PiZZA r128, f16 factors,
+structured crops and the acoustic loss. `MM3_LM_DEFAULTS` carries the Fast
+values, so an empty API body trains Fast. The runner scripts under
+`_experiments/` that post `{}` expecting the 500-step recipe now need
+`{preset:'balanced'}`.
 
 **Rob, 2026-08-25, on the LoKr configuration this replaced: "the closest we've ever gotten to
 artist replication."** Crop 750 = 30 s = ~3 s/step; he set it by ear after

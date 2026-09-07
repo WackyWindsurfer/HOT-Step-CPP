@@ -101,6 +101,14 @@ peak. Raising the learning rate to shorten the run was tried and rejected:
 every 2x-LR arm scored a few points under, and one such run planned a song
 with no vocals. Turning the acoustic loss off was the lowest-scored arm.
 
+The Training Studio offers the result as three recipes (Recipe row on the
+MM3 card; `preset` on the API): **Fast** (default: 300 steps at `--lr
+1.6e-4`, crop 500, history 1024, about 15 min per album, one instrumental
+plan in six blind songs), **Balanced** (500 steps at 8e-5, same window, 26
+min, no failures on record) and **Thorough** (500 steps, crop 750, history
+4096, about 40 min). All three tied blind; they trade minutes, not audible
+quality, with the caveat noted on Fast.
+
 Two cost knobs for any PiSSA-family run (2026-09-06): `--pissa-cache-dir <dir>`
 stores the SVD init factors once per base file / rank / oversample / iters /
 layer range and uploads the identical bytes on the next run (the init is a

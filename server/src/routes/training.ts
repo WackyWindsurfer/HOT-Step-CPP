@@ -85,7 +85,8 @@ import {
 import { getTrainingDefaults, setTrainingDefaults } from '../services/training/trainingDefaults.js';
 import {
   availableMm3Bases, MM3_VRAM_MODEL, mm3FlashVramCalibrated, recommendMm3Config,
-  MM3_LM_DEFAULTS, missingMm3TrainModels, mm3AdapterRunDir, mm3CodesDir, mm3PriorDir,
+  MM3_LM_DEFAULTS, MM3_LM_PRESETS, MM3_LM_DEFAULT_PRESET, applyMm3Preset,
+  missingMm3TrainModels, mm3AdapterRunDir, mm3CodesDir, mm3PriorDir,
   mm3RunName,
   type Mm3BasePrecision,
 } from '../services/training/mm3Train.js';
@@ -1837,6 +1838,8 @@ router.get('/datasets/:id/mm3', async (req: Request, res: Response) => {
       // present it as a proven saving.
       flashVramCalibrated: mm3FlashVramCalibrated(),
       defaults: MM3_LM_DEFAULTS,
+      presets: MM3_LM_PRESETS,
+      defaultPreset: MM3_LM_DEFAULT_PRESET,
       // For the preview-song picker (Mm3TrainCard's select, default = auto).
       // Empty when the dataset has no codes cache yet — the picker then just
       // shows "auto". Computed at the DEFAULT holdout; the card's own auto
@@ -2072,7 +2075,10 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       const v = Number(b[k]);
       return Number.isFinite(v) && v >= lo && v <= hi ? v : d;
     };
-    const D = MM3_LM_DEFAULTS;
+    // A named preset (fast / balanced / thorough) sits UNDER the request's own
+    // fields: `{preset:'thorough'}` alone trains Thorough, `{preset:'thorough',
+    // steps: 800}` trains Thorough for 800 steps. No name = the defaults = Fast.
+    const D = applyMm3Preset(MM3_LM_DEFAULTS, b.preset);
     // Three-way now. The old two-way collapsed anything that was not 'adamw'
     // onto the default, which with a prodigy default would have silently
     // ignored a request for muon.
