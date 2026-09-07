@@ -2014,6 +2014,29 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     int64_t max_prompt = 0;
     for (const auto & s : samples) max_prompt = std::max(max_prompt, (int64_t) s.prompt.size());
     for (const auto & s : holdout) max_prompt = std::max(max_prompt, (int64_t) s.prompt.size());
+    // A regularisation corpus carries its own prompts, and they are not bounded
+    // by the style corpus: a Lyric Studio MM3 caption runs ~1,100-1,300 tokens
+    // against ~600 for a captioned album track. Sizing the graph off the style
+    // corpus alone made every such reg sample "sequence exceeds S_max" at
+    // capture time, and a reg step with no prior is a silent no-op (2026-09-07:
+    // a 450-step run with 150 reg steps that trained exactly like the 300-step
+    // baseline). Pre-scan the corpus here so the graph fits it; the samples are
+    // loaded again where the priors are captured.
+    if (a.reg_every > 0 && !a.reg_manifest.empty()) {
+        std::vector<MM3LmSample> reg_probe;
+        std::string              perr;
+        if (mm3_lm_load_samples_from(a.reg_manifest, a.reg_captions_dir, a.reg_codes_dir, a.lm_path,
+                                     /*trigger_prefix=*/"", /*caption_override=*/"", /*trim_trailing=*/false, t,
+                                     &reg_probe, &perr)) {
+            int64_t reg_max = 0;
+            for (const auto & s : reg_probe) reg_max = std::max(reg_max, (int64_t) s.prompt.size());
+            fprintf(stderr, "[mm3-lm-train] reg corpus: %zu samples, longest prompt %lld tok (style %lld) - graph sized to fit both\n",
+                    reg_probe.size(), (long long) reg_max, (long long) max_prompt);
+            max_prompt = std::max(max_prompt, reg_max);
+        } else {
+            fprintf(stderr, "[mm3-lm-train] reg corpus pre-scan failed (%s); sizing off the style corpus only\n", perr.c_str());
+        }
+    }
     const int64_t K_max = a.max_frames > 0 ? a.max_frames : 4096;
     // A crop that reaches the track end uses all K frames as INPUT, and with a
     // prefix the window takes one more in front of them (see `lead`). So the
