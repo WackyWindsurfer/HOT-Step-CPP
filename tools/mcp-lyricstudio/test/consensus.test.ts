@@ -79,6 +79,8 @@ test('plan agreement closes only after all agents review the current discussion'
     });
     await t.test('human reopening resets votes and ending clears outstanding research and requests', async () => {
       store.status('room', human, 'reopen', 'active', 'Revisit this');
+      store.monitor('room', codex);
+      store.monitor('room', claude);
       assert.equal(page().consensus.reached, false);
       assert.equal(page().consensus.agents.some(a => a.agreed), false);
       store.post('room', human, 'new-ping', 'user_direction', '@claude review');

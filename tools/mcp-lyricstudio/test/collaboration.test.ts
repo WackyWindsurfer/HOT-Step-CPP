@@ -43,7 +43,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
 
     await t.test('tools load without music database; concurrent joins share one room', async () => {
       const tools = await codex.listTools();
-      assert.equal(tools.tools.length, 10);
+      assert.equal(tools.tools.length, 11);
       await assert.rejects(call(codex, 'collab_join_discussion', { room: 'missing', name: 'Codex' }), /brief is required/);
       const joined = await Promise.all([
         call(codex, 'collab_join_discussion', { room, name: 'Codex', brief: 'Review cache design without touching running jobs.' }),
@@ -192,7 +192,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
       const idle = await call(codex, 'collab_wait_for_message', { room: 'turns', after_id: page.next_after_id, timeout_ms: 0, compact: true });
       assert.equal(idle.timed_out, true);
       assert.equal(idle.decision, undefined);
-      assert.equal(idle.participants, undefined);
+      assert.deepEqual(idle.participants, page.participants);
       assert.equal(idle.discussion.brief, undefined);
       assert.equal(idle.discussion.revision, 1);
       assert.equal(idle.next_after_id, page.next_after_id);
@@ -241,6 +241,22 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
       assert.equal(closed.discussion.status, 'closed');
     });
 
+    await t.test('MCP rejoin, leave and identified reads update the shared live roster', async () => {
+      const a = await call(codex, 'collab_join_discussion', { room: 'presence', name: 'Codex', brief: 'Show live agents' });
+      await call(claude, 'collab_join_discussion', { room: 'presence', name: 'Claude' });
+      const again = await call(codex, 'collab_join_discussion', { room: 'presence', name: ' codex ' });
+      assert.equal(again.participant_id, a.participant_id);
+      const read = () => call(claude, 'collab_read_discussion', { room: 'presence', compact: true });
+      assert.equal((await read()).participants.length, 2);
+      await call(codex, 'collab_leave_discussion', { room: 'presence', participant_id: a.participant_id });
+      assert.deepEqual((await read()).participants.map((p: { name: string }) => p.name), ['Claude']);
+      const observer = await call(codex, 'collab_read_discussion', { room: 'presence' });
+      assert.equal(observer.participants.length, 1);
+      const monitoring = await call(codex, 'collab_read_discussion', { room: 'presence', participant_id: a.participant_id });
+      assert.equal(monitoring.participants.length, 2);
+      await assert.rejects(call(codex, 'collab_read_discussion', { room: 'research', participant_id: a.participant_id }), /Unknown participant/);
+    });
+
     await t.test('restart preserves transcript, identities, decisions, and closed state', async () => {
       await call(codex, 'collab_set_status', { room, participant_id: codexId, request_id: 'close', status: 'closed', reason: 'Review completed.' });
       const before = await call(codex, 'collab_read_discussion', { room });
@@ -248,7 +264,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
       const restarted = await connect('test-restarted');
       assert.deepEqual(await call(restarted, 'collab_read_discussion', { room }), before);
       const listed = await call(restarted, 'collab_list_discussions', {});
-      assert.equal(listed.length, 4);
+      assert.equal(listed.length, 5);
       await assert.rejects(post(restarted, codexId, 'closed-post', 'Must fail'), /closed/);
     });
   } finally {

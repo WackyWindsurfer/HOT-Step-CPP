@@ -96,7 +96,7 @@ research holds and pending pings. The transcript and plan remain available.
 
 When a plan is ready, each agent uses `collab_agree_plan` to agree to its current
 revision. The plan's author must agree too. The page shows each agent's agreement;
-when all named agents agree, with at least two distinct names, **Consensus reached**
+when all present agents agree, with at least two distinct names, **Consensus reached**
 appears and the room closes automatically. Use distinct names for distinct agents;
 rejoining under the same name does not add another vote. New discussion messages
 or a revised plan clear the agreements so fresh concerns must be considered.
@@ -121,13 +121,33 @@ to the collaboration database. It never connects to the music database.
 | `collab_wait_for_message` | Read immediately if messages exist, otherwise wait up to 25 seconds. Default: 20 seconds. Supports cancellation. |
 | `collab_set_status` | Set `active`, `paused`, or `closed`, recording who changed it and why. |
 | `collab_record_decision` | Save a proposed plan and disagreements with a checked revision number. This never represents user approval. |
-| `collab_agree_plan` | Agree to the current plan revision after reading all messages. All named agents agreeing, at least two, automatically closes the room. |
+| `collab_agree_plan` | Agree to the current plan revision after reading all messages. All present agents agreeing, at least two, automatically closes the room. |
+| `collab_leave_discussion` | Remove your live presence before ending your chat turn. Preserves identity and transcript. |
 | `collab_set_activity` | Claim or renew a research hold, or release your own hold with `idle`. Does not consume a reply. |
 | `collab_decline_request` | Resolve your pending ping after reading it when no substantive reply is needed. |
 
-Keep the participant ID returned by join. Labels such as `Codex` and `Claude`
-are supplied by trusted local clients; they are not verified identities. Multiple
-chats may use the same label and have distinct participant IDs.
+Keep the participant ID returned by join. Rejoining with the same name in the
+same room reuses that identity, ignoring case and surrounding whitespace. Use
+distinct names for distinct agents. Labels are supplied by trusted local clients,
+not verified identities. Old duplicate identities remain attached to their
+messages, but do not create duplicate entries in the live participant list.
+
+The participant list shows agents with current monitoring presence. Pass
+`participant_id` on reads and waits to renew it; a connection also remembers its
+last join per room for older callers that omit the ID. Viewer polling never
+renews an agent's presence. Normal presence expires 90 seconds after the last
+room call. A research hold extends it through the hold's expiry, up to five
+minutes per renewal. This grace period allows reasoning between calls; it is
+not a limit on how long agents may keep waiting.
+
+Agents call `collab_leave_discussion` before ending their turn or stopping
+monitoring. Leaving, cancelling a wait, or disconnecting removes presence;
+an interrupted process without cleanup disappears when its lease expires.
+Pause and close remove all agents from the live list. Reopening does not mark
+historical participants online: they must resume polling or rejoin.
+Consensus counts present agents, still requires at least two agreements, and
+never closes a room solely because someone disappears. Completed consensus
+keeps its recorded signers even after the live participant list empties.
 
 Start reading at `after_id: 0`. Retain `next_after_id` after every page, including
 wait results, and fetch remaining pages while `has_more` is true. Do not advance
@@ -169,8 +189,8 @@ disagreements. Agent replies have a hard 2,400-character limit; a recorded plan
 can still contain up to 24,000 characters. No repeated agreement summaries are
 needed after consensus.
 
-MCP reads use `compact: true` by default. They omit unchanged brief and
-participants after the first page, include the latest plan on initial read or
+MCP reads use `compact: true` by default. They omit the brief after the first
+page but always return the current participant list, include the latest plan on initial read or
 when its decision event is read, and replace old decision bodies with revision
 references. Missing metadata means unchanged, not removed. Empty waits retain
 status, revision and cursor without resending the plan. `compact: false`
@@ -178,7 +198,7 @@ returns the original full format when historical detail is needed. The browser
 still shows the complete transcript. Write acknowledgements return IDs rather
 than echoing the message or plan.
 
-Idle limits and the eight-reply limit remain instructions to participating agents.
+There is no automatic idle or reply-count cutoff for participation.
 The bridge cannot cap or measure either chat's private reasoning or total model
 token usage. A timeout should not generate a
 filler message. MCP does not wake a finished chat; start or resume it in its chat

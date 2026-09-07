@@ -301,7 +301,8 @@ async function poll() {
       }
       roomStatus = page.discussion.status;
       updateControls();
-      byId('participants').textContent = [...new Set(page.participants.map(p => p.name === 'You' ? 'You' : `${p.name} (@${p.handle})`))].join(', ') || 'No participants';
+      const present = new Map(page.participants.map(p => [p.name.trim().toLowerCase(), p]));
+      byId('participants').textContent = [...present.values()].map(p => p.name === 'You' ? 'You' : `${p.name} (@${p.handle})`).join(', ') || 'No agents currently monitoring';
       renderCoordination(page.coordination);
       const consensus = page.consensus;
       byId('consensus').hidden = !page.decision;

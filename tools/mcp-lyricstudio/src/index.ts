@@ -20,7 +20,8 @@ const server = new McpServer({
   version: '1.0.0',
 });
 
-registerCollaborationTools(server);
+const collaboration = registerCollaborationTools(server);
+server.server.onclose = () => collaboration.close();
 
 const MODEL_PARAM_DESC =
   "Name of the model YOU are running as (e.g. 'Fable 5', 'claude-opus-4-8', 'Gemini 3 Pro'). " +
