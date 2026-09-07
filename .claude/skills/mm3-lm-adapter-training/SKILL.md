@@ -26,8 +26,8 @@ survives a fresh clone.
 --rank 128 --alpha 128 --adapter-type lora --hot-pizza          # HOT-PiZZA: PiSSA with principal-subspace dropout (2026-09-06)
 --pissa-frozen-f16 --pissa-cache-dir <adapters>/mm3-lm-adapters/_pissa-init-cache
 --optimizer adamw --lr 8e-5 --lr-end-frac 0.005 --warmup 25    # AdamW tied Prodigy by ear, 2.3 GB lighter
---attn flash --prefix-frames 2048                              # flash + prefix compose since 7070238e; 2048 tied 4096
---max-frames 750 --crop-mode structured --crop-start-frac 0.55 --crop-end-frac 0.15
+--attn flash --prefix-frames 1024 --prefix-chunk 1024          # flash + prefix compose since 7070238e; 1024 tied 2048 tied 4096
+--max-frames 500 --crop-mode structured --crop-start-frac 0.55 --crop-end-frac 0.15   # 500 tied 750 blind (2026-09-07)
 --crop-start-tiles 3 --crop-anchor song
 --rank-dropout 0.1                                             # the mask IS the method under --hot-pizza; never 0
 --steps 500 --save-every 50                                    # stop on STEPS: train loss reads 2.7-5 under HOT-PiZZA
@@ -35,7 +35,7 @@ survives a fresh clone.
 # captions: per-track <stem>.mm3.txt from MOSS/Gemini (the default input);
 # --caption-file <shared caption> is the FALLBACK when tracks have none
 --trigger "<artist>" --trigger-prepend
---holdout 0.15 --eval-every 250 --eval-crop 750
+--holdout 0.15 --eval-every 250 --eval-crop 500
 ```
 
 Previews: every 50 steps (= every checkpoint), 40 s, control + baseline off,
@@ -47,6 +47,19 @@ alk3_crimson: 4.7 s/step, 39 min for 500 steps, peak 25.9 GB — against the
 2026-09-05 LoKr/Prodigy/exact/4096 line's 5.9 s, 49 min, 30.4 GB. Every
 lever was first tied individually in a blind set, then stacked and heard.
 The earlier LoKr line stays in the git history of this file.
+
+**2026-09-07, the safe stack.** An overnight one-lever-at-a-time speed trial
+(`overnight-speed/COSTS.md` + `blind-speed/RESULTS.md` in the alk3 hub) found
+prefix 1024 (69 of 90) and crop 500 (67.5) tie the reference (68), while the
+prefill chunk 256 → 1024 cuts 17% off the step with an identical step-1 loss.
+Combined and heard blind (`blind-confirm/RESULTS.md`): safe stack 67 vs the
+crop-750 recipe 70.5, inside the ~6 noise floor, at 3.1 s/step and 26 min per
+500 steps (was 4.5 s, 37 min). That is the recipe block above. What did NOT
+survive: doubling the LR (every 2x arm 3-4 under, and a 2x-LR/300-step stack
+produced a vocal-free plan on 1 of 6 songs across two seeds) and turning the
+acoustic loss off (lowest score). Held-out loss every 50 has the same shape in
+every arm — it follows the seed's crop order, not the adapter — so it is not a
+stopping signal.
 
 **Rob, 2026-08-25, on the LoKr configuration this replaced: "the closest we've ever gotten to
 artist replication."** Crop 750 = 30 s = ~3 s/step; he set it by ear after

@@ -638,7 +638,11 @@ export const MM3_LM_DEFAULTS = {
    *  song-structure duties the long window carried are now covered elsewhere
    *  — structured start/end crops teach openings and EOS, and the acoustic
    *  loss holds timbre. ~5.4 GB of activations at q8/r128 instead of ~19. */
-  maxFrames: 750,
+  /** 500 since 2026-09-07 (Rob): the speed trial's crop-500 arm tied crop 750
+   *  blind (67.5 vs 68 of 90) and the combined safe stack (crop 500 + prefix
+   *  1024 + prefill chunk 1024) tied the crop-750 recipe again (67 vs 70.5,
+   *  noise ~6) at 3.1 s/step against 4.5: 26 min per 500 steps instead of 37. */
+  maxFrames: 500,
   /** `structured`: a fixed share of steps pinned to frame 0, a fixed share
    *  flush to the track's end, the rest random.
    *
@@ -770,7 +774,7 @@ export const MM3_LM_DEFAULTS = {
    *  only comparable ACROSS runs while the crop it is measured at stays put. */
   /** = maxFrames (the route clamps it there anyway; stating it avoids the
    *  silently-skipped-eval trap this comment block documents). */
-  evalCrop: 750,
+  evalCrop: 500,
   /** LyCORIS-style rank masking, part of bghira's published config. */
   rankDropout: 0.1,
   /** LoKr: dW = kron(w1, w2) instead of a low-rank pair.
@@ -834,11 +838,15 @@ export const MM3_LM_DEFAULTS = {
   /** 2048 since 2026-09-06 (Rob): tied 4096 blind (71 vs 72 of 90) and takes
    *  14% off the step, 0.8 GB off the peak. The per-step cost of a prefix is
    *  the prefill through every layer, not the attention over it. */
-  prefixFrames: 2048,
+  /** 1024 since 2026-09-07 (Rob): tied 2048 blind (69 vs 68 of 90) and takes
+   *  another 12% off the step; part of the safe stack with crop 500. */
+  prefixFrames: 1024,
   /** Prefill positions per graph. Trades host graph-build overhead against the
    *  transient attention scores of one chunk; 256 is a middle setting and has
-   *  no effect on the result, only on speed and peak. */
-  prefixChunk: 256,
+   *  no effect on the result, only on speed and peak. 1024 since 2026-09-07:
+   *  3.72 vs 4.46 s/step at 256 with the same step-1 loss and peak, then
+   *  heard inside the safe stack. */
+  prefixChunk: 1024,
   /** Prove the prefix before training on it. Attention over [prefix ; window]
    *  is mathematically identical to one long crop covering both, so the
    *  supervised CE must not care which way it was produced. It caught two real

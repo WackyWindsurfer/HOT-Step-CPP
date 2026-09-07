@@ -93,6 +93,14 @@ prefix since 7070238e), `--optimizer adamw --lr 8e-5` (was Prodigy) and
 `--pissa-frozen-f16`. On alk3_crimson that is 4.7 s/step, 39 min for 500
 steps and a 25.9 GB peak against 5.9 s, 49 min and 30.4 GB.
 
+Since 2026-09-07 three more levers ride on top, each tied blind on its own
+and then as a combination: `--prefix-frames 1024` (was 2048), `--max-frames
+500` (was 750) and `--prefix-chunk 1024` (was 256; changes nothing but the
+prefill speed). Together 3.1 s/step and 26 min per 500 steps at a 26.4 GB
+peak. Raising the learning rate to shorten the run was tried and rejected:
+every 2x-LR arm scored a few points under, and one such run planned a song
+with no vocals. Turning the acoustic loss off was the lowest-scored arm.
+
 Two cost knobs for any PiSSA-family run (2026-09-06): `--pissa-cache-dir <dir>`
 stores the SVD init factors once per base file / rank / oversample / iters /
 layer range and uploads the identical bytes on the next run (the init is a
