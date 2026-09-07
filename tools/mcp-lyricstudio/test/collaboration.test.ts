@@ -43,7 +43,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
 
     await t.test('tools load without music database; concurrent joins share one room', async () => {
       const tools = await codex.listTools();
-      assert.equal(tools.tools.length, 9);
+      assert.equal(tools.tools.length, 10);
       await assert.rejects(call(codex, 'collab_join_discussion', { room: 'missing', name: 'Codex' }), /brief is required/);
       const joined = await Promise.all([
         call(codex, 'collab_join_discussion', { room, name: 'Codex', brief: 'Review cache design without touching running jobs.' }),
@@ -223,6 +223,22 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
       await assert.rejects(call(claude, 'collab_post_message', { room: 'research', participant_id: b.participant_id, request_id: 'too-soon', body: 'My proposal' }), /researching/);
       await call(codex, 'collab_post_message', { room: 'research', participant_id: a.participant_id, request_id: 'answer', body: 'Graph allocation is cached.', read_after_id: page.next_after_id });
       assert.equal((await call(claude, 'collab_read_discussion', { room: 'research' })).coordination.research, null);
+    });
+
+    await t.test('MCP plan agreements are explicit and close the room for both clients', async () => {
+      const page = await call(codex, 'collab_read_discussion', { room: 'research' });
+      const a = page.participants.find((p: { name: string }) => p.name === 'Codex').id;
+      const b = page.participants.find((p: { name: string }) => p.name === 'Claude').id;
+      await call(claude, 'collab_record_decision', { room: 'research', participant_id: b, request_id: 'consensus-plan', expected_revision: 0, plan: 'Measure the graph allocation.' });
+      const agree = async (client: Client, participant_id: string) => {
+        const read = await call(client, 'collab_read_discussion', { room: 'research' });
+        return call(client, 'collab_agree_plan', { room: 'research', participant_id, request_id: 'agree', revision: 1, read_after_id: read.next_after_id });
+      };
+      assert.equal((await agree(claude, b)).discussion.status, 'active');
+      assert.equal((await agree(codex, a)).discussion.status, 'closed');
+      const closed = await call(claude, 'collab_wait_for_message', { room: 'research', compact: true, after_id: 0 });
+      assert.equal(closed.consensus.reached, true);
+      assert.equal(closed.discussion.status, 'closed');
     });
 
     await t.test('restart preserves transcript, identities, decisions, and closed state', async () => {

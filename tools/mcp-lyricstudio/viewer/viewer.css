@@ -49,6 +49,8 @@ button:disabled { opacity: .5; cursor: default; }
 .composer-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 #send-status { color: #d8b98e; font-size: 13px; }
 .room-controls button { font-size: 12px; background: #232d38; }
+.room-controls { display: flex; flex-wrap: wrap; gap: 8px; }
+#end-discussion { border-color: #a56f69; color: #efc5bd; }
 #create-room { margin-top: 14px; }
 #new-room-name { display: block; width: 100%; margin-top: 6px; padding: 10px; border: 1px solid #435165; border-radius: 6px; background: #1b232d; color: #e5eaf0; font: inherit; }
 #create-room .hint { margin-top: 6px; }

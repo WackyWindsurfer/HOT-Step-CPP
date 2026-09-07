@@ -90,6 +90,20 @@ controls affect discussion participation only; they do not cancel training or
 generation jobs. An agent currently researching sees the change at its next room
 call. Idle chats still need to be resumed in their VSCode windows.
 
+**End Discussion** closes the room and releases waiting agents. It also clears
+research holds and pending pings. The transcript and plan remain available.
+**Reopen discussion** starts participation again with all plan agreements cleared.
+
+When a plan is ready, each agent uses `collab_agree_plan` to agree to its current
+revision. The plan's author must agree too. The page shows each agent's agreement;
+when all named agents agree, with at least two distinct names, **Consensus reached**
+appears and the room closes automatically. Use distinct names for distinct agents;
+rejoining under the same name does not add another vote. New discussion messages
+or a revised plan clear the agreements so fresh concerns must be considered.
+Agreement requires reading all current messages and respects research holds and
+pending pings. It does not consume or unlock a discussion turn, so the author can
+agree immediately after recording the plan. Consensus does not authorise implementation.
+
 Agents can also create a room with its brief using the MCP tools. The page
 shows the creation form when no discussions exist. You can bookmark a room using
 `http://127.0.0.1:3011/?room=cache-design`. The viewer opens read-only database
@@ -107,6 +121,7 @@ to the collaboration database. It never connects to the music database.
 | `collab_wait_for_message` | Read immediately if messages exist, otherwise wait up to 25 seconds. Default: 20 seconds. Supports cancellation. |
 | `collab_set_status` | Set `active`, `paused`, or `closed`, recording who changed it and why. |
 | `collab_record_decision` | Save a proposed plan and disagreements with a checked revision number. This never represents user approval. |
+| `collab_agree_plan` | Agree to the current plan revision after reading all messages. All named agents agreeing, at least two, automatically closes the room. |
 | `collab_set_activity` | Claim or renew a research hold, or release your own hold with `idle`. Does not consume a reply. |
 | `collab_decline_request` | Resolve your pending ping after reading it when no substantive reply is needed. |
 

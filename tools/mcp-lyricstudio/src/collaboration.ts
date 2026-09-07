@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { COORDINATION_SCHEMA, DiscussionCoordination, mentionHandle } from './discussion-coordination.js';
+import { CONSENSUS_SCHEMA, DiscussionConsensus } from './discussion-consensus.js';
 
 export const DEFAULT_COLLAB_DB = fileURLToPath(new URL('../../../data/collaboration.db', import.meta.url));
 
@@ -16,7 +17,7 @@ export const DISCUSSION_PROTOCOL = `You are participating as the current chat ag
 Read the brief and transcript before replying. Post concrete proposals and critiques with code references where useful.
 Aim for 150 words per reply; agent messages are limited to 2400 characters. State only new evidence, disagreements, or the next decision. Do not repeat a peer's proposal or announce that you will reply later.
 One agent contribution per turn, including a decision. After posting, wait for a different speaker (another agent or the human) before posting again. Do not send an acknowledgement followed by a proposal or decision. Combine them into one contribution. Rejoining or relaying user_direction does not bypass this rule.
-Once agreement is reached, one agent records the plan as its contribution. Others need not repeat it. Stop when the requested discussion is complete.
+Once a solid plan is set, one agent records it with collab_record_decision. Each agent, including its author, must then read the latest plan and all messages and call collab_agree_plan for that revision. Recording a plan does not count as agreement. Agreement is a control action, allowed directly after recording or replying, but does not unlock another discussion turn. Do not post a separate agreement announcement. All named agents must agree, with at least two distinct agent names, before the room closes automatically with Consensus reached. New discussion, a revised plan, or reopening clears agreements. Keep waiting until the room closes or the user stops you. Consensus is agreement on a plan, not permission to implement.
 An @mention requests a reply from that participant. Read coordination.requests and wait if another agent was asked. Requests are queued, not proof that an idle VSCode chat was woken.
 Before investigating, use collab_set_activity(researching, reason). It reserves the room for 120 seconds, renewable up to 300 seconds per call, without consuming your reply. Other agents may read but must hold proposals and decisions. Human steering stays open. Do not post a separate "please hold" message.
 Before answering from research, read all new messages and pass next_after_id as read_after_id with your reply or decision. The answer releases the hold and resolves your pending mentions. Use activity=idle to release without answering; the human can also clear a hold or unanswered mention. Renew before expiry if more time is needed.
@@ -28,7 +29,7 @@ After reading a page, retain next_after_id. If has_more is true, read the next p
 Reads are compact by default: brief and participant list arrive on the initial read only; decision text arrives initially and with a new decision event. Retain earlier values. Older decision bodies are revision references. Use compact=false for full historical text or refreshed participant metadata. Write results acknowledge IDs without echoing your text.
 Use collab_wait_for_message with that cursor between responses. A timeout is not a message: do not post filler or respond repeatedly to your own messages.
 An empty wait ends only that tool call, not your participation. Keep calling collab_wait_for_message while the discussion is active, including while another participant researches. There is no automatic idle-time or reply-count cutoff. Stop when the requested discussion is complete, the room is paused or closed, or the user asks you to stop or sets a deadline that has arrived. Do not end your chat turn merely because repeated waits return no messages. Keep individual waits short so user steering stays responsive.
-Pause or close the room when asked; all participants must stop discussion work when its status is paused or closed. Resume only on user direction.
+Pause or close the room when asked; use collab_agree_plan for consensus completion rather than closing the room unilaterally. All participants must stop discussion work when its status is paused or closed. Resume only on user direction.
 record_decision saves an agent proposal and unresolved disagreements; it does not confer user approval or permission to implement.
 MCP does not automatically wake a chat after its turn ends. The user must start or resume participation in each chat.
 Keep training, generation, and source edits outside this discussion unless separately authorized.`;
@@ -45,6 +46,7 @@ function compactPage(page: ReturnType<DiscussionStore['read']>, after: number) {
     discussion: { id: page.discussion.id, status: page.discussion.status, revision: page.discussion.revision,
       ...(after === 0 ? { brief: page.discussion.brief } : {}) },
     coordination: page.coordination,
+    consensus: page.consensus,
     messages: page.messages.map(({ id, author, kind, body, reply_to, mentions }) => {
       if (kind === 'decision') {
         try { body = JSON.stringify({ revision: JSON.parse(body).expected_revision + 1, superseded: id !== decision?.message_id }); }
@@ -61,11 +63,13 @@ function compactPage(page: ReturnType<DiscussionStore['read']>, after: number) {
 export class DiscussionStore {
   private db: Database.Database;
   private coordination: DiscussionCoordination;
+  private consensus: DiscussionConsensus;
 
   constructor(dbPath: string, options: { readonly?: boolean } = {}) {
     if (!options.readonly) mkdirSync(dirname(resolve(dbPath)), { recursive: true });
     this.db = new Database(dbPath, { timeout: 5000, readonly: options.readonly ?? false, fileMustExist: options.readonly ?? false });
     this.coordination = new DiscussionCoordination(this.db);
+    this.consensus = new DiscussionConsensus(this.db);
     if (options.readonly) return;
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
@@ -94,6 +98,7 @@ export class DiscussionStore {
       );
     `);
     this.db.exec(COORDINATION_SCHEMA);
+    this.db.exec(CONSENSUS_SCHEMA);
   }
 
   close() { this.db.close(); }
@@ -168,6 +173,7 @@ export class DiscussionStore {
         participants: (this.db.prepare('SELECT id, name, joined_at FROM participants WHERE room = ? ORDER BY joined_at').all(room) as { id: string; name: string; joined_at: string }[]).map(p => ({ ...p, handle: mentionHandle(p.name) })),
         decision: this.latestDecision(room),
         coordination: this.coordination.snapshot(room),
+        consensus: this.consensus.snapshot(room, discussion.revision),
       };
     })();
   }
@@ -193,7 +199,7 @@ export class DiscussionStore {
       throw new Error(`Keep agent replies within ${MAX_AGENT_REPLY_CHARS} characters. Combine only new evidence and your proposed next step.`);
     }
     // Agent control events must neither consume nor unlock a discussion turn.
-    const last = this.db.prepare("SELECT author FROM messages WHERE room = ? AND (kind NOT IN ('status', 'coordination') OR author = 'You') ORDER BY id DESC LIMIT 1").get(room) as { author: string } | undefined;
+    const last = this.db.prepare("SELECT author FROM messages WHERE room = ? AND (kind NOT IN ('status', 'coordination', 'agreement') OR author = 'You') ORDER BY id DESC LIMIT 1").get(room) as { author: string } | undefined;
     if (last?.author.trim().toLowerCase() === name.trim().toLowerCase()) {
       throw new Error('Wait for another agent or the human to reply before posting again. Do not retry, rejoin, or post user_direction to bypass the turn limit.');
     }
@@ -224,6 +230,7 @@ export class DiscussionStore {
       }
       this.checkTurn(room, participant, body, readAfter);
       const message = this.insert(room, participant, request, kind, body, replyTo);
+      this.consensus.clear(room);
       this.coordination.answered(room, participant);
       this.coordination.enqueue(room, participant, message.id, body);
       return message;
@@ -238,8 +245,11 @@ export class DiscussionStore {
         if (previous.kind !== 'status' || previous.body !== body) throw new Error('request_id was already used for different content.');
         return { event: previous, discussion: this.room(room) };
       }
+      const previousStatus = this.room(room).status;
       this.db.prepare('UPDATE discussions SET status = ? WHERE id = ?').run(status, room);
+      if (status === 'active' && previousStatus !== 'active') this.consensus.clear(room);
       if (status !== 'active') this.coordination.release(room, participant, true);
+      if (status === 'closed') this.coordination.clearRequests(room);
       return { event: this.insert(room, participant, request, 'status', body), discussion: this.room(room) };
     }).immediate();
   }
@@ -259,8 +269,37 @@ export class DiscussionStore {
       const revision = expected + 1;
       this.db.prepare('INSERT INTO decisions VALUES (?, ?, ?, ?, ?)').run(room, revision, message.id, plan, disagreements);
       this.db.prepare('UPDATE discussions SET revision = ? WHERE id = ?').run(revision, room);
+      this.consensus.clear(room);
       this.coordination.answered(room, participant);
       return { room, revision, message_id: message.id, plan, disagreements };
+    }).immediate();
+  }
+  agreePlan(room: string, participant: string, request: string, revision: number, readAfter: number) {
+    return this.db.transaction(() => {
+      const { name } = this.participant(room, participant);
+      if (name === 'You') throw new Error('Plan agreements belong to agents. The human can end the discussion.');
+      const body = JSON.stringify({ revision });
+      const previous = this.previous(participant, request);
+      if (previous) {
+        if (previous.room !== room || previous.kind !== 'agreement' || previous.body !== body) throw new Error('request_id was already used for different content.');
+        return { id: previous.id, discussion: this.room(room), consensus: this.consensus.snapshot(room, this.room(room).revision) };
+      }
+      const current = this.active(room);
+      if (revision < 1 || revision !== current.revision) throw new Error('Read the current recorded plan before agreeing; its revision must match.');
+      const latest = this.db.prepare('SELECT MAX(id) AS id FROM messages WHERE room = ?').get(room) as { id: number };
+      if (readAfter !== latest.id) throw new Error('Read all new room messages before agreeing; pass next_after_id as read_after_id.');
+      this.coordination.beforeContribution(room, participant, readAfter);
+      const message = this.insert(room, participant, request, 'agreement', body);
+      this.consensus.agree(room, revision, name, participant, message.id);
+      this.coordination.answered(room, participant);
+      const consensus = this.consensus.snapshot(room, revision);
+      if (consensus.reached) {
+        this.db.prepare("UPDATE discussions SET status = 'closed' WHERE id = ?").run(room);
+        this.coordination.release(room, participant, true);
+        this.coordination.clearRequests(room);
+        this.insert(room, participant, randomUUID(), 'status', JSON.stringify({ status: 'closed', reason: `Consensus reached on plan revision ${revision}.` }));
+      }
+      return { id: message.id, discussion: this.room(room), consensus };
     }).immediate();
   }
   activity(room: string, participant: string, activity: 'researching' | 'idle', reason: string, seconds: number) {
@@ -353,10 +392,13 @@ export function registerCollaborationTools(server: McpServer, dbPath = process.e
   server.tool('collab_wait_for_message', 'Wait for new messages in this active turn; does not wake idle chats. Retain next_after_id and repeat empty waits while active, including during peer research. No automatic idle or reply-count cutoff. Stop on completion, pause/close, or user stop/deadline. Never post filler on timeout.',
     { ...cursor, timeout_ms: z.number().int().min(0).max(25000).default(20000) },
     async ({ room, after_id, limit, timeout_ms, compact }, extra) => result(async () => { const page = await get().wait(room, after_id, timeout_ms, limit, extra.signal); return compact ? { ...compactPage(page, after_id), timed_out: page.timed_out } : page; }));
-  server.tool('collab_set_status', 'Pause/close on user request or completion; resume (active) only on user direction. Status changes are visible to all waiting participants.',
+  server.tool('collab_set_status', 'Pause/close on user request; use collab_agree_plan for consensus completion. Resume (active) only on user direction. Status changes are visible to all waiting participants.',
     { ...identity, status: z.enum(['active', 'paused', 'closed']), reason: body },
     async ({ room, participant_id, request_id, status, reason }) => result(() => { const value = get().status(room, participant_id, request_id, status, reason); return { id: value.event.id, status: value.discussion.status }; }));
-  server.tool('collab_record_decision', 'Save the plan as your one contribution this turn; do not post an announcement first. Not user approval. expected_revision prevents overwrites.',
+  server.tool('collab_agree_plan', 'Agree to the current recorded plan after reading all messages. Each agent, including the author, must agree. All named agents (at least two) agreeing closes the room and releases waiters. Does not consume or unlock a discussion turn. Not implementation approval.',
+    { ...identity, revision: z.number().int().positive(), read_after_id: z.number().int().min(0) },
+    async ({ room, participant_id, request_id, revision, read_after_id }) => result(() => get().agreePlan(room, participant_id, request_id, revision, read_after_id)));
+  server.tool('collab_record_decision', 'Save the plan as your one contribution this turn; do not post an announcement first. After reading it, each agent including the author must use collab_agree_plan to reach consensus. Not user approval. expected_revision prevents overwrites.',
     { ...identity, expected_revision: z.number().int().min(0), plan: body, disagreements: z.string().max(24000).default(''), read_after_id: readAfter },
     async ({ room, participant_id, request_id, expected_revision, plan, disagreements, read_after_id }) => result(() => { const value = get().decide(room, participant_id, request_id, expected_revision, plan, disagreements, read_after_id) as Decision; return { revision: value.revision, message_id: value.message_id }; }));
   return { close: () => { store?.close(); store = undefined; } };
