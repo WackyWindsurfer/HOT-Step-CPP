@@ -3460,13 +3460,24 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             // only true because the recipe truncates from the start. A random
             // crop would need a cache per offset, or a teacher that disagrees
             // with the student about which audio it is looking at.
+            // The window. An excerpt no longer than K is rehearsed whole from
+            // its first frame. An excerpt LONGER than K carries history: its
+            // last K frames are the window and the frames before them go into
+            // the frozen KV prefix, exactly as a style crop's history does
+            // (Phase 4 step 2b, 2026-09-07). Either way the window reaches the
+            // excerpt's end, so the base's stopping decision is the last
+            // supervised position. Same arithmetic as the reg step below.
             const int64_t K      = std::min<int64_t>(K_max, rs.n_frames);
-            const bool    at_end = K >= rs.n_frames;
-            const int64_t Fin    = at_end ? K : K - 1;
-            const int64_t n_sup  = at_end ? K + 1 : K;
+            const int64_t c0     = rs.n_frames - K;              // 0 for a history-free excerpt
+            const bool    at_end = true;                         // c0 + K == n_frames
+            const int64_t lead   = (kv_on && c0 > 0) ? 1 : 0;   // frame c0-1 as input, as in a style crop
+            const int64_t f0     = c0 - lead;
+            const int64_t Fin    = K + lead;                     // input frames, lead included
+            const int64_t n_sup  = K + 1;
             const int64_t P      = (int64_t) rs.prompt.size();
             const int64_t S      = P + Fin;
-            if (S > S_max || Fin < 1) {
+            const int64_t npfx   = kv_on ? f0 - std::max<int64_t>(0, f0 - a.prefix_frames) : 0;
+            if (S > S_max || K < 1) {
                 fprintf(stderr, "[mm3-lm-train] SKIP reg %s: sequence %lld exceeds %lld\n",
                         rs.id.c_str(), (long long) S, (long long) S_max);
                 continue;
@@ -3474,9 +3485,12 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             // An excerpt's teacher was captured at ITS positions; a cache for the
             // same id at another offset is a different teacher, so the offset is
             // in the name like the base model and K already are.
-            const std::string path = mm3_prior_path(
-                prior_dir, rs.frame_offset ? rs.id + ".o" + std::to_string((long long) rs.frame_offset) : rs.id,
-                a.lm_path, a.reg_topk);
+            std::string cache_id = rs.id;
+            if (rs.frame_offset) cache_id += ".o" + std::to_string((long long) rs.frame_offset);
+            // A windowed excerpt's teacher saw a prefix; a cache captured with
+            // another window or history length is a different teacher.
+            if (c0 > 0) cache_id += ".c" + std::to_string((long long) c0) + ".p" + std::to_string((long long) npfx);
+            const std::string path = mm3_prior_path(prior_dir, cache_id, a.lm_path, a.reg_topk);
             std::string       lerr;
             if (mm3_prior_load(path, a.reg_topk, (int) n_sup, W, &reg_priors[i], &lerr)) {
                 loaded++;
@@ -3499,7 +3513,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             sem_in.resize((size_t) Fin);
             ac_in.resize((size_t) (Fin * NC));
             for (int64_t j = 0; j < Fin; j++) {
-                const int32_t * f = &rs.codes[(size_t) (j * 8)];
+                const int32_t * f = &rs.codes[(size_t) ((f0 + j) * 8)];
                 sem_in[(size_t) j] = f[0] + (int32_t) t.semantic_vocab_offset;
                 for (int64_t k2 = 0; k2 < NC; k2++) {
                     ac_in[(size_t) (k2 * Fin + j)] = f[1 + k2] + (int32_t) (k2 * AV);
@@ -3509,7 +3523,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             for (int64_t j = 0; j < n_sup; j++) {
                 tgt[(size_t) j] = (at_end && j == n_sup - 1)
                                     ? mm3_lm_train_slice_eos(t)
-                                    : mm3_lm_train_slice_index(t, rs.codes[(size_t) (j * 8)]);
+                                    : mm3_lm_train_slice_index(t, rs.codes[(size_t) ((c0 + j) * 8)]);
             }
             // Skipped entirely under a trainable prefix: lm_ckpt_upload_mask
             // owns t_msk then (the mask is rectangular, [n + S, S]), and a
@@ -3525,7 +3539,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             // teacher sees the frames where the base saw them (frame_offset is 0
             // for ordinary corpora, so this is the old P + j there).
             const int64_t cap_off = anchor_song ? rs.frame_offset : 0;
-            for (int64_t j = 0; j < Fin; j++) pos[(size_t) (P + j)] = (int32_t) (P + cap_off + j);
+            for (int64_t j = 0; j < Fin; j++) pos[(size_t) (P + j)] = (int32_t) (P + cap_off + f0 + j);
             ggml_backend_tensor_set(t_prompt, rs.prompt.data(), 0, (size_t) P * sizeof(int32_t));
             ggml_backend_tensor_set(t_sem, sem_in.data(), 0, sem_in.size() * sizeof(int32_t));
             ggml_backend_tensor_set(t_ac, ac_in.data(), 0, ac_in.size() * sizeof(int32_t));
@@ -3535,6 +3549,32 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             // the capture too — the teacher distribution has to be the one the
             // reg steps below will be scored against, and those run token-free.
             set_art(false);
+            set_rank_mask(false);  // the teacher is the base, not a subnetwork (prefix included)
+            // The frozen prefix for a history-bearing excerpt, built the way the
+            // reg step will build it. Q == 0 still runs when the store is on:
+            // it clears K/V a longer previous capture left behind.
+            if (kv_on) {
+                int64_t Q = 0;
+                if (c0 > 0) {
+                    const int64_t pfx_lo = f0 - npfx;
+                    pfx_ctx.prompt       = rs.prompt.data();
+                    pfx_ctx.codes        = rs.codes.data();
+                    pfx_ctx.P            = P;
+                    pfx_ctx.pfx_lo       = pfx_lo;
+                    Q                    = P + npfx;
+                    pfx_pos.resize((size_t) Q);
+                    for (int64_t i2 = 0; i2 < P; i2++)    pfx_pos[(size_t) i2] = (int32_t) i2;
+                    for (int64_t i2 = 0; i2 < npfx; i2++) pfx_pos[(size_t) (P + i2)] = (int32_t) (P + cap_off + pfx_lo + i2);
+                }
+                std::string perr;
+                if (!lm_kvprefix_run(&kvpfx, &t.lm, sched, arena, lm_ckpt_layer_opts(ckpt_st),
+                                     mm3_lm_prefix_embed, &pfx_ctx, pfx_pos.data(), Q, &perr)) {
+                    fatal_msg = "prior capture prefix failed for " + rs.id + ": " + perr;
+                    fprintf(stderr, "[mm3-lm-train] %s\n", fatal_msg.c_str());
+                    rc = 1;
+                    break;
+                }
+            }
 
             MM3PriorCache pc;
             pc.k = a.reg_topk; pc.n_pos = (int) n_sup; pc.width = W;
@@ -3548,7 +3588,8 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             LmSample smp;
             smp.tokens.assign((size_t) S, 0);
             smp.targets  = tgt;
-            smp.n_masked = (int) P;
+            smp.n_masked = (int) (P + lead);
+            smp.n_prompt = (int) P;
             smp.s_tr     = (int) n_sup;
             const bool ok = lm_ckpt_micro_step(ckpt_run, smp, false, nullptr);
             ckpt_run.capture_k   = 0;
@@ -3639,6 +3680,10 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             // exactly that crop and no other.
             int64_t K = std::min<int64_t>(K_max, s.n_frames);
             int64_t c0 = 0;
+            // A history-bearing reg excerpt (longer than K) is windowed flush to
+            // its end and its history becomes the prefix — the capture above
+            // used the same window, so the cached teacher matches.
+            if (is_reg && s.n_frames > K) c0 = s.n_frames - K;
             if (!is_reg && a.crop_mode != "beginning" && s.n_frames > K) {
                 const int64_t span = s.n_frames - K;          // largest legal c0
                 if (a.crop_mode == "structured") {
@@ -3684,7 +3729,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             // at frame 0. With history in front, frame c0-1 comes in as an
             // input and becomes that row instead; the caption stays blind to
             // the prefix, so its own states are unchanged.
-            const int64_t lead   = (kv_on && !is_reg && c0 > 0) ? 1 : 0;
+            const int64_t lead   = (kv_on && c0 > 0) ? 1 : 0;   // a reg step: only with a windowed excerpt
             const int64_t f0     = c0 - lead;               // first INPUT frame
             const int64_t Finw   = Fin + lead;
             const int64_t S      = P + Finw;
@@ -3742,12 +3787,13 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
 
             // ── frozen KV prefix ──────────────────────────────────────
             //
-            // A regularisation step gets NO prefix: its teacher distribution
-            // was captured with none, and scoring against it through a
-            // different context would be measuring drift that is not there.
+            // A regularisation step gets the prefix its teacher was captured
+            // with: none for a history-free excerpt, the excerpt's own history
+            // for a windowed one. Scoring through any other context would be
+            // measuring drift that is not there.
             if (kv_on) {
                 int64_t Q = 0;
-                if (!is_reg) {
+                if (!is_reg || c0 > 0) {
                     // History runs up to f0, because frame f0 itself is an
                     // input to the window (see `lead`).
                     const int64_t pfx_lo = std::max<int64_t>(0, f0 - a.prefix_frames);
@@ -3761,8 +3807,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                     for (int64_t i = 0; i < P; i++) {
                         pfx_pos[(size_t) i] = (int32_t) i;
                     }
+                    // Excerpt corpora carry their true start (frame_offset is 0
+                    // for ordinary corpora): the history sits where the base saw it.
+                    const int64_t pfx_off = anchor_song ? s.frame_offset : 0;
                     for (int64_t i = 0; i < npfx; i++) {
-                        pfx_pos[(size_t) (P + i)] = (int32_t) (P + pfx_lo + i);
+                        pfx_pos[(size_t) (P + i)] = (int32_t) (P + pfx_off + pfx_lo + i);
                     }
                 }
                 // Q == 0 still runs, because it is what CLEARS the store: the
