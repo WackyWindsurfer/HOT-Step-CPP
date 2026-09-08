@@ -1084,6 +1084,9 @@ export interface ResolvedMm3TrainLmOptions {
   /** Style-step counterpart: score only the last N supervised rows of every
    *  style crop (SimpleTuner continuation objective, 2026-09-08). 0 = all. */
   scoreLast?: number;
+  /** Lyrics dropout (2026-09-08): share of style steps trained on a prompt
+   *  without lyrics (instrumental marker). 0/absent = never. */
+  lyricsDropout?: number;
   /** Stage A (2026-09-07): drop each style track's trailing digital silence
    *  before the EOS target, from <codes>/trim.json (tools/mm3-trim-silence).
    *  Off unless the request asks; the file must exist when it does. */
@@ -1308,6 +1311,7 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     args.push('--reg-every', String(o.regEvery));
     if (o.regScoreLast && o.regScoreLast > 0) args.push('--reg-score-last', String(o.regScoreLast));
     if (o.scoreLast && o.scoreLast > 0) args.push('--score-last', String(o.scoreLast));
+    if (o.lyricsDropout && o.lyricsDropout > 0) args.push('--lyrics-dropout', String(o.lyricsDropout));
     args.push('--reg-topk', String(o.regTopK ?? MM3_LM_DEFAULTS.regTopK));
     if (o.regPriorDir) args.push('--reg-prior', o.regPriorDir);
   }

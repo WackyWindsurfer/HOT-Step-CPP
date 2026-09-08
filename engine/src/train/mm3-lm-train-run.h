@@ -295,6 +295,14 @@ struct MM3LmTrainArgs {
      *  Drawn from the training RNG, so it is reproducible and survives a resume
      *  along with everything else. */
     double      caption_dropout = 0.0;
+    /** Lyrics dropout (2026-09-08): share of style steps whose prompt carries
+     *  NO lyrics (the assembler writes the instrumental marker). SimpleTuner's
+     *  positioned continuation spans train without lyrics on most steps, and
+     *  its adapters end songs where ours do not; the hypothesis is that always
+     *  training with the full lyrics binds song structure to them so tightly
+     *  that the base's "lyrics done, wrap up, stop" is overwritten. Reg steps
+     *  never drop (their teacher was captured with the full prompt). */
+    double      lyrics_dropout = 0.0;
 
     /** Artist token (textual inversion), V3. k learned vectors accumulated onto
      *  the first k prompt positions, whose ids are placeholder copies spliced at
@@ -642,6 +650,7 @@ struct MM3LmSample {
      *  short string per song at load, and doing it per step would put the BPE
      *  tokenizer inside the training loop. */
     std::vector<int32_t> prompt_trigger_only;
+    std::vector<int32_t> prompt_no_lyrics;      // lyrics dropout: caption kept, lyrics replaced by the instrumental marker
     std::vector<int32_t> codes;           // [n_frames * 8], warm-up row already dropped
     int64_t              n_frames = 0;
     /** Absolute frame index of codes[0] in the track this sample was cut from.
@@ -939,6 +948,7 @@ static bool mm3_lm_load_samples_from(const std::string & manifest, const std::st
                 fprintf(stderr, "[mm3-lm-train] first training caption begins: %.120s\n", head.c_str());
             }
             mm3_tokenizer_encode(tok, mm3_assemble_prompt(caption, lyrics), &sm.prompt);
+            mm3_tokenizer_encode(tok, mm3_assemble_prompt(caption, std::string()), &sm.prompt_no_lyrics);
             if (!trigger_prefix.empty()) {
                 // Caption dropout's alternative prompt: the trigger and nothing
                 // else. Lyrics are KEPT — dropping those too would change what
@@ -2885,6 +2895,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
    // caption-dropout steps, THIS SEGMENT
     int64_t n_end_vary = 0;   // lever 4a: end steps that drew a varied window/history
     bool    reg_span_logged = false;   // rev-7 ending-targeted prior: announce the scored span once
+    int64_t n_lyrics_dropped = 0;      // lyrics dropout: style steps trained without lyrics
     int                  n_style_seg = 0;   // style steps, THIS SEGMENT
 
     auto save_ckpt = [&](int step, double loss) -> std::string {
@@ -3706,8 +3717,12 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             const bool drop_caption =
                 !is_reg && a.caption_dropout > 0.0 && !s.prompt_trigger_only.empty()
                 && lm_rng_uniform(&rng) < (float) a.caption_dropout;
+            const bool drop_lyrics =
+                !is_reg && !drop_caption && a.lyrics_dropout > 0.0 && !s.prompt_no_lyrics.empty()
+                && lm_rng_uniform(&rng) < (float) a.lyrics_dropout;
             const std::vector<int32_t> & prompt_ids =
-                drop_caption ? s.prompt_trigger_only : s.prompt;
+                drop_caption ? s.prompt_trigger_only : (drop_lyrics ? s.prompt_no_lyrics : s.prompt);
+            if (drop_lyrics) n_lyrics_dropped++;
             const int64_t       P = (int64_t) prompt_ids.size();
 
             // Fresh crop every time this song comes up. `beginning` exists only
@@ -4216,6 +4231,10 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             fprintf(stderr, "[mm3-lm-train] could not write the final resume state: %s\n",
                     ferr.c_str());
         }
+    }
+    if (a.lyrics_dropout > 0.0) {
+        fprintf(stderr, "[mm3-lm-train] lyrics dropout: %lld style steps trained without lyrics (asked for %.1f%%)\n",
+                (long long) n_lyrics_dropped, 100.0 * a.lyrics_dropout);
     }
     if (a.end_crop_vary) {
         fprintf(stderr, "[mm3-lm-train] varied end supervision: %lld end steps drew a varied window/history\n",
