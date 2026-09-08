@@ -1078,6 +1078,9 @@ export interface ResolvedMm3TrainLmOptions {
    *  their frozen-prefix span in [0, prefixFrames]. Off unless asked. */
   endCropVary?: boolean;
   endCropMin?: number;
+  /** Rev-7 ending-targeted prior (2026-09-08): score a reg step's loss on the
+   *  last N supervised rows only. 0/absent = every row. */
+  regScoreLast?: number;
   /** Stage A (2026-09-07): drop each style track's trailing digital silence
    *  before the EOS target, from <codes>/trim.json (tools/mm3-trim-silence).
    *  Off unless the request asks; the file must exist when it does. */
@@ -1300,6 +1303,7 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     args.push('--reg-captions', o.regCaptionsDir);
     args.push('--reg-codes', o.regCodesDir);
     args.push('--reg-every', String(o.regEvery));
+    if (o.regScoreLast && o.regScoreLast > 0) args.push('--reg-score-last', String(o.regScoreLast));
     args.push('--reg-topk', String(o.regTopK ?? MM3_LM_DEFAULTS.regTopK));
     if (o.regPriorDir) args.push('--reg-prior', o.regPriorDir);
   }

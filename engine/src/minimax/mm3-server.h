@@ -1164,6 +1164,7 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
     opt.seed            = (uint64_t) mm3_json_i64(root, "seed", 42);
     opt.collect_hiddens = mm3_json_bool(root, "hiddens", false);
     opt.eos_trace       = mm3_json_bool(root, "eos_trace", false);   // per-iteration EOS stats, JSON body only
+    opt.forced_continue = mm3_json_bool(root, "forced_continue", false);   // replay, then sample on to EOS
     opt.dump_iters      = req.has_param("dump") ? strtoll(req.get_param_value("dump").c_str(), nullptr, 10) : 0;
     // Ensemble takes: plan K independent songs from this prompt in one batched
     // pass (mm3-ar-loop.h). Clamped inside mm3_ar_plan_takes to the row budget.

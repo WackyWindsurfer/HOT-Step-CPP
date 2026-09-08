@@ -610,6 +610,17 @@ struct MM3LmTrainArgs {
     /** Classes kept per position. 64 is his; the producer logs the measured
      *  probability mass it covers so the choice is checkable. */
     int         reg_topk = 64;
+    /** Ending-targeted prior (room plan rev 7, 2026-09-08). A reg step scores
+     *  its soft-target loss on the LAST N supervised rows of the excerpt only;
+     *  inputs, prefix and teacher are unchanged, so the model still sees the
+     *  whole context and only the trained span shrinks (n_masked moves up,
+     *  s_tr = N). The base teacher puts its stopping decision on the final row
+     *  and ~no EOS mass anywhere else, so scoring all ~500 rows is 500 rows of
+     *  "be the base" to 1 of "stop": the likeness cost measured on 2026-09-08.
+     *  0 = every row (today's behaviour, bit-identical). The loss is a mean
+     *  over the scored rows, so each retained row's coefficient rises by
+     *  n_sup/N; that number is logged. */
+    int         reg_score_last = 0;
     /** Where the captured base distributions live. Empty = <reg-codes>/../prior,
      *  so a second run over the same corpus reuses them. */
     std::string reg_prior_dir;
@@ -2867,6 +2878,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     int                  n_dropped   = 0;
    // caption-dropout steps, THIS SEGMENT
     int64_t n_end_vary = 0;   // lever 4a: end steps that drew a varied window/history
+    bool    reg_span_logged = false;   // rev-7 ending-targeted prior: announce the scored span once
     int                  n_style_seg = 0;   // style steps, THIS SEGMENT
 
     auto save_ckpt = [&](int step, double loss) -> std::string {
@@ -3883,9 +3895,29 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                     // not against this song's actual codes. `targets` goes
                     // unused; LmChunkLabelGuard switches on soft_k.
                     smp.soft_k   = prior->k;
-                    smp.soft_idx = prior->idx;
-                    smp.soft_p   = prior->p;
                     smp.s_tr     = std::min<int>(smp.s_tr, prior->n_pos);
+                    const int skip = (a.reg_score_last > 0 && smp.s_tr > a.reg_score_last)
+                                         ? smp.s_tr - a.reg_score_last : 0;
+                    if (skip > 0) {
+                        // Ending-targeted: the first `skip` supervised rows stay
+                        // as INPUT context and drop out of the loss. Same
+                        // column arithmetic as the head (n_masked - 1 + i).
+                        smp.n_masked += skip;
+                        smp.s_tr     -= skip;
+                        smp.soft_idx.assign(prior->idx.begin() + (size_t) skip * (size_t) prior->k,
+                                            prior->idx.begin() + (size_t) (skip + smp.s_tr) * (size_t) prior->k);
+                        smp.soft_p.assign(prior->p.begin() + (size_t) skip * (size_t) prior->k,
+                                          prior->p.begin() + (size_t) (skip + smp.s_tr) * (size_t) prior->k);
+                    } else {
+                        smp.soft_idx = prior->idx;
+                        smp.soft_p   = prior->p;
+                    }
+                    if (!reg_span_logged) {
+                        reg_span_logged = true;
+                        fprintf(stderr, "[mm3-lm-train] prior preservation: scoring the last %d of %d supervised rows per reg step "
+                                        "(per-row coefficient x%.3g vs the full window)\n",
+                                smp.s_tr, (int) n_sup, (double) n_sup / (double) smp.s_tr);
+                    }
                 }
                 ok = lm_ckpt_micro_step(ckpt_run, smp, true, &ce);
                 // The gradient tripwire, once, on the first real step: central

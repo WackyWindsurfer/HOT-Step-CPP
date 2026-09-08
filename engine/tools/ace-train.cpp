@@ -1896,6 +1896,7 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--reg-prior"))    a.reg_prior_dir = next("--reg-prior");
         else if (!strcmp(argv[i], "--reg-every"))    a.reg_every    = atoi(next("--reg-every"));
         else if (!strcmp(argv[i], "--reg-topk"))     a.reg_topk     = atoi(next("--reg-topk"));
+        else if (!strcmp(argv[i], "--reg-score-last")) a.reg_score_last = atoi(next("--reg-score-last"));
         else if (!strcmp(argv[i], "--jsonl"))         g_jsonl        = true;
         else if (!strcmp(argv[i], "--no-ckpt"))       a.ckpt         = false;
         else if (!strcmp(argv[i], "--fd-check"))      fd_probes      = atoi(next("--fd-check"));

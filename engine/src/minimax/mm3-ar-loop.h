@@ -223,6 +223,12 @@ struct MM3ArOptions {
     // Record per-iteration EOS statistics into MM3ArResult (see there). Costs
     // two O(NCAND) passes per step on the host; off by default.
     bool    eos_trace       = false;
+    // Forced replay normally stops at the end of the forced frames. With this
+    // on it hands over to free sampling there and runs to EOS or max_frames:
+    // the model continues someone else's plan (lever 4b, 2026-09-08: the base
+    // finishes an adapter's song; the same KV was built from the forced codes,
+    // so nothing is spliced). Needs full forcing (both code streams).
+    bool    forced_continue = false;
 
     // Lyric timestamps: capture the alignment heads' decode attention and emit
     // LRC into MM3ArResult::lrc. Needs the tokenizer to turn the lyric token
@@ -416,7 +422,13 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
             }
             return false;
         }
-        if (opt.forced_len - 1 < max_frames) {
+        if (opt.forced_continue && !forced_ac_given) {
+            if (err) {
+                *err = "forced_continue needs both forced_semantic and forced_acoustic";
+            }
+            return false;
+        }
+        if (!opt.forced_continue && opt.forced_len - 1 < max_frames) {
             max_frames = opt.forced_len - 1;  // entry 0 is the un-emitted iteration
         }
         if (max_frames <= 0) {
@@ -638,9 +650,11 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
     }
 
     for (int64_t it = 0; it <= max_frames; it++) {
-        if (forced && it >= opt.forced_len) {
+        if (forced && it >= opt.forced_len && !opt.forced_continue) {
             break;
         }
+        // Under forced_continue the iterations past the forced frames sample freely.
+        const bool forced_it = forced && it < opt.forced_len;
         const auto t_host0 = std::chrono::steady_clock::now();
 
         // ── sample this iteration's semantic code, once per take ──
@@ -780,13 +794,13 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
 
             // ── repetition penalty on the guided candidates (knobs at
             // defaults: no-op). History = this take's emitted codes. ──
-            if (!forced && opt.knobs.rep_penalty > 1.0f) {
+            if (!forced_it && opt.knobs.rep_penalty > 1.0f) {
                 mm3_apply_rep_penalty(cand_guided.data(), NCAND, outs[t].semantic_all.data(),
                                       (int64_t) outs[t].semantic_all.size(), opt.knobs);
             }
 
             // ── sample (or replay) ──
-            if (forced) {
+            if (forced_it) {
                 const int32_t fs = opt.forced_semantic[it];
                 if (fs < 0 || (int64_t) fs >= SV) {
                     if (err) {
@@ -837,9 +851,10 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
         // ── depth decoder: the seven acoustic codes and their hidden states ──
         // Semantic-only forcing keeps the RNG alive so the depth decoder samples
         // the acoustic codebooks; full forcing passes null and replays them.
-        const int32_t * forced_ac = forced_ac_given ? opt.forced_acoustic + it * NC : nullptr;
+        const bool      forced_ac_it = forced_ac_given && it < opt.forced_len;
+        const int32_t * forced_ac = forced_ac_it ? opt.forced_acoustic + it * NC : nullptr;
         if (!mm3_depth_decode_takes(m, hidden.data(), sem_code.data(), forced_ac, frames.data(), err,
-                                    forced_ac_given ? nullptr : rngs.data(), TOPK)) {
+                                    forced_ac_it ? nullptr : rngs.data(), TOPK)) {
             return false;
         }
         out->depth_ms += frames[0].ms;
