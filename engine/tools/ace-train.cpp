@@ -278,6 +278,10 @@ static void print_usage(void) {
             "                [--crop-start-tiles 3] the start share puts half its weight at\n"
             "                frame 0 and half across aligned tiles K,2K,..: teaches the\n"
             "                intro->build->verse arc under short crops. 1 = frame 0 only.\n"
+            "                [--end-crop-vary] [--end-crop-min 128] lever 4a (2026-09-08): end\n"
+            "                crops draw their length in [min, K] and their frozen-prefix span in\n"
+            "                [0, --prefix-frames], so a real ending is learned as a state rather\n"
+            "                than one memorised frame. Off = the pinned end crop.\n"
             "                [--weights f32-window|bf16] default f32-window. `bf16` is\n"
             "                Lever A: the raw BF16 weight goes to mul_mat and the\n"
             "                backward's out_prod nodes are rewritten to mul_mat, so both\n"
@@ -1868,6 +1872,8 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--crop-start-frac")) a.crop_start_frac = atof(next("--crop-start-frac"));
         else if (!strcmp(argv[i], "--crop-end-frac"))   a.crop_end_frac   = atof(next("--crop-end-frac"));
         else if (!strcmp(argv[i], "--crop-start-tiles")) a.crop_start_tiles = atoi(next("--crop-start-tiles"));
+        else if (!strcmp(argv[i], "--end-crop-vary"))  a.end_crop_vary = true;
+        else if (!strcmp(argv[i], "--end-crop-min"))   a.end_crop_min  = atoll(next("--end-crop-min"));
         else if (!strcmp(argv[i], "--crop-anchor"))   a.crop_anchor  = next("--crop-anchor");
         else if (!strcmp(argv[i], "--prefix-frames")) a.prefix_frames = atoll(next("--prefix-frames"));
         else if (!strcmp(argv[i], "--prefix-n"))     a.prefix_n     = atoi(next("--prefix-n"));

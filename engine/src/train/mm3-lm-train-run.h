@@ -222,6 +222,17 @@ struct MM3LmTrainArgs {
      *  behaviour exactly. 3 at crop 750 covers what crop 2496's start share
      *  used to. */
     int         crop_start_tiles = 3;
+    /** Varied end supervision (lever 4a, 2026-09-08). The end share above is a
+     *  single deterministic crop per song, so twelve songs teach twelve
+     *  memorised frames and the adapter's own plans never reach a state it
+     *  recognises as an ending (P(EOS) = 1.0 at the trained frame, 0 one frame
+     *  earlier). With this on, every end step draws its crop length uniformly
+     *  in [end_crop_min, K] and its frozen-prefix span uniformly in
+     *  [0, prefix_frames], so the same real ending is seen from many distances
+     *  and with many amounts of history: an ending as a STATE, not a frame.
+     *  Off = the pinned crop exactly as before. */
+    bool        end_crop_vary = false;
+    int64_t     end_crop_min  = 128;
     int         grad_accum = 1, seed = 42;
     // ADAMW BY DEFAULT as of 2026-08-23, because the recipe it belongs to is
     // now rank 64.
@@ -2821,6 +2832,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                 "half over %d aligned tiles), %.0f%% flush to the end (EOS), %.0f%% random\n",
                 a.crop_start_frac * 100.0, a.crop_start_tiles, a.crop_end_frac * 100.0,
                 (1.0 - a.crop_start_frac - a.crop_end_frac) * 100.0);
+        if (a.end_crop_vary) {
+            fprintf(stderr, "[mm3-lm-train] varied end supervision: end crops draw their length in [%lld, K] and "
+                            "their history in [0, %lld] frames (lever 4a)\n",
+                    (long long) a.end_crop_min, (long long) a.prefix_frames);
+        }
     }
     jl("{\"type\":\"cropPolicy\",\"mode\":\"%s\",\"startFrac\":%.3f,\"endFrac\":%.3f}",
        a.crop_mode.c_str(), a.crop_start_frac, a.crop_end_frac);
@@ -2848,7 +2864,9 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     // the rate. Reporting the segment is honest and needs no change to the
     // resume format — which matters, since bumping it would strand every state
     // file already on disk.
-    int                  n_dropped   = 0;   // caption-dropout steps, THIS SEGMENT
+    int                  n_dropped   = 0;
+   // caption-dropout steps, THIS SEGMENT
+    int64_t n_end_vary = 0;   // lever 4a: end steps that drew a varied window/history
     int                  n_style_seg = 0;   // style steps, THIS SEGMENT
 
     auto save_ckpt = [&](int step, double loss) -> std::string {
@@ -3680,6 +3698,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             // exactly that crop and no other.
             int64_t K = std::min<int64_t>(K_max, s.n_frames);
             int64_t c0 = 0;
+            int64_t pfx_span = a.prefix_frames;   // history in front of the window; lever 4a shortens it on end steps
             // A history-bearing reg excerpt (longer than K) is windowed flush to
             // its end and its history becomes the prefix — the capture above
             // used the same window, so the cached teacher matches.
@@ -3710,7 +3729,18 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                                      : K * (1 + (int64_t) (lm_rng_next(&rng) % (uint64_t) (max_tiles - 1)));
                         }
                     } else if (u < a.crop_start_frac + a.crop_end_frac) {
-                        c0 = span;                            // flush to the end: EOS
+                        if (a.end_crop_vary) {
+                            // Lever 4a: a shorter window still flush to the
+                            // end, and a random slice of history in front of
+                            // it. Extra RNG draws ride the resume state.
+                            const int64_t k_lo = std::max<int64_t>(1, std::min<int64_t>(a.end_crop_min, K));
+                            K = k_lo + (int64_t) (lm_rng_next(&rng) % (uint64_t) (K - k_lo + 1));
+                            if (kv_on && a.prefix_frames > 0) {
+                                pfx_span = (int64_t) (lm_rng_next(&rng) % (uint64_t) (a.prefix_frames + 1));
+                            }
+                            n_end_vary++;
+                        }
+                        c0 = s.n_frames - K;                  // flush to the end: EOS
                     } else {
                         c0 = (int64_t) (lm_rng_next(&rng) % (uint64_t) (span + 1));
                     }
@@ -3796,7 +3826,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                 if (!is_reg || c0 > 0) {
                     // History runs up to f0, because frame f0 itself is an
                     // input to the window (see `lead`).
-                    const int64_t pfx_lo = std::max<int64_t>(0, f0 - a.prefix_frames);
+                    const int64_t pfx_lo = std::max<int64_t>(0, f0 - pfx_span);
                     const int64_t npfx   = f0 - pfx_lo;
                     pfx_ctx.prompt       = prompt_ids.data();
                     pfx_ctx.codes        = s.codes.data();
@@ -4140,6 +4170,10 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             fprintf(stderr, "[mm3-lm-train] could not write the final resume state: %s\n",
                     ferr.c_str());
         }
+    }
+    if (a.end_crop_vary) {
+        fprintf(stderr, "[mm3-lm-train] varied end supervision: %lld end steps drew a varied window/history\n",
+                (long long) n_end_vary);
     }
     if (n_dropped > 0) {
         fprintf(stderr, "[mm3-lm-train] caption dropout: %d of %d style steps THIS SEGMENT "

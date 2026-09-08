@@ -2286,6 +2286,8 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       cropStartFrac: num('cropStartFrac', D.cropStartFrac, 0, 1),
       cropEndFrac:   num('cropEndFrac', D.cropEndFrac, 0, 1),
       cropStartTiles: num('cropStartTiles', D.cropStartTiles, 1, 64),
+      endCropVary: b.endCropVary === true,
+      endCropMin:  num('endCropMin', 128, 1, 9000),
       trimTrailingSilence: b.trimTrailingSilence === true,
       depthLossWeight: num('depthLossWeight', D.depthLossWeight, 0, 10),
       depthLossFrames: num('depthLossFrames', D.depthLossFrames, 1, 1024),

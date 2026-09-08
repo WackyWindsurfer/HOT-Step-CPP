@@ -1074,6 +1074,10 @@ export interface ResolvedMm3TrainLmOptions {
   cropStartFrac: number;
   cropEndFrac: number;
   cropStartTiles: number;
+  /** Lever 4a (2026-09-08): end crops draw their length in [endCropMin, K] and
+   *  their frozen-prefix span in [0, prefixFrames]. Off unless asked. */
+  endCropVary?: boolean;
+  endCropMin?: number;
   /** Stage A (2026-09-07): drop each style track's trailing digital silence
    *  before the EOS target, from <codes>/trim.json (tools/mm3-trim-silence).
    *  Off unless the request asks; the file must exist when it does. */
@@ -1194,6 +1198,10 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
   if (o.cropMode === 'structured') {
     args.push('--crop-start-frac', String(o.cropStartFrac));
     args.push('--crop-end-frac', String(o.cropEndFrac));
+    if (o.endCropVary) {
+      args.push('--end-crop-vary');
+      if (o.endCropMin) args.push('--end-crop-min', String(o.endCropMin));
+    }
     args.push('--crop-start-tiles', String(o.cropStartTiles));
   }
   if (o.trimTrailingSilence) args.push('--trim-trailing-silence');
