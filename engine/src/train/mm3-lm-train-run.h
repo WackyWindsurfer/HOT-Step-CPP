@@ -621,6 +621,12 @@ struct MM3LmTrainArgs {
      *  over the scored rows, so each retained row's coefficient rises by
      *  n_sup/N; that number is logged. */
     int         reg_score_last = 0;
+    /** Style-step counterpart (2026-09-08 evening): score only the last N
+     *  supervised rows of every style crop. SimpleTuner's `continuation` mode
+     *  scores the last 128 frames of a span whose earlier frames are context,
+     *  and its adapters end songs ~30-67% of the time where ours never do; this
+     *  ports that half of the objective. 0 = every row (today's behaviour). */
+    int         score_last = 0;
     /** Where the captured base distributions live. Empty = <reg-codes>/../prior,
      *  so a second run over the same corpus reuses them. */
     std::string reg_prior_dir;
@@ -3890,6 +3896,14 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                 smp.n_masked = (int) (P + lead);
                 smp.n_prompt = (int) P;
                 smp.s_tr     = (int) n_sup;
+                if (!prior && a.score_last > 0 && (int) n_sup > a.score_last) {
+                    // --score-last: the earlier rows stay as input context and
+                    // leave the loss; same column arithmetic as the head.
+                    const int skip = (int) n_sup - a.score_last;
+                    smp.n_masked += skip;
+                    smp.s_tr      = a.score_last;
+                    smp.targets.assign(tgt.begin() + skip, tgt.begin() + skip + a.score_last);
+                }
                 if (prior) {
                     // Score against what the base model itself predicted here,
                     // not against this song's actual codes. `targets` goes
