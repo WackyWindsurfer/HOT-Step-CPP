@@ -964,23 +964,22 @@ export const MM3_LM_DEFAULTS = {
 /** The three MM3 training presets. Each is a set of overrides on
  *  MM3_LM_DEFAULTS; everything not listed is shared.
  *
- *   balanced  THE DEFAULT (Rob, 2026-09-07 evening): the recipe that made
- *             the rock-10 adapters — crop 750, a 2048-frame history prefilled
- *             in 256-token chunks, 500 steps at 8e-5. ~35 min per album.
- *             Retrained on the same day's binary it reproduced the morning's
- *             adapter to three decimals and Rob heard intelligible vocals.
- *   fast      EXPERIMENTAL. The 2026-09-07 speed stack (crop 500, history
- *             1024, chunk 1024, 300 steps at 2x LR) tied blind on 90 s
- *             previews of alk3_crimson, then failed on greenday_warning in
- *             three different ways across five runs: Simlish vocals, a
- *             vocal-free plan, an out-of-tune organ. Neither the LR nor the
- *             chunk size alone was the lever (lr 8e-5 and chunk 256 arms both
- *             failed), so crop 500 / history 1024 / 300 steps remain suspect.
- *             Left selectable for the bisect; not for real adapters.
- *   thorough  crop 750 and a 4096-frame history over 1000 steps: ~80 min.
- *             The window and history behind the highest scores recorded
- *             here (72 and 70.5 of 90). Carries the chunk-1024 prefill that
- *             Fast also has; not implicated on its own, not re-verified.
+ *   balanced  THE DEFAULT: crop 750, a 2048-frame history prefilled in
+ *             256-token chunks, 500 steps at 8e-5, per-track captions, no
+ *             prior. ~36 min per album. On 2026-09-09 this exact recipe
+ *             (GOODCAPS) gave Green Day 4/6 natural endings with likeness,
+ *             intelligibility and style Rob rated perfect; the same recipe
+ *             under the old dataset-wide caption ended 0/6.
+ *   fast      Balanced's geometry (crop 750, history 2048) over 300 steps,
+ *             with the history prefilled in 1024-token chunks: ~22 min. The
+ *             2026-09-07 Fast (crop 500, history 1024, 2x LR) broke vocals on
+ *             greenday_warning; each of those three ingredients is gone here
+ *             and the chunk size was cleared as a lever in that bisect. The
+ *             300-step depth is the one thing not re-heard since.
+ *   thorough  crop 750 and a 4096-frame history over 1000 steps, prefilled
+ *             in the verified 256-token chunks: ~85 min. The window and
+ *             history behind the highest scores recorded here (72 and 70.5
+ *             of 90); the gain over Balanced sat inside the listening noise.
  *
  *  MM3_LM_DEFAULTS carries the Balanced values, so an empty request and the
  *  form's initial state are the same recipe. The route applies a named
@@ -990,9 +989,9 @@ export const MM3_LM_DEFAULT_PRESET: Mm3PresetName = 'balanced';
 export const MM3_LM_PRESETS: Record<Mm3PresetName, {
   steps: number; lr: number; maxFrames: number; prefixFrames: number; prefixChunk: number;
 }> = {
-  fast:     { steps: 300, lr: 1.6e-4, maxFrames: 500, prefixFrames: 1024, prefixChunk: 1024 },
+  fast:     { steps: 300, lr: 8e-5,   maxFrames: 750, prefixFrames: 2048, prefixChunk: 1024 },
   balanced: { steps: 500, lr: 8e-5,   maxFrames: 750, prefixFrames: 2048, prefixChunk: 256 },
-  thorough: { steps: 1000, lr: 8e-5,  maxFrames: 750, prefixFrames: 4096, prefixChunk: 1024 },
+  thorough: { steps: 1000, lr: 8e-5,  maxFrames: 750, prefixFrames: 4096, prefixChunk: 256 },
 };
 export function isMm3PresetName(v: unknown): v is Mm3PresetName {
   return v === 'fast' || v === 'balanced' || v === 'thorough';

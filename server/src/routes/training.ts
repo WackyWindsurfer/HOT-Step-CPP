@@ -2097,25 +2097,16 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
     // fields: `{preset:'thorough'}` alone trains Thorough, `{preset:'thorough',
     // steps: 800}` trains Thorough for 800 steps. No name = the defaults = Fast.
     const D = applyMm3Preset(MM3_LM_DEFAULTS, b.preset);
-    // Prior preservation on BASE-MODEL ENDINGS is part of the default recipe
-    // (2026-09-07 evening): without it a Green Day adapter on this recipe hit
-    // the 300 s ceiling in 6 of 6 renders, with it 3 of 6 ended naturally and
-    // every ending Rob heard was a real outro. The corpus is base-plan
-    // excerpts (tools/mm3-reg-corpus) shipped under the training data dir; a
-    // request that names its own corpus, or sends `regularisation: null`,
-    // overrides this. Reg steps are EXTRA: the default step count grows so
-    // the artist still gets D.steps updates (every 3rd step is a reg step).
-    // A user-built corpus under the training dir wins; otherwise the shipped one
-    // (server/src/data in dev, copied to server/data by the release packager).
-    const defaultRegDir = [
-      path.join(trainingBaseDir, 'mm3-reg-corpus', 'base-endings-k500'),
-      PORTABLE_MODE
-        ? path.join(PROJECT_ROOT, 'server', 'data', 'mm3-reg-corpus', 'base-endings-k500')
-        : path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'data', 'mm3-reg-corpus', 'base-endings-k500'),
-    ].find(d => fs.existsSync(path.join(d, 'dataset.json'))) ?? '';
-    const regDefaulted = b.regularisation === undefined && defaultRegDir !== '';
-    const regRaw = regDefaulted ? { corpusDir: defaultRegDir, every: 3 } : (b.regularisation ?? undefined);
-    const stepsDefault = regDefaulted ? D.steps + Math.floor(D.steps / 2) : D.steps;
+    // Prior preservation is OFF unless the request names a corpus. From
+    // 2026-09-07 to 2026-09-09 an absent `regularisation` silently defaulted
+    // the shipped base-endings corpus in (and grew the step count by half),
+    // while the form told the user the prior was off. It was a workaround for
+    // endings that the dataset-wide caption had broken; with per-track
+    // captions the plain recipe ends songs (GOODCAPS 4/6, 2026-09-09) and the
+    // prior only cost likeness by ear. The shipped corpus stays available to
+    // a request that asks for it by dataset or path.
+    const regRaw = b.regularisation ?? undefined;
+    const stepsDefault = D.steps;
     // Three-way now. The old two-way collapsed anything that was not 'adamw'
     // onto the default, which with a prodigy default would have silently
     // ignored a request for muon.
