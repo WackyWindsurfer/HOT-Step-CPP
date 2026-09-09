@@ -1310,11 +1310,14 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     args.push('--reg-codes', o.regCodesDir);
     args.push('--reg-every', String(o.regEvery));
     if (o.regScoreLast && o.regScoreLast > 0) args.push('--reg-score-last', String(o.regScoreLast));
-    if (o.scoreLast && o.scoreLast > 0) args.push('--score-last', String(o.scoreLast));
-    if (o.lyricsDropout && o.lyricsDropout > 0) args.push('--lyrics-dropout', String(o.lyricsDropout));
     args.push('--reg-topk', String(o.regTopK ?? MM3_LM_DEFAULTS.regTopK));
     if (o.regPriorDir) args.push('--reg-prior', o.regPriorDir);
   }
+  // Style-step knobs, independent of the prior. Until 2026-09-09 01:20 these
+  // two sat inside the regularisation block above, so every no-prior run that
+  // asked for them (CONT, FAITHFUL, FAITHLYD) silently trained without them.
+  if (o.scoreLast && o.scoreLast > 0) args.push('--score-last', String(o.scoreLast));
+  if (o.lyricsDropout && o.lyricsDropout > 0) args.push('--lyrics-dropout', String(o.lyricsDropout));
   // Previews pause the trainer through a sentinel file. When they are off, say
   // so explicitly: a stray PAUSE left behind by a killed run would otherwise
   // stop the next run at its first step.
