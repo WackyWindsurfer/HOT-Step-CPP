@@ -1669,6 +1669,8 @@
     "trainingStudio.mm3.preset.customInfo": "Steps, learning rate, crop or history differ from every preset.",
     "trainingStudio.mm3.steps": "Steps",
     "trainingStudio.mm3.saveEvery": "Checkpoint every",
+    "trainingStudio.mm3.keepResumeState": "Keep resume state after completion",
+    "trainingStudio.mm3.keepResumeStateHint": "The optimizer state (about 4 GB) lets a finished run be continued past its step count. Off: it is deleted once the run ends. A run that stops early keeps it either way.",
     "trainingStudio.mm3.rank": "Rank",
     "trainingStudio.mm3.maxFrames": "Crop (frames)",
     "trainingStudio.mm3.prefixFrames": "History before crop (frames)",

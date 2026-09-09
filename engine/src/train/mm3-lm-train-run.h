@@ -2211,8 +2211,16 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                 ps.sites, 100.0 * ps.energy_mean, 100.0 * ps.energy_min, a.rank,
                 100.0 * (double) a.rank / (double) c.hidden_size);
         jl("{\"type\":\"adapter\",\"kind\":\"%s\",\"sites\":%d,\"energyMean\":%.6f,"
-           "\"energyMin\":%.6f}",
-           a.hot_pizza ? "hot-pizza" : "pissa", ps.sites, ps.energy_mean, ps.energy_min);
+           "\"energyMin\":%.6f,\"residual\":\"%s\"}",
+           a.hot_pizza ? "hot-pizza" : "pissa", ps.sites, ps.energy_mean, ps.energy_min,
+           json_escape(lora.pissa_residual).c_str());
+        if (!lora.pissa_residual.empty()) {
+            fprintf(stderr, "[mm3-lm-train] PiSSA export: adapter-only (delta) files against residual %s\n",
+                    lora.pissa_residual.c_str());
+        } else {
+            fprintf(stderr, "[mm3-lm-train] PiSSA export: standalone rank-%d files (no residual beside %s)\n",
+                    2 * a.rank, a.lm_path.c_str());
+        }
     }
     if (want_lokr) {
         fprintf(stderr, "[mm3-lm-train] LoKr: dim %d alpha %.0f factor %d, decompose %s\n", a.lokr_dim,
@@ -2963,9 +2971,14 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         // respectively — through the same writer, with their factors
         // substituted. That is what lets the runtime and merge paths stay
         // completely unaware of either.
+        // PiSSA (2026-09-09): the DELTA form when the init read or wrote the
+        // residual beside the base (adapter-only, rank r), else the standalone
+        // rank-2r form. Both F16 now.
         const bool exported = lokr_out  ? lm_export_lokr(lora, meta, dir, &res, &xerr)
                               : a.hra   ? lm_export_hra(lora, c, meta, dir, sched, &res, &xerr, &mx)
-                              : a.pissa ? lm_export_pissa(lora, c, meta, dir, &res, &xerr, &mx)
+                              : a.pissa ? (lora.pissa_residual.empty()
+                                               ? lm_export_pissa(lora, c, meta, dir, &res, &xerr, &mx)
+                                               : lm_export_pissa_delta(lora, c, meta, dir, &res, &xerr, &mx))
                                         : lm_export_peft(lora, c, meta, dir, &res, &xerr, &mx);
         if (!exported) {
             fprintf(stderr, "[mm3-lm-train] export failed: %s\n", xerr.c_str());
@@ -3028,8 +3041,8 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
         // catch it.
         if (a.verify_export && !lokr_out) {
             std::string verr;
-            const bool  vok = (a.pissa || a.hra) ? mm3_lm_verify_export_delta(dir, lora, &verr)
-                                                 : mm3_lm_verify_export(dir, lora, &verr);
+            const bool  vok = (a.pissa || a.hra) ? mm3_lm_verify_export_delta(dir, lora, &verr, a.lm_path)
+                                                 : mm3_lm_verify_export(dir, lora, &verr, a.lm_path);
             if (!vok) {
                 fprintf(stderr, "[mm3-lm-train] --verify-export FAILED: %s\n", verr.c_str());
                 return std::string();

@@ -44,6 +44,12 @@ export interface Mm3TrainLmRequest {
   lr?: number;
   steps?: number;
   saveEvery?: number;
+  /** Keep the optimizer state (resume-state.bin, ~4 GB) once the run reaches
+   *  its end. Default false: it is deleted on completion and kept only when
+   *  the run stops short. */
+  keepResumeState?: boolean;
+  /** Engine --verify-export (round-trip every checkpoint through the runtime loader). */
+  verifyExport?: boolean;
   warmup?: number;
   gradAccum?: number;
   seed?: number;

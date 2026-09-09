@@ -905,7 +905,11 @@ the head-averaged matrix, grouped on newline tokens, is what works — see
 ## Runtime LM adapters (SHIPPED 2026-08-20 — engine + server + UI)
 
 `engine/src/minimax/mm3-lm-adapter.h` loads PEFT LM LoRAs (SimpleTuner
-`language_model.`-prefixed checkpoints, q/k/v/o + gate/up/down × 36 layers)
+`language_model.`-prefixed checkpoints, q/k/v/o + gate/up/down × 36 layers;
+since 2026-09-09 also the PiSSA DELTA form, `hot_step.param_method = 4`, which
+needs the residual file beside the resident base — the loader takes the base
+path as its third argument and refuses with the file's name when it is
+missing; see `engine/src/pissa-residual.h`)
 and applies them as RUNTIME low-rank deltas in the AR stage — base weights
 untouched, so per-group scales are live per generation. Wire fields on
 `POST /mm3/synth`: `lm_adapter` (abs path), `lm_adapter_scale{,_attn,_mlp,

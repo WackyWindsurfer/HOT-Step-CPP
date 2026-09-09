@@ -220,6 +220,12 @@ struct LmLora {
     // only to f16 (~5e-4 relative on the top-r component); an ear test decides
     // whether that is free. The trained A/B stay F32 either way.
     bool  pissa_f16      = false;
+    // The residual file the PiSSA init used or wrote (pissa-residual.h): its
+    // basename when the frozen A0/B0 are the bytes in that file, empty when the
+    // init could neither read nor write one. Non-empty selects the DELTA export
+    // (rank r, adapter-only) over the standalone rank-2r one.
+    std::string pissa_residual;
+    long long   pissa_base_size = 0;   // byte length of the base the residual is tied to
     // HRA (2026-09-05): `rank` Householder reflections on each site's INPUT.
     // A holds the vectors, B is null, so nothing downstream that keys off
     // `pr.B` fires. Exact rank-r LoRA on export (lm-hra.h).

@@ -1189,7 +1189,8 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
             if (!g_mm3_lm_adapter || g_mm3_lm_adapter->path != ad_path) {
                 mm3_lm_adapter_drop();
                 std::string aerr;
-                g_mm3_lm_adapter = mm3_lm_adapter_load(ad_path.c_str(), &aerr);
+                g_mm3_lm_adapter = mm3_lm_adapter_load(ad_path.c_str(), &aerr,
+                                                       g_mm3.lm_file.found ? g_mm3.lm_file.path.c_str() : nullptr);
                 if (!g_mm3_lm_adapter) {
                     mm3_json_error(res, 400, aerr.empty() ? "LM adapter load failed" : aerr);
                     return;

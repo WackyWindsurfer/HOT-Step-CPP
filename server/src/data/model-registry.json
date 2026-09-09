@@ -107,6 +107,7 @@
       "description": "LM, DiT and depth decoder at Q8_0 with the frontends near-native — near-lossless, about half the size and a faster LM step. Recommended. ~13 GB download.",
       "fileIds": [
         "mm3-lm-q8_0",
+        "mm3-lm-q8_0-pissa-r128",
         "mm3-synth-q8_0"
       ],
       "components": [
@@ -123,6 +124,7 @@
       "description": "The split format's point: LM at Q8_0 (quality lives in the language model) with the DiT at Q4_K_M (VRAM lives in the flow stack), depth at Q8_0, frontends near-native. ~12 GB download.",
       "fileIds": [
         "mm3-lm-q8_0",
+        "mm3-lm-q8_0-pissa-r128",
         "mm3-dit-Q4_K_M",
         "mm3-depth-q8_0",
         "mm3-cond-f16",
@@ -191,7 +193,8 @@
       "fileIds": [
         "mm3-rvq-53kpooled",
         "mm3-enc-f16",
-        "mm3-depth-f16"
+        "mm3-depth-f16",
+        "mm3-lm-q8_0-pissa-r128"
       ]
     },
     {
@@ -3716,6 +3719,28 @@
       "repo": "scragnog/MiniMax-Music3-GGUF",
       "description": "Audio → LM frame hiddens. TRAINING ONLY, and OPTIONAL: powers the codes stage's \"Cover-launder\" option, which renders each track back through the model before encoding so buried vocals reach the code targets — the ear-validated fix for dense-mix artists. PurpleOrc's rec7 encoder (170M, MIT) converted to GGUF, with the MM3 LM's two semantic table slices baked in so laundering never runs the 8B language model. Skip it if you never use laundered codes.",
       "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "mm3-lm-q8_0-pissa-r128",
+      "filename": "mm3-lm-q8_0.pissa-r128.safetensors",
+      "role": "mm3",
+      "subdir": "mm3",
+      "displayName": "MM3 LM HOT-PiZZA residual (Q8_0, rank 128)",
+      "scale": null,
+      "variant": "residual",
+      "quant": "F16",
+      "sizeBytes": 698403328,
+      "repo": "scragnog/MiniMax-Music3-GGUF",
+      "description": "The frozen half of every HOT-PiZZA / PiSSA adapter trained on the Q8_0 language model at rank 128: the base weights' own top-128 singular directions, shipped once instead of inside each adapter. Needed to LOAD any MM3 artist adapter trained from 2026-09-09 on (the adapter files are 0.7 GB instead of 2.8 GB because of it) and read by the trainer so new adapters export in that form. Generation without an adapter does not use it. This file is ~0.7 GB.",
+      "tags": [
+        "recommended"
+      ],
       "companions": [
         {
           "filename": "LICENSE",

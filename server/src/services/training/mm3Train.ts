@@ -599,14 +599,20 @@ export const MM3_LM_DEFAULTS = {
    *  it caught rather than with the model. A whole number of passes counts
    *  every song identically. */
   targetLossEpochs: 5,
-  /** 50, so a 500-step run yields 10 checkpoints to audition — the memorised
-   *  run put the plausible ear-optimum somewhere in 150-350, and checkpoints
-   *  every 250 would straddle it blind. */
-  saveEvery: 50,
+  /** 100 (Rob, 2026-09-09; was 50). Five checkpoints on a 500-step run. The
+   *  depth ladder showed 500/750/1000 inside the noise, so the mid-run grid
+   *  was costing 2.8 GB a checkpoint for auditions nobody did; the final is
+   *  what ships. */
+  saveEvery: 100,
   /** One preview per checkpoint (Rob, 2026-08-25). The clock cadence made
-   *  sense at 15 s steps and a 250-step save interval; at saveEvery 50 the
+   *  sense at 15 s steps and a 250-step save interval; at saveEvery 100 the
    *  checkpoint grid IS the cadence you want the ear to track. */
-  previewEverySteps: 50,
+  previewEverySteps: 100,
+  /** Keep resume-state.bin (~4.2 GB of optimizer state) after a run that
+   *  reaches its end. Off (Rob, 2026-09-09): a finished adapter is not
+   *  continued in practice, and the state outweighed the adapter itself. A
+   *  run that stops short (cancel, crash, pause) keeps it regardless. */
+  keepResumeState: false,
   /** Cadence follows checkpoints instead of the clock (Rob, 2026-08-25): a
    *  preview per checkpoint means every audition candidate on disk has an ear
    *  sample attached, and none are rendered twice. */
@@ -1085,6 +1091,12 @@ export interface ResolvedMm3TrainLmOptions {
   scoreLast?: number;
   /** Apply scoreLast to END crops only (interior crops keep every row scored). */
   scoreLastEndOnly?: boolean;
+  /** Server-side only (no engine flag): keep resume-state.bin after completion. */
+  keepResumeState?: boolean;
+  /** Engine --verify-export: after every checkpoint, load it back through the
+   *  RUNTIME loader and compare against the live trainer (mm3-lm-verify-export.h).
+   *  Opt-in: it briefly holds a second copy of the adapter on the card. */
+  verifyExport?: boolean;
   /** Lyrics dropout (2026-09-08): share of style steps trained on a prompt
    *  without lyrics (instrumental marker). 0/absent = never. */
   lyricsDropout?: number;
@@ -1320,6 +1332,7 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
   if (o.scoreLast && o.scoreLast > 0) {
     args.push('--score-last', String(o.scoreLast));
     if (o.scoreLastEndOnly) args.push('--score-last-end-only');
+    if (o.verifyExport) args.push('--verify-export');
   }
   if (o.lyricsDropout && o.lyricsDropout > 0) args.push('--lyrics-dropout', String(o.lyricsDropout));
   // Previews pause the trainer through a sentinel file. When they are off, say

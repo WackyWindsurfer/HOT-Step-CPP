@@ -34,6 +34,7 @@
 
 #include "backend.h"
 #include "hot-step-fsutf8.h"  // hs_stat / HS_STAT_T
+#include "pissa-residual.h"   // the shipped frozen half of a PiSSA delta adapter
 #include "safetensors.h"
 #include "yyjson.h"
 
@@ -175,6 +176,12 @@ struct MM3LmAdapter {
     // where the low-rank assumption actually lives.
     bool             is_loha      = false;
     bool             is_hira      = false;
+
+    // PiSSA delta form (2026-09-09): the file held only A - A0 and s(B - B0);
+    // the pair in `mods` was rebuilt at rank 2r from it plus the residual named
+    // here (pissa-residual.h). Downstream sees an ordinary rank-2r LoRA.
+    bool             is_pissa_delta = false;
+    std::string      pissa_residual;
 
     int              dora_n       = 0;
     bool             dora_pending = false;  // nrm not filled yet — do NOT build a graph
@@ -397,6 +404,9 @@ struct MM3LmAdapterCfg {
      *  the file's own marker against it: "the config says LORA" and "there is no
      *  config" are different claims. */
     bool        present   = false;
+    /** hot_step_pissa_residual: the residual file a delta-form adapter pairs
+     *  with (basename, beside the base GGUF). Empty for every other adapter. */
+    std::string pissa_residual;
 };
 
 static MM3LmAdapterCfg mm3_lm_adapter_read_cfg(const std::string & sf_path) {
@@ -415,11 +425,13 @@ static MM3LmAdapterCfg mm3_lm_adapter_read_cfg(const std::string & sf_path) {
         yyjson_val * rs = yyjson_obj_get(root, "use_rslora");
         yyjson_val * dv = yyjson_obj_get(root, "use_dora");
         yyjson_val * pt = yyjson_obj_get(root, "peft_type");
+        yyjson_val * pr = yyjson_obj_get(root, "hot_step_pissa_residual");
         if (a && yyjson_is_num(a)) alpha = yyjson_get_num(a);
         if (rv && yyjson_is_num(rv)) r = yyjson_get_num(rv);
         if (rs && yyjson_is_true(rs)) out.rslora = true;
         if (dv && yyjson_is_true(dv)) out.dora = true;
         if (pt && yyjson_is_str(pt)) out.peft_type = yyjson_get_str(pt);
+        if (pr && yyjson_is_str(pr)) out.pissa_residual = yyjson_get_str(pr);
         out.present = true;
     }
     yyjson_doc_free(doc);
@@ -513,7 +525,12 @@ static void mm3_lm_adapter_read_soft_prompt(const STFile & st, MM3LmAdapter * ad
 // as every other module). Returns nullptr with a message on any structural
 // problem — a half-loaded adapter is worse than none (the LM-echo whitelist
 // lesson: silently dropping modules changes what the adapter IS).
-static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) {
+//
+// base_lm_path (2026-09-09): the resident base GGUF. A PiSSA delta adapter
+// (hot_step.param_method 4) carries only the trained half; the frozen half is
+// read from `<dir of base>/<hot_step_pissa_residual>` and the rank-2r pair the
+// older exports carried is rebuilt here. Every other adapter ignores it.
+static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err, const char * base_lm_path = nullptr) {
     STFile st;
     if (!st_open(&st, path)) {
         if (err) {
@@ -545,10 +562,13 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
         const STEntry * mk = st_find(st, "hot_step.param_method");
         if (mk && mk->dtype == "F32" && mk->n_dims == 1 && mk->shape[0] == 1) {
             const int code = (int) *(const float *) st_data(st, *mk);
-            marker = code == 1 ? "dora" : code == 2 ? "hira" : code == 3 ? "loha" : "lora";
+            marker = code == 1 ? "dora" : code == 2 ? "hira" : code == 3 ? "loha" : code == 4 ? "pissa-delta" : "lora";
         }
     }
-    if (!marker.empty() && cfg.present) {
+    const bool pissa_delta = marker == "pissa-delta";
+    // A delta file's config says LORA on purpose (it IS applied as one once the
+    // pair is rebuilt), so the marker/config cross-check below does not apply.
+    if (!marker.empty() && !pissa_delta && cfg.present) {
         const std::string from_cfg = cfg.peft_type == "HIRA"   ? "hira"
                                      : cfg.peft_type == "LOHA" ? "loha"
                                      : cfg.dora                ? "dora"
@@ -563,9 +583,88 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
         }
     }
 
+    // ── PiSSA delta: fetch the residual before any tensor is sized ─────────
+    //
+    // The pair rebuilt below is [s(B - B0), sqrt(s) B0c][A0c/sqrt(s) + dA; dA]
+    // (lm-pissa.h, lm_export_pissa_delta), with A0c/B0c the residual's
+    // canonical factors and dA / s(B - B0) the file's lora_A / lora_B.
+    int                            pd_rank  = 0;
+    float                          pd_scale = 1.0f;
+    std::vector<PissaResidualSite> pd_sites;
+    std::string                    pd_name;
+    if (pissa_delta) {
+        const STEntry * pm = st_find(st, "hot_step.pissa.meta");
+        if (!pm || pm->dtype != "F32" || pm->n_dims != 1 || pm->shape[0] < 6) {
+            st_close(&st);
+            if (err) {
+                *err = std::string("adapter ") + path + " is a PiSSA delta file without hot_step.pissa.meta";
+            }
+            return nullptr;
+        }
+        const float *   mv        = (const float *) st_data(st, *pm);
+        pd_rank                   = (int) mv[0];
+        pd_scale                  = mv[1];
+        const long long base_size = pissa_size_join(mv[4], mv[5]);
+        if (pd_rank <= 0 || !(pd_scale > 0.0f)) {
+            st_close(&st);
+            if (err) {
+                *err = std::string("adapter ") + path + " has a malformed hot_step.pissa.meta";
+            }
+            return nullptr;
+        }
+        if (!base_lm_path || !*base_lm_path) {
+            st_close(&st);
+            if (err) {
+                *err = std::string("adapter ") + path + " is a PiSSA delta file (adapter-only); its residual can "
+                       "only be found beside the base LM, and no base path was given to the loader";
+            }
+            return nullptr;
+        }
+        pd_name = !cfg.pissa_residual.empty() ? cfg.pissa_residual : pissa_residual_name(base_lm_path, pd_rank);
+        const std::string pd_path = pissa_dirname(base_lm_path) + "/" + pd_name;
+        PissaResidualMeta rm;
+        std::string       rerr;
+        if (!hs_file_exists(pd_path)) {
+            st_close(&st);
+            if (err) {
+                *err = "this adapter needs the PiSSA residual file " + pd_name + " beside the MM3 language model (" +
+                       pissa_dirname(base_lm_path) + "). It is a one-off download from the model registry (Models "
+                       "page), about 0.7 GB, shared by every HOT-PiZZA adapter trained on that base.";
+            }
+            return nullptr;
+        }
+        if (!pissa_residual_read_meta(pd_path, &rm, &rerr)) {
+            st_close(&st);
+            if (err) {
+                *err = "PiSSA residual unreadable: " + rerr;
+            }
+            return nullptr;
+        }
+        if (rm.rank != pd_rank || (base_size > 0 && rm.base_size > 0 && rm.base_size != base_size)) {
+            st_close(&st);
+            if (err) {
+                char b[256];
+                snprintf(b, sizeof(b), " (residual: rank %d, base %lld B; adapter: rank %d, base %lld B)", rm.rank,
+                         rm.base_size, pd_rank, base_size);
+                *err = "PiSSA residual " + pd_name + " was not made for this adapter" + b +
+                       ". Re-download the residual, or retrain the adapter against this base.";
+            }
+            return nullptr;
+        }
+        if (!pissa_residual_read(pd_path, &rm, &pd_sites, &rerr)) {
+            st_close(&st);
+            if (err) {
+                *err = "PiSSA residual unreadable: " + rerr;
+            }
+            return nullptr;
+        }
+    }
+
     MM3LmAdapter * ad = new MM3LmAdapter();
     ad->path          = path;
     ad->mtime         = (int64_t) sb.st_mtime;
+    ad->is_pissa_delta = pissa_delta;
+    ad->pissa_residual = pd_name;
     {
         ad->cfg_ratio  = cfg.ratio;
         ad->cfg_rslora = cfg.rslora;
@@ -647,8 +746,24 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
         // LoRA:  A [r, in]     -> [in, r]      B [out, r]   -> [r, out]
         // LoKr:  w1 [out_l, in_m] -> [in_m, out_l]; w2 [out_k, in_n] -> [in_n, out_k]
         //        w2_a [out_k, dim] -> [dim, out_k];  w2_b [dim, in_n] -> [in_n, dim]
-        const int64_t ne0 = e.shape[1];
-        const int64_t ne1 = e.shape[0];
+        int64_t ne0 = e.shape[1];
+        int64_t ne1 = e.shape[0];
+        if (pissa_delta && (c == MM3_LM_COMP_A || c == MM3_LM_COMP_B)) {
+            // The file is rank r; the pair rebuilt from it is rank 2r.
+            if ((c == MM3_LM_COMP_A ? ne1 : ne0) != pd_rank) {
+                if (err) {
+                    *err = "PiSSA delta tensor " + e.name + " is not rank " + std::to_string(pd_rank);
+                }
+                st_close(&st);
+                mm3_lm_adapter_free(ad);
+                return nullptr;
+            }
+            if (c == MM3_LM_COMP_A) {
+                ne1 = 2 * pd_rank;
+            } else {
+                ne0 = 2 * pd_rank;
+            }
+        }
         ggml_tensor * t   = ggml_new_tensor_2d(ad->ctx, GGML_TYPE_F16, ne0, ne1);
         ggml_set_name(t, e.name.c_str());
         MM3LmAdapterPair & p    = ad->mods[layer][module];
@@ -710,14 +825,67 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
             continue;
         }
         const int64_t n = ggml_nelements(t);
-        f32.resize((size_t) n);
-        if (!adapter_to_f32(st_data(st, e), f32.data(), n, e.dtype)) {
-            st_close(&st);
-            if (err) {
-                *err = "unsupported dtype " + e.dtype + " on " + e.name;
+        if (pissa_delta && (c == MM3_LM_COMP_A || c == MM3_LM_COMP_B)) {
+            // ── rebuild the rank-2r pair from the delta and the residual ───
+            const PissaResidualSite * rs = pissa_residual_find(pd_sites, layer, MM3_LM_ADAPTER_MODULE_KEY[module]);
+            const int64_t             r  = pd_rank;
+            const int64_t in  = (c == MM3_LM_COMP_A) ? t->ne[0] : 0;
+            const int64_t out = (c == MM3_LM_COMP_B) ? t->ne[1] : 0;
+            if (!rs || (c == MM3_LM_COMP_A && rs->in != in) || (c == MM3_LM_COMP_B && rs->out != out)) {
+                st_close(&st);
+                if (err) {
+                    *err = "PiSSA residual " + pd_name + " has no matching site for " + e.name;
+                }
+                mm3_lm_adapter_free(ad);
+                return nullptr;
             }
-            mm3_lm_adapter_free(ad);
-            return nullptr;
+            const int64_t nd = (c == MM3_LM_COMP_A) ? in * r : r * out;   // the file tensor's elements
+            std::vector<float> d((size_t) nd);
+            if (!adapter_to_f32(st_data(st, e), d.data(), nd, e.dtype)) {
+                st_close(&st);
+                if (err) {
+                    *err = "unsupported dtype " + e.dtype + " on " + e.name;
+                }
+                mm3_lm_adapter_free(ad);
+                return nullptr;
+            }
+            const double sqrt_s = sqrt((double) pd_scale);
+            f32.resize((size_t) n);
+            if (c == MM3_LM_COMP_A) {
+                // ggml [in, 2r]: rows 0..r-1 = A0c/sqrt(s) + dA, rows r..2r-1 = dA.
+                // Row k of an [in, r] ggml tensor is the contiguous block k*in.
+                for (int64_t k = 0; k < r; k++) {
+                    const float * a0 = rs->A0.data() + (size_t) (k * in);
+                    const float * da = d.data() + (size_t) (k * in);
+                    float *       lo = f32.data() + (size_t) (k * in);
+                    float *       hi = f32.data() + (size_t) ((r + k) * in);
+                    for (int64_t i = 0; i < in; i++) {
+                        lo[i] = (float) ((double) a0[i] / sqrt_s + (double) da[i]);
+                        hi[i] = da[i];
+                    }
+                }
+            } else {
+                // ggml [2r, out]: per output column j, [s(B - B0)(j) ; sqrt(s) B0c(j)].
+                for (int64_t j = 0; j < out; j++) {
+                    const float * b0 = rs->B0.data() + (size_t) (j * r);
+                    const float * db = d.data() + (size_t) (j * r);
+                    float *       o  = f32.data() + (size_t) (j * 2 * r);
+                    for (int64_t k = 0; k < r; k++) {
+                        o[k]     = db[k];
+                        o[r + k] = (float) ((double) b0[k] * sqrt_s);
+                    }
+                }
+            }
+        } else {
+            f32.resize((size_t) n);
+            if (!adapter_to_f32(st_data(st, e), f32.data(), n, e.dtype)) {
+                st_close(&st);
+                if (err) {
+                    *err = "unsupported dtype " + e.dtype + " on " + e.name;
+                }
+                mm3_lm_adapter_free(ad);
+                return nullptr;
+            }
         }
         // THE F16 STORE IS LOSSY AT THE TOP OF THE RANGE, AND SILENTLY SO.
         //
@@ -773,6 +941,9 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
         ggml_fp32_to_fp16_row(f32.data(), f16.data(), n);
         ggml_backend_tensor_set(t, f16.data(), 0, (size_t) n * sizeof(ggml_fp16_t));
     }
+    // The residual's host copy (up to 1.4 GB) is done with once the pairs are
+    // on the device.
+    std::vector<PissaResidualSite>().swap(pd_sites);
     // The token / prefix halves, while the file is still mapped. They are
     // F32 host rows — nothing here goes through the f16 store above.
     mm3_lm_adapter_read_soft_prompt(st, ad);
@@ -911,7 +1082,8 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err) 
         }
     }
     fprintf(stderr, "[MM3] LM adapter loaded: %s (%d modules, %s%s%s%s%s, base scale %.4f, %.1f MB)\n", path, ad->n_loaded,
-            ad->is_lokr ? "LoKr" : ad->is_loha ? "LoHa" : "LoRA", ad->is_hira ? " HiRA" : "",
+            ad->is_lokr ? "LoKr" : ad->is_loha ? "LoHa" : ad->is_pissa_delta ? "PiSSA delta + residual" : "LoRA",
+            ad->is_hira ? " HiRA" : "",
             ad->cfg_rslora ? " +rsLoRA" : "", ad->dora_n ? " +DoRA" : "",
             (ad->is_loha || ad->is_hira) ? " (merge mode only)" : "",
             (double) scale_shown, (double) ggml_backend_buffer_get_size(ad->buf) / 1e6);

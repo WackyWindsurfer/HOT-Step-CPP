@@ -80,11 +80,35 @@ alk3_crimson (nine methods, three songs, everything else locked) its adapter
 scored 68/90 and, rated again against the corrected PiSSA and LoRA, 66.5,
 top both times with no plan failures, while corrected PiSSA produced drone
 plans in half its renders (39.5) and LoRA sat at 60–64. One album so far; a
-second artist is the pending validation. The export is an ordinary rank-2r
-LoRA, identical in form to `--pissa`, so nothing at load time changes.
+second artist is the pending validation. The export is either the DELTA
+form (rank r, adapter-only, 0.7 GB at r128 F16) when a residual file sits
+beside the base, or an ordinary rank-2r LoRA (F16, 1.4 GB) when none does;
+see "PiSSA residual" below.
 Training loss reads high under it by construction (the trailing mean sat at
 2.7–5 where LoRA reads 1.8–3), so stop on steps: the in-app MM3 default is
 500 steps, the checkpoint Rob rated. Not resumable, like `--pissa`.
+
+#### PiSSA residual: the frozen half shipped once (2026-09-09)
+
+Half of every PiSSA/HOT-PiZZA export is the frozen pair A0/B0, the base
+weight's own top-r singular directions, identical for every adapter on the
+same base. `engine/src/pissa-residual.h` defines a file that carries it once:
+`<base stem>.pissa-r<rank>.safetensors` beside the base GGUF (F16, canonical
+scale-1 factors, `pissa.meta` with rank / SVD parameters / the base's byte
+size). The shipped one, `mm3-lm-q8_0.pissa-r128.safetensors` (0.7 GB), is in
+the model registry (`mm3-lm-q8_0-pissa-r128`) and the MM3 packs.
+
+The trainer's PiSSA init reads it when rank, oversample, iterations, layer
+range and base size match (else SVD cache, else the SVD, and then it writes
+the file). Checkpoints then export in the delta form: `lora_A = A - A0`,
+`lora_B = s(B - B0)` at rank r, `hot_step.param_method = 4`, a
+`hot_step.pissa.meta` tensor and `hot_step_pissa_residual` in
+adapter_config.json. `minimax/mm3-lm-adapter.h` rebuilds the same rank-2r
+pair the older exports carried from the two files, so the runtime graph,
+merge mode and group scales are untouched. The delta file is not a plain
+LoRA (an external PEFT loader would apply (B-B0)(A-A0)); the AS1.5 LM loader
+refuses the marker. `engine/tools/pissa_cache_to_residual.py` converts an
+SVD cache into the file; it made the shipped one.
 
 The shipped MM3 recipe since 2026-09-06 stacks four cost levers on top of
 HOT-PiZZA, each first tied against the default in a blind set and then heard

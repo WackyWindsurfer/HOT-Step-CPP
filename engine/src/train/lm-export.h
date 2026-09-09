@@ -186,7 +186,8 @@ struct LmExportMeta {
 // Key ORDER is unchanged — the §2.4 literal is frozen and these two keys were
 // already in it.
 static bool lm_write_adapter_config(const std::string & dir, int rank, int alpha, const std::string & base_model,
-                                    bool rslora = false, bool dora = false, const char * peft_type = "LORA") {
+                                    bool rslora = false, bool dora = false, const char * peft_type = "LORA",
+                                    const std::string & extra_json = "") {
     std::string j;
     j += "{\n";
     j += "  \"alpha_pattern\": {},\n";
@@ -194,6 +195,9 @@ static bool lm_write_adapter_config(const std::string & dir, int rank, int alpha
     j += "  \"base_model_name_or_path\": \"" + lm_json_escape(base_model) + "\",\n";
     j += "  \"bias\": \"none\",\n";
     j += "  \"fan_in_fan_out\": false,\n";
+    // HOT-Step keys, before PEFT's own so a reader that stops at the first
+    // unknown key has nothing to trip on. Each line must end with ",\n".
+    j += extra_json;
     j += "  \"inference_mode\": true,\n";
     j += "  \"init_lora_weights\": true,\n";
     j += "  \"layer_replication\": null,\n";
@@ -433,6 +437,19 @@ struct LmPeftOverride {
     int  alpha = 0;
     // false with *err empty = skip this site; false with *err set = fail.
     std::function<bool(int l, int s, LmPeftFactors * f, std::string * err)> site;
+    // ── delta-form additions (2026-09-09) ──────────────────────────────────
+    // hot_step.param_method for the file: 0 = a genuine plain LoRA (PiSSA
+    // standalone, HRA), 4 = PiSSA DELTA (needs its residual file to apply).
+    int      marker = 0;
+    // Storage dtype. F16 for both PiSSA forms: the MM3 runtime loader stores f16
+    // anyway, and the factors are written in the well-conditioned arrangement
+    // (every term drift-sized), so nothing is lost on the way to disk.
+    STWDType dtype  = STW_F32;
+    // Written as hot_step.pissa.meta F32[6] when non-empty:
+    // {rank, scale, layer_lo, layer_hi, base_size_hi, base_size_lo}.
+    std::vector<float> pissa_meta;
+    // Extra adapter_config.json lines (each "  \"k\": v,\n"), e.g. the residual name.
+    std::string        cfg_extra;
 };
 
 static bool lm_export_peft(const LmLora & L, const Qwen3LMConfig & cfg, const LmExportMeta & meta,
@@ -448,7 +465,8 @@ static bool lm_export_peft(const LmLora & L, const Qwen3LMConfig & cfg, const Lm
         // themselves (PiSSA bakes the scale into B, HRA's basis is orthonormal
         // and needs scale 1), so a loader that re-derived either from the file
         // would apply it twice.
-        if (!lm_write_adapter_config(out_dir, ovr->rank, ovr->alpha, meta.lm_path, false, false, "LORA")) {
+        if (!lm_write_adapter_config(out_dir, ovr->rank, ovr->alpha, meta.lm_path, false, false, "LORA",
+                                     ovr->cfg_extra)) {
             *err = "cannot write adapter_config.json in " + out_dir;
             return false;
         }
@@ -576,13 +594,22 @@ static bool lm_export_peft(const LmLora & L, const Qwen3LMConfig & cfg, const Lm
     // The code describes the APPLY, not the training method: PiSSA and HRA
     // export as genuine plain LoRA (the `ovr` branch), so they mark 0.
     std::vector<float> method_marker = {
-        (float) (ovr ? 0 : L.loha ? 3 : L.hira ? 2 : L.dora ? 1 : 0)
+        (float) (ovr ? ovr->marker : L.loha ? 3 : L.hira ? 2 : L.dora ? 1 : 0)
     };
     {
         STWTensor sm;
         sm.name  = "hot_step.param_method";
         sm.shape = { 1 };
         sm.data  = method_marker.data();
+        tensors.push_back(sm);
+    }
+    // PiSSA delta form (marker 4): what the loader needs to pair this file
+    // with its residual — see pissa-residual.h.
+    if (ovr && !ovr->pissa_meta.empty()) {
+        STWTensor sm;
+        sm.name  = "hot_step.pissa.meta";
+        sm.shape = { (int64_t) ovr->pissa_meta.size() };
+        sm.data  = ovr->pissa_meta.data();
         tensors.push_back(sm);
     }
 
@@ -659,8 +686,14 @@ static bool lm_export_peft(const LmLora & L, const Qwen3LMConfig & cfg, const Lm
         md.push_back({ "modelspec.trigger_phrase", meta.trigger });
     }
 
+    if (ovr && ovr->marker == 4) {
+        md.push_back({ "hot_step_pissa_delta", "v1" });
+    }
+
     const std::string sf = lm_join(out_dir, "adapter_model.safetensors");
-    if (!st_write_file(sf.c_str(), tensors, md, STW_F32)) {
+    // The plain export stays F32 (Side-Step reads it); the PiSSA forms choose
+    // their own dtype through the override.
+    if (!st_write_file(sf.c_str(), tensors, md, ovr ? ovr->dtype : STW_F32)) {
         *err = "cannot write " + sf;
         return false;
     }

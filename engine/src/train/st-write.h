@@ -18,13 +18,53 @@
 #include <utility>
 #include <vector>
 
-enum STWDType { STW_F32, STW_BF16 };
+enum STWDType { STW_F32, STW_BF16, STW_F16 };
 
 struct STWTensor {
     std::string          name;
     std::vector<int64_t> shape;  // row-major; shape[0] varies slowest
     const float *        data;   // prod(shape) f32 values, row-major
 };
+
+// float -> IEEE half with round-to-nearest-even (2026-09-09: the PiSSA
+// residual and delta exports). Same rounding as ggml_fp32_to_fp16, written out
+// here so this header stays free of ggml. Overflow saturates to +-inf, which
+// the LM loaders refuse by name rather than render as noise.
+static inline uint16_t stw_f32_to_f16(float f) {
+    uint32_t b;
+    memcpy(&b, &f, 4);
+    const uint32_t sign = (b >> 16) & 0x8000u;
+    const uint32_t exp  = (b >> 23) & 0xFFu;
+    const uint32_t man  = b & 0x7FFFFFu;
+    if (exp == 0xFFu) {  // inf / NaN
+        return (uint16_t) (sign | 0x7C00u | (man ? 0x200u : 0u));
+    }
+    int e = (int) exp - 127 + 15;
+    if (e >= 0x1F) {
+        return (uint16_t) (sign | 0x7C00u);  // overflow -> inf
+    }
+    if (e <= 0) {
+        if (e < -10) {
+            return (uint16_t) sign;  // underflow -> signed zero
+        }
+        // subnormal: shift the implicit-1 mantissa right, round to nearest even
+        uint32_t m     = man | 0x800000u;
+        int      shift = 14 - e;
+        uint32_t half  = m >> shift;
+        uint32_t rem   = m & ((1u << shift) - 1u);
+        uint32_t mid   = 1u << (shift - 1);
+        if (rem > mid || (rem == mid && (half & 1u))) {
+            half++;
+        }
+        return (uint16_t) (sign | half);
+    }
+    uint32_t half = ((uint32_t) e << 10) | (man >> 13);
+    uint32_t rem  = man & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (half & 1u))) {
+        half++;  // may carry into the exponent, which is the correct rounding
+    }
+    return (uint16_t) (sign | half);
+}
 
 // float -> bfloat16 with round-to-nearest-even.
 static inline uint16_t stw_f32_to_bf16(float f) {
@@ -90,7 +130,7 @@ static bool st_write_file(const char *                                          
                           const std::vector<std::pair<std::string, std::string>> & metadata,
                           STWDType                                                 dtype) {
     const size_t esz = (dtype == STW_F32) ? 4u : 2u;
-    const char * dts = (dtype == STW_F32) ? "F32" : "BF16";
+    const char * dts = (dtype == STW_F32) ? "F32" : (dtype == STW_F16) ? "F16" : "BF16";
 
     // 1. Offsets (relative to the data section, no padding between tensors).
     std::vector<uint64_t> starts(tensors.size()), ends(tensors.size());
@@ -184,8 +224,14 @@ static bool st_write_file(const char *                                          
             size_t left = (size_t) n;
             while (ok && left > 0) {
                 size_t chunk = left > 65536 ? 65536 : left;
-                for (size_t k = 0; k < chunk; k++) {
-                    scratch[k] = stw_f32_to_bf16(p[k]);
+                if (dtype == STW_F16) {
+                    for (size_t k = 0; k < chunk; k++) {
+                        scratch[k] = stw_f32_to_f16(p[k]);
+                    }
+                } else {
+                    for (size_t k = 0; k < chunk; k++) {
+                        scratch[k] = stw_f32_to_bf16(p[k]);
+                    }
                 }
                 ok = (fwrite(scratch.data(), sizeof(uint16_t), chunk, f) == chunk);
                 p += chunk;

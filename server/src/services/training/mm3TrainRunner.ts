@@ -692,10 +692,31 @@ export async function runMm3TrainLmJob(job: TrainingJob): Promise<void> {
     if (!isCancelled(job)) {
       log(job, 'info',
         'Checkpoints are in the MM3 adapter folder — they appear in the adapter picker with no install step.');
-      if (resumable) {
-        log(job, 'info',
-          'This run can be continued later from the Previous runs list on this tab — its optimizer '
-          + 'state is saved beside the checkpoints.');
+      // Reaching here means the run ENDED (step cap or target loss); a cancel,
+      // a pause or a crash never gets this far, so their state survives for a
+      // continuation. A finished run's optimizer state (~4.2 GB at r128) is
+      // dropped unless asked for (Rob, 2026-09-09).
+      if (opts.keepResumeState) {
+        if (resumable) {
+          log(job, 'info',
+            'This run can be continued later from the Previous runs list on this tab — its optimizer '
+            + 'state is saved beside the checkpoints.');
+        }
+      } else {
+        let freed = 0;
+        for (const name of ['resume-state.bin', 'resume-state.json']) {
+          const p = path.join(opts.outDir, name);
+          try {
+            if (fs.existsSync(p)) { freed += fs.statSync(p).size; fs.unlinkSync(p); }
+          } catch (e: any) {
+            log(job, 'warn', `Could not remove ${name}: ${e?.message || e}`);
+          }
+        }
+        if (freed > 0) {
+          log(job, 'info',
+            `Optimizer state removed (${(freed / 1e9).toFixed(1)} GB) — the run finished, so it is not needed. `
+            + 'Tick "Keep resume state" before starting a run you may want to continue past its step count.');
+        }
       }
       finishJob(job, 'done');
     }

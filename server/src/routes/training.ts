@@ -2298,6 +2298,8 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       regScoreLast: num('regScoreLast', 0, 0, 9000),
       scoreLast:    num('scoreLast', 0, 0, 9000),
       scoreLastEndOnly: b.scoreLastEndOnly === true,
+      keepResumeState: b.keepResumeState === true,
+      verifyExport: b.verifyExport === true,
       lyricsDropout: num('lyricsDropout', 0, 0, 1),
       trimTrailingSilence: b.trimTrailingSilence === true,
       depthLossWeight: num('depthLossWeight', D.depthLossWeight, 0, 10),

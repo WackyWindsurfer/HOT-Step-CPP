@@ -43,6 +43,7 @@
 // runtime paths need no PiSSA knowledge whatsoever.
 
 #include "backend.h"
+#include "pissa-residual.h"
 #include "qwen3-enc.h"
 #include "train/lm-export.h"
 #include "train/lm-graph.h"
@@ -193,11 +194,74 @@ static bool lm_pissa_cache_write(const std::string & path, int rank, int q, int 
     return ok;
 }
 
+// ── the shipped residual (2026-09-09) ───────────────────────────────────────
+//
+// pissa-residual.h describes the file. This is its writer: canonical (scale 1)
+// factors, F16, one file per base and rank, beside the base GGUF. Once it
+// exists every adapter trained against it exports in the DELTA form (rank r,
+// adapter-only, ~0.7 GB at r128 instead of 2.8 GB) and the runtime loader
+// rebuilds the full pair from the two files.
+static bool lm_pissa_residual_write(const std::string & path, const PissaResidualMeta & m,
+                                    const std::vector<PissaResidualSite> & sites, std::string * err) {
+    std::vector<STWTensor> tensors;
+    tensors.reserve(sites.size() * 2 + 1);
+    float hi = 0.0f, lo = 0.0f;
+    pissa_size_split(m.base_size, &hi, &lo);
+    std::vector<float> meta = { (float) PISSA_RESIDUAL_VERSION, (float) m.rank,     (float) m.q,
+                                (float) m.iters,                (float) m.layer_lo, (float) m.layer_hi,
+                                hi,                             lo,
+                                (float) m.energy_mean,          (float) m.energy_min };
+    {
+        STWTensor t;
+        t.name  = "pissa.meta";
+        t.shape = { (int64_t) meta.size() };
+        t.data  = meta.data();
+        tensors.push_back(t);
+    }
+    std::vector<std::string> names;
+    names.reserve(sites.size() * 2);
+    for (const PissaResidualSite & s : sites) {
+        names.push_back("pissa.L" + std::to_string(s.l) + "." + s.site + ".A0");
+        names.push_back("pissa.L" + std::to_string(s.l) + "." + s.site + ".B0");
+    }
+    for (size_t i = 0; i < sites.size(); i++) {
+        const PissaResidualSite & s = sites[i];
+        STWTensor a;
+        a.name  = names[2 * i];
+        a.shape = { (int64_t) m.rank, (int64_t) s.in };   // torch [rank, in] == ggml [in, rank]
+        a.data  = s.A0.data();
+        tensors.push_back(a);
+        STWTensor b;
+        b.name  = names[2 * i + 1];
+        b.shape = { (int64_t) s.out, (int64_t) m.rank };  // torch [out, rank] == ggml [rank, out]
+        b.data  = s.B0.data();
+        tensors.push_back(b);
+    }
+    std::vector<std::pair<std::string, std::string>> md;
+    md.push_back({ "format", "pt" });
+    md.push_back({ "hot_step_pissa_residual", "v1" });
+    md.push_back({ "producer", std::string("ace-train ") + ACE_VERSION });
+    if (!st_write_file(path.c_str(), tensors, md, STW_F16)) {
+        *err = "cannot write " + path;
+        return false;
+    }
+    return true;
+}
+
 // Fills A/B with the SVD factors and A0/B0 with a frozen copy of them. The base
 // is not written. `sched` runs the GPU stages; it is reset around every graph,
 // so call this before the training graphs exist.
+//
+// Sources, in order: the residual file beside the base (residual_path, must
+// match rank / q / iters / layers / base size), the SVD cache (cache_path),
+// the SVD itself. Whatever the source, the factors the trainer holds are the
+// F16-ROUNDED canonical values divided by sqrt(s): the same bytes a loader will
+// read back from the residual file, so an adapter exported in the delta form
+// reproduces the trained function exactly and not to within f16 of it. When the
+// residual file did not exist and residual_path is writable, it is written.
 static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample, int iters, LmPissaStats * stats,
-                          std::string * err, const std::string & cache_path = "") {
+                          std::string * err, const std::string & cache_path = "",
+                          const std::string & residual_path = "", long long base_size = 0) {
     Qwen3LM * lm = L->model;
     if (!lm || !L->pissa || L->layer_lo >= L->layer_hi) {
         *err = "PiSSA: adapter not initialised for it";
@@ -210,12 +274,163 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
     auto elapsed = [&]() {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
     };
+    // The factors are stored so that s * B0 A0 reproduces W's rank-r truncation
+    // EXACTLY, whatever the scale is. The DiT bakes sqrt(S) into each factor and
+    // then subtracts s*B0A0, which only lands on the true PiSSA residual when
+    // alpha == rank; dividing both factors by sqrt(s) here makes it right for
+    // any alpha and for rsLoRA, at zero cost when s == 1.
+    const double sqrt_s     = (L->scale > 0.0f) ? sqrt((double) L->scale) : 1.0;
+    const double inv_sqrt_s = 1.0 / sqrt_s;
+    L->pissa_residual.clear();
+    L->pissa_base_size = 0;
+
+    std::string residual_base;
+    if (!residual_path.empty()) {
+        const size_t cut = residual_path.find_last_of("/\\");
+        residual_base    = cut == std::string::npos ? residual_path : residual_path.substr(cut + 1);
+    }
+
+    // ── residual file: the shipped frozen half ───────────────────────────
+    if (!residual_path.empty() && hs_file_exists(residual_path)) {
+        PissaResidualMeta              rm;
+        std::vector<PissaResidualSite> rsites;
+        std::string                    rerr;
+        if (!pissa_residual_read_meta(residual_path, &rm, &rerr)) {
+            fprintf(stderr, "[pissa] residual %s unreadable (%s); falling back\n", residual_path.c_str(), rerr.c_str());
+        } else if (rm.rank != r || rm.q != q || rm.iters != iters || rm.layer_lo != L->layer_lo ||
+                   rm.layer_hi != L->layer_hi || (base_size > 0 && rm.base_size != base_size)) {
+            fprintf(stderr,
+                    "[pissa] residual %s was made for rank %d q %d iters %d layers %d-%d base %lld B; this run is "
+                    "rank %d q %d iters %d layers %d-%d base %lld B. Not used; the export will be standalone.\n",
+                    residual_path.c_str(), rm.rank, rm.q, rm.iters, rm.layer_lo, rm.layer_hi, rm.base_size, r, q,
+                    iters, L->layer_lo, L->layer_hi, base_size);
+        } else if (!pissa_residual_read(residual_path, &rm, &rsites, &rerr)) {
+            fprintf(stderr, "[pissa] residual %s unreadable (%s); falling back\n", residual_path.c_str(), rerr.c_str());
+        } else {
+            bool ok = true;
+            int  n  = 0;
+            for (int l = L->layer_lo; l < L->layer_hi && ok; l++) {
+                for (int s = 0; s < QW_LORA_NSLOTS; s++) {
+                    QwLoraPair & pr = L->layers[l].p[s];
+                    if (!pr.A || !pr.B || !pr.A0 || !pr.B0) {
+                        continue;
+                    }
+                    PissaResidualSite * c = nullptr;
+                    for (PissaResidualSite & cand : rsites) {
+                        if (cand.l == l && cand.site == lm_slot_peft_name(s)) {
+                            c = &cand;
+                            break;
+                        }
+                    }
+                    if (!c || c->in != (int) pr.A->ne[0] || c->out != (int) pr.B->ne[1]) {
+                        fprintf(stderr, "[pissa] residual %s has no usable site for layer %d %s; falling back\n",
+                                residual_path.c_str(), l, lm_slot_peft_name(s));
+                        ok = false;
+                        break;
+                    }
+                    if (inv_sqrt_s != 1.0) {
+                        for (float & x : c->A0) x = (float) (x * inv_sqrt_s);
+                        for (float & x : c->B0) x = (float) (x * inv_sqrt_s);
+                    }
+                    ggml_backend_tensor_set(pr.A, c->A0.data(), 0, c->A0.size() * sizeof(float));
+                    ggml_backend_tensor_set(pr.B, c->B0.data(), 0, c->B0.size() * sizeof(float));
+                    lm_pissa_tensor_set_f32(pr.A0, c->A0);
+                    lm_pissa_tensor_set_f32(pr.B0, c->B0);
+                    // Done with this site's 5+ MB; the file holds 252 of them.
+                    std::vector<float>().swap(c->A0);
+                    std::vector<float>().swap(c->B0);
+                    n++;
+                }
+            }
+            if (ok) {
+                L->pissa_residual  = residual_base;
+                L->pissa_base_size = rm.base_size;
+                if (stats) {
+                    stats->sites       = n;
+                    stats->energy_mean = rm.energy_mean;
+                    stats->energy_min  = rm.energy_min;
+                    stats->seconds     = elapsed();
+                    stats->from_cache  = true;
+                }
+                fprintf(stderr, "[pissa] init: %d sites from residual %s in %.1f s (delta export)\n", n,
+                        residual_path.c_str(), elapsed());
+                return true;
+            }
+        }
+    }
+
+    // Canonical, f16-rounded copies of every site's frozen pair, for the
+    // residual write. Only collected when there is somewhere to write them.
+    const bool                     want_write = !residual_path.empty();
+    std::vector<PissaResidualSite> res_out;
+    std::vector<ggml_fp16_t>       h16;
+    // Takes trainer-space host factors, rounds them through the canonical F16
+    // representation the residual file uses, uploads, and keeps the canonical
+    // copy for the write. This is what makes "what the trainer subtracted" and
+    // "what the file says" the same numbers.
+    auto place = [&](QwLoraPair & pr, int l, int s, int in, int out, std::vector<float> & A0t,
+                     std::vector<float> & B0t) {
+        auto canon_round = [&](std::vector<float> & v) {
+            if (sqrt_s != 1.0) {
+                for (float & x : v) x = (float) (x * sqrt_s);
+            }
+            h16.resize(v.size());
+            ggml_fp32_to_fp16_row(v.data(), h16.data(), (int64_t) v.size());
+            ggml_fp16_to_fp32_row(h16.data(), v.data(), (int64_t) v.size());
+        };
+        canon_round(A0t);
+        canon_round(B0t);
+        if (want_write) {
+            PissaResidualSite rs;
+            rs.l    = l;
+            rs.site = lm_slot_peft_name(s);
+            rs.in   = in;
+            rs.out  = out;
+            rs.A0   = A0t;
+            rs.B0   = B0t;
+            res_out.push_back(std::move(rs));
+        }
+        if (inv_sqrt_s != 1.0) {
+            for (float & x : A0t) x = (float) (x * inv_sqrt_s);
+            for (float & x : B0t) x = (float) (x * inv_sqrt_s);
+        }
+        ggml_backend_tensor_set(pr.A, A0t.data(), 0, A0t.size() * sizeof(float));
+        ggml_backend_tensor_set(pr.B, B0t.data(), 0, B0t.size() * sizeof(float));
+        lm_pissa_tensor_set_f32(pr.A0, A0t);
+        lm_pissa_tensor_set_f32(pr.B0, B0t);
+    };
+    auto write_residual = [&](double e_mean, double e_min) {
+        if (!want_write || res_out.empty()) {
+            return;
+        }
+        PissaResidualMeta wm;
+        wm.version     = PISSA_RESIDUAL_VERSION;
+        wm.rank        = r;
+        wm.q           = q;
+        wm.iters       = iters;
+        wm.layer_lo    = L->layer_lo;
+        wm.layer_hi    = L->layer_hi;
+        wm.base_size   = base_size;
+        wm.energy_mean = e_mean;
+        wm.energy_min  = e_min;
+        std::string werr;
+        if (lm_pissa_residual_write(residual_path, wm, res_out, &werr)) {
+            L->pissa_residual  = residual_base;
+            L->pissa_base_size = base_size;
+            fprintf(stderr, "[pissa] residual written: %s (%zu sites, F16; later runs at this rank read it and "
+                    "export adapter-only files)\n", residual_path.c_str(), res_out.size());
+        } else {
+            fprintf(stderr, "[pissa] residual NOT written (%s); this run exports standalone rank-2r files\n",
+                    werr.c_str());
+        }
+        std::vector<PissaResidualSite>().swap(res_out);
+    };
 
     // ── cache hit: upload the stored factors and skip the SVD ─────────────
     std::vector<LmPissaCacheSite> cached;
     if (!cache_path.empty() && lm_pissa_cache_read(cache_path, r, q, iters, L->layer_lo, L->layer_hi, &cached)) {
         size_t idx = 0;
-        double e_sum = 0.0;
+        double e_sum = 0.0, e_min = 1.0;
         int    n_e   = 0;
         bool   ok    = true;
         for (int l = L->layer_lo; l < L->layer_hi && ok; l++) {
@@ -228,35 +443,38 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
                     ok = false;
                     break;
                 }
-                const LmPissaCacheSite & c = cached[idx++];
+                LmPissaCacheSite & c = cached[idx++];
                 if (c.l != l || c.s != s || c.in != (int) pr.A->ne[0] || c.out != (int) pr.B->ne[1]) {
                     ok = false;
                     break;
                 }
-                ggml_backend_tensor_set(pr.A, c.A0.data(), 0, c.A0.size() * sizeof(float));
-                ggml_backend_tensor_set(pr.B, c.B0.data(), 0, c.B0.size() * sizeof(float));
-                lm_pissa_tensor_set_f32(pr.A0, c.A0);
-                lm_pissa_tensor_set_f32(pr.B0, c.B0);
+                place(pr, l, s, c.in, c.out, c.A0, c.B0);
+                std::vector<float>().swap(c.A0);
+                std::vector<float>().swap(c.B0);
                 if (stats) {
                     stats->energy_min = std::min(stats->energy_min, c.frac);
                     stats->sites++;
                 }
+                e_min = std::min(e_min, c.frac);
                 e_sum += c.frac;
                 n_e++;
             }
         }
         if (ok && idx == cached.size()) {
+            const double e_mean = n_e > 0 ? e_sum / (double) n_e : 0.0;
             if (stats) {
-                stats->energy_mean = n_e > 0 ? e_sum / (double) n_e : 0.0;
+                stats->energy_mean = e_mean;
                 stats->seconds     = elapsed();
                 stats->from_cache  = true;
             }
             fprintf(stderr, "[pissa] init: %zu sites from cache in %.1f s (%s)\n", cached.size(), elapsed(),
                     cache_path.c_str());
+            write_residual(e_mean, e_min);
             return true;
         }
         // A stale or mismatched file: fall through to the SVD and overwrite it.
         fprintf(stderr, "[pissa] cache %s does not match this run; recomputing\n", cache_path.c_str());
+        std::vector<PissaResidualSite>().swap(res_out);
         if (stats) {
             stats->energy_min = 1.0;
             stats->sites      = 0;
@@ -324,13 +542,7 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
         return ggml_view_2d(ctx, t, ne0, ne1, (size_t) ne0 * sizeof(float), 0);
     };
 
-    // The factors are stored so that s * B0 A0 reproduces W's rank-r truncation
-    // EXACTLY, whatever the scale is. The DiT bakes sqrt(S) into each factor and
-    // then subtracts s*B0A0, which only lands on the true PiSSA residual when
-    // alpha == rank; dividing both factors by sqrt(s) here makes it right for
-    // any alpha and for rsLoRA, at zero cost when s == 1.
-    const double inv_sqrt_s = (L->scale > 0.0f) ? 1.0 / sqrt((double) L->scale) : 1.0;
-
+    // sqrt_s / inv_sqrt_s are defined at the top of this function.
     LmRng rng;
     lm_rng_seed(&rng, 0x9155a000ull ^ (uint64_t) L->rank);
     std::vector<float> host;
@@ -495,10 +707,9 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
                     B0[(size_t) j * (size_t) r + (size_t) k] = (float) (sS * u);
                 }
             }
-            ggml_backend_tensor_set(pr.A, A0.data(), 0, A0.size() * sizeof(float));
-            ggml_backend_tensor_set(pr.B, B0.data(), 0, B0.size() * sizeof(float));
-            lm_pissa_tensor_set_f32(pr.A0, A0);
-            lm_pissa_tensor_set_f32(pr.B0, B0);
+            // Rounded through the residual's F16 before upload, so the frozen
+            // pair the trainer subtracts is byte-for-byte what the file keeps.
+            place(pr, l, s, in, out, A0, B0);
 
             // A NaN here would silently poison the adapter — A0/B0 are frozen
             // inputs, so the very first forward would be non-finite and the run
@@ -529,8 +740,9 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
             }
         }
     }
+    const double e_mean = n_e > 0 ? e_sum / (double) n_e : 0.0;
     if (stats && n_e > 0) {
-        stats->energy_mean = e_sum / (double) n_e;
+        stats->energy_mean = e_mean;
     }
     if (stats) {
         stats->seconds = elapsed();
@@ -542,6 +754,7 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
     } else {
         fprintf(stderr, "[pissa] init: %d sites by SVD in %.1f s\n", n_e, elapsed());
     }
+    write_residual(e_mean, stats ? stats->energy_min : e_mean);
     return done(true);
 }
 
@@ -550,7 +763,8 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
 // own, and the ~200 MB of scratch it holds is returned before anything else is
 // allocated.
 static bool lm_pissa_init_standalone(LmLora * L, int oversample, int iters, LmPissaStats * stats, std::string * err,
-                                     const std::string & cache_dir = "", const std::string & lm_path = "") {
+                                     const std::string & cache_dir = "", const std::string & lm_path = "",
+                                     bool use_residual = true) {
     if (!L->model) {
         *err = "PiSSA: the adapter bank is not attached to a model";
         return false;
@@ -561,12 +775,16 @@ static bool lm_pissa_init_standalone(LmLora * L, int oversample, int iters, LmPi
         cache_path = lm_pissa_cache_path(cache_dir, lm_path, L->rank, L->rank + std::max(0, oversample),
                                          std::max(0, std::min(4, iters)), L->layer_lo, L->layer_hi);
     }
+    // The residual lives beside the base GGUF (pissa-residual.h). Without a base
+    // path there is nowhere to look, and the run exports standalone files.
+    const std::string residual_path = use_residual ? pissa_residual_path(lm_path, L->rank) : std::string();
+    const long long   base_size     = use_residual ? pissa_file_size(lm_path) : 0;
     BackendPair bp;
     bp.backend     = L->model->backend;
     bp.cpu_backend = L->model->cpu_backend;
     bp.has_gpu     = bp.backend != bp.cpu_backend;
     ggml_backend_sched_t sc = backend_sched_new(bp, 2048);
-    const bool           ok = lm_pissa_init(L, sc, oversample, iters, stats, err, cache_path);
+    const bool           ok = lm_pissa_init(L, sc, oversample, iters, stats, err, cache_path, residual_path, base_size);
     ggml_backend_sched_free(sc);
     return ok;
 }
@@ -601,6 +819,7 @@ static bool lm_export_pissa(const LmLora & L, const Qwen3LMConfig & cfg, const L
     LmPeftOverride     ovr;
     ovr.rank  = 2 * r;
     ovr.alpha = 2 * r;  // loader scale alpha/rank = 1
+    ovr.dtype = STW_F16;  // 2026-09-09: half the file; every term is drift-sized (see above)
     ovr.site  = [&](int l, int s, LmPeftFactors * f, std::string * e) -> bool {
         const QwLoraPair & pr = L.layers[l].p[s];
         if (!pr.A || !pr.B || !pr.has_pissa()) {
@@ -635,6 +854,75 @@ static bool lm_export_pissa(const LmLora & L, const Qwen3LMConfig & cfg, const L
                 f->B[(size_t) j * (size_t) (2 * r) + (size_t) k] = L.scale * (b[src] - b0[src]);
                 f->B[(size_t) j * (size_t) (2 * r) + (size_t) r + (size_t) k] = L.scale * b0[src];
             }
+        }
+        return true;
+    };
+    return lm_export_peft(L, cfg, meta, out_dir, res, err, extra, &ovr);
+}
+
+// ─── the DELTA export (2026-09-09) ───────────────────────────────────────────
+//
+// When the init read (or wrote) the residual file, the adapter no longer needs
+// to carry the frozen half. The file holds, at rank r:
+//
+//     lora_A = A - A0                 [r, in]
+//     lora_B = s (B - B0)             [out, r]
+//
+// plus hot_step.param_method = 4, hot_step.pissa.meta and the residual's name
+// in adapter_config.json. minimax/mm3-lm-adapter.h rebuilds
+//
+//     [s(B - B0), sqrt(s) B0_canon] [A0_canon/sqrt(s) + (A - A0); A - A0]
+//
+// which is the rank-2r pair lm_export_pissa writes, from the two files. Same
+// numbers, same runtime cost; 0.7 GB on disk at r128 F16 instead of 2.8 GB.
+//
+// Not a plain LoRA: an external PEFT loader would apply (B - B0)(A - A0), which
+// is nothing. That is what the marker and the metadata key are for.
+static bool lm_export_pissa_delta(const LmLora & L, const Qwen3LMConfig & cfg, const LmExportMeta & meta,
+                                  const std::string & out_dir, LmExportResult * res, std::string * err,
+                                  const LmExtraExport * extra = nullptr) {
+    if (L.pissa_residual.empty()) {
+        *err = "PiSSA delta export: the init did not read or write a residual file";
+        return false;
+    }
+    const int          r = L.rank;
+    std::vector<float> a, b, a0, b0;
+    LmPeftOverride     ovr;
+    ovr.rank   = r;
+    ovr.alpha  = r;  // loader scale 1; s is baked into lora_B and recorded in the meta
+    ovr.marker = 4;
+    ovr.dtype  = STW_F16;
+    float hi = 0.0f, lo = 0.0f;
+    pissa_size_split(L.pissa_base_size, &hi, &lo);
+    ovr.pissa_meta = { (float) r, L.scale, (float) L.layer_lo, (float) L.layer_hi, hi, lo };
+    ovr.cfg_extra  = "  \"hot_step_pissa_residual\": \"" + lm_json_escape(L.pissa_residual) + "\",\n";
+    ovr.site       = [&](int l, int s, LmPeftFactors * f, std::string * e) -> bool {
+        const QwLoraPair & pr = L.layers[l].p[s];
+        if (!pr.A || !pr.B || !pr.has_pissa()) {
+            e->clear();
+            return false;
+        }
+        const int64_t in  = pr.A->ne[0];
+        const int64_t out = pr.B->ne[1];
+        a.assign((size_t) in * (size_t) r, 0.0f);
+        b.assign((size_t) r * (size_t) out, 0.0f);
+        a0.assign(a.size(), 0.0f);
+        b0.assign(b.size(), 0.0f);
+        ggml_backend_tensor_get(pr.A, a.data(), 0, a.size() * sizeof(float));
+        ggml_backend_tensor_get(pr.B, b.data(), 0, b.size() * sizeof(float));
+        lm_pissa_tensor_get_f32(pr.A0, a0);
+        lm_pissa_tensor_get_f32(pr.B0, b0);
+        f->in  = in;
+        f->out = out;
+        f->rr  = r;
+        // Same ggml layouts as the trainer's own tensors, so both are elementwise.
+        f->A.resize(a.size());
+        for (size_t i = 0; i < a.size(); i++) {
+            f->A[i] = a[i] - a0[i];
+        }
+        f->B.resize(b.size());
+        for (size_t i = 0; i < b.size(); i++) {
+            f->B[i] = L.scale * (b[i] - b0[i]);
         }
         return true;
     };

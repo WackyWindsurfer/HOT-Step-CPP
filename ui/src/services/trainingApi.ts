@@ -189,6 +189,7 @@ export interface Mm3TrainLmRequest {
   lr?: number;
   steps?: number;
   saveEvery?: number;
+  keepResumeState?: boolean;
   warmup?: number;
   gradAccum?: number;
   seed?: number;

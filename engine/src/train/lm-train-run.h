@@ -1080,7 +1080,8 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
     if (a.pissa) {
         LmPissaStats ps;
         std::string  perr;
-        if (!lm_pissa_init_standalone(&lora, a.pissa_oversample, a.pissa_iters, &ps, &perr, a.pissa_cache_dir, a.lm_path)) {
+        if (!lm_pissa_init_standalone(&lora, a.pissa_oversample, a.pissa_iters, &ps, &perr, a.pissa_cache_dir, a.lm_path,
+                                      /*use_residual=*/false)) {
             lm_fatal("pissa", perr);
             return 1;
         }

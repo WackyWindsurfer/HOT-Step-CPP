@@ -47,10 +47,12 @@
 // The HRA arm is the one that needs the F32 base: (W U) Q^T is only equal to
 // W(R - I) if Q really is an orthonormal basis of span(v), and nothing short of
 // multiplying by W says so.
-static bool mm3_lm_verify_export_delta(const std::string & dir, const LmLora & L, std::string * err) {
+static bool mm3_lm_verify_export_delta(const std::string & dir, const LmLora & L, std::string * err,
+                                       const std::string & base_lm_path = "") {
     const std::string sf = dir + "/adapter_model.safetensors";
     std::string       lerr;
-    MM3LmAdapter *    ad = mm3_lm_adapter_load(sf.c_str(), &lerr);
+    // The base path is how the loader finds a delta-form adapter's residual.
+    MM3LmAdapter *    ad = mm3_lm_adapter_load(sf.c_str(), &lerr, base_lm_path.empty() ? nullptr : base_lm_path.c_str());
     if (!ad) {
         *err = "the runtime loader refused the file we just wrote: " + lerr;
         return false;
@@ -228,10 +230,11 @@ static bool mm3_lm_verify_export_delta(const std::string & dir, const LmLora & L
 /** Load `dir`'s adapter_model.safetensors with the runtime loader and compare
  *  it against the live trainer bank. Returns true on PASS; prints one line per
  *  failed check plus a verdict line. */
-static bool mm3_lm_verify_export(const std::string & dir, const LmLora & L, std::string * err) {
+static bool mm3_lm_verify_export(const std::string & dir, const LmLora & L, std::string * err,
+                                 const std::string & base_lm_path = "") {
     const std::string sf = dir + "/adapter_model.safetensors";
     std::string       lerr;
-    MM3LmAdapter *    ad = mm3_lm_adapter_load(sf.c_str(), &lerr);
+    MM3LmAdapter *    ad = mm3_lm_adapter_load(sf.c_str(), &lerr, base_lm_path.empty() ? nullptr : base_lm_path.c_str());
     if (!ad) {
         *err = "the runtime loader refused the file we just wrote: " + lerr;
         return false;

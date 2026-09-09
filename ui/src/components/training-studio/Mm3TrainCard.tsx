@@ -47,6 +47,7 @@ interface FormState {
   targetLossMetric: 'train' | 'eval';
   targetLossEpochs: number;
   saveEvery: number;
+  keepResumeState: boolean;
   rank: number;
   alpha: number;
   lr: number;
@@ -174,6 +175,7 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
     targetLossMetric: status.defaults.targetLossMetric ?? 'train',
     targetLossEpochs: status.defaults.targetLossEpochs ?? 5,
     saveEvery: status.defaults.saveEvery ?? 100,
+    keepResumeState: status.defaults.keepResumeState ?? false,
     // Rank follows the recommendation for the same reason as the base: at the
     // default 256 nothing fits below ~24 GB, so a 16 GB card would open on a
     // red 'will not fit' form with the fix two fields away and unstated.
@@ -320,7 +322,8 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
     setBusy(true);
     try {
       const body: Mm3TrainLmRequest = {
-        steps: form.steps, saveEvery: form.saveEvery, rank: form.rank, alpha: form.alpha,
+        steps: form.steps, saveEvery: form.saveEvery, keepResumeState: form.keepResumeState,
+        rank: form.rank, alpha: form.alpha,
         lr: form.lr, maxFrames: form.maxFrames, cropMode: form.cropMode,
         // Informational: the fields above already carry the recipe. The
         // route lays a named preset UNDER them, so this changes nothing here
@@ -660,6 +663,18 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                   'Trains the adapter to keep vocal timbre intact: acoustic codebooks are '
                   + 'supervised through the frozen depth decoder. 0 disables — renders then '
                   + 'drift into chipmunk/goblin voices. Leave at 1.') as string} />
+              <label className="flex items-start gap-2 text-[11px] text-zinc-600 dark:text-zinc-300 col-span-2">
+                <input type="checkbox" className="mt-0.5" checked={form.keepResumeState}
+                  onChange={e => set('keepResumeState', e.target.checked)} />
+                <span>
+                  {t('trainingStudio.mm3.keepResumeState', 'Keep resume state after completion')}
+                  <span className="block text-[10px] text-zinc-500">
+                    {t('trainingStudio.mm3.keepResumeStateHint',
+                      'The optimizer state (about 4 GB) lets a finished run be continued past its step '
+                      + 'count. Off: it is deleted once the run ends. A run that stops early keeps it either way.')}
+                  </span>
+                </span>
+              </label>
               <NumField label={t('trainingStudio.mm3.depthLossFrames', 'Acoustic frames/step')}
                 value={form.depthLossFrames} onChange={v => set('depthLossFrames', v)} step={16}
                 hint={t('trainingStudio.mm3.depthLossFramesHint',

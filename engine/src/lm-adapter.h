@@ -380,6 +380,19 @@ static LMLora * lm_adapter_load(const char * path, float user_scale, ggml_backen
             const STEntry * mk = st_find(st, "hot_step.param_method");
             if (mk && mk->dtype == "F32" && mk->n_dims == 1 && mk->shape[0] == 1) {
                 const int code = (int) *(const float *) st_data(st, *mk);
+                if (code == 4) {
+                    // PiSSA DELTA form (2026-09-09): lora_A/lora_B are A - A0 and
+                    // s(B - B0), meaningless without the residual file, which only
+                    // the MM3 loader (minimax/mm3-lm-adapter.h) knows how to pair.
+                    // Applying them as a plain LoRA would add (B - B0)(A - A0): a
+                    // wrong delta, silently.
+                    fprintf(stderr,
+                            "[LM-Adapter] FATAL: %s is a PiSSA delta adapter (adapter-only, needs its residual file).\n"
+                            "             This loader cannot apply it; it was trained for the MM3 LM.\n",
+                            sf_path.c_str());
+                    st_close(&st);
+                    return nullptr;
+                }
                 marker = code == 1 ? "dora" : code == 2 ? "hira" : code == 3 ? "loha" : "lora";
             }
         }

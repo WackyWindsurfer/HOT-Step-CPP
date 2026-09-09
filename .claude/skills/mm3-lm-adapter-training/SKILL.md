@@ -30,7 +30,7 @@ survives a fresh clone.
 --max-frames 750 --crop-mode structured --crop-start-frac 0.2 --crop-end-frac 0.15   # Fast = 300 steps, chunk 1024; Thorough = 1000 steps, prefix 4096
 --crop-start-tiles 3 --crop-anchor song
 --rank-dropout 0.1                                             # the mask IS the method under --hot-pizza; never 0
---steps 500 --save-every 50                                    # stop on STEPS: train loss reads 2.7-5 under HOT-PiZZA (Balanced; Fast = 300)
+--steps 500 --save-every 100                                   # stop on STEPS: train loss reads 2.7-5 under HOT-PiZZA (Balanced; Fast = 300); 100 since 2026-09-09
 --depth-loss-weight 1.0 --depth-loss-frames 128
 # captions: per-track <stem>.mm3.txt from MOSS/Gemini, and ONLY those. No --caption-file:
 # the shared caption killed endings (0/6 vs 4/6) and was removed on 2026-09-09.
@@ -227,6 +227,41 @@ trailing train loss at 2.7–5, so a loss target never binds. Plain LoRA is
 next in line; LoKr stays selectable. One album so far: the second-artist run
 is the outstanding validation. Cost is LoRA's: ~5.9 s/step, peak 30.4 GB on
 the 32 GB card at crop 750 + prefix 4096.
+
+### Adapter files: the residual + delta form (2026-09-09)
+
+A HOT-PiZZA / PiSSA export used to be a rank-2r F32 PEFT LoRA: 2.79 GB per
+checkpoint at r128, half of it the frozen A0/B0 pair (the base weight's own
+top-128 singular directions), which is the SAME bytes in every adapter
+trained on the same base. Since 2026-09-09 that half ships once:
+
+- `models/mm3/mm3-lm-q8_0.pissa-r128.safetensors` (0.7 GB, F16; registry id
+  `mm3-lm-q8_0-pissa-r128`, in the Q8_0 / Balanced / Training packs; format in
+  `engine/src/pissa-residual.h`). The trainer reads it at init when rank, SVD
+  parameters and the base's byte size match, else falls back to the SVD cache
+  or the SVD and WRITES it beside the base. Keyed by base file size: a
+  re-quantized base misses rather than pairs wrongly.
+- Adapters trained against it export the DELTA form: `lora_A = A - A0`,
+  `lora_B = s(B - B0)` at rank r, F16, `hot_step.param_method = 4`,
+  `hot_step.pissa.meta`, `hot_step_pissa_residual` in adapter_config.json.
+  0.7 GB per checkpoint instead of 2.8. `minimax/mm3-lm-adapter.h` rebuilds
+  the rank-2r pair from the two files (needs the resident base's path, so the
+  residual is found beside it); everything downstream is unchanged, VRAM too.
+  NOT a plain LoRA: PEFT/SimpleTuner would apply (B-B0)(A-A0), which is
+  nothing; the AS1.5 LM loader refuses the marker by name.
+- Standalone rank-2r exports (no residual beside the base, or the AS1.5 LM
+  trainer) are still written, now F16 (1.4 GB). Every older adapter loads as
+  before.
+- Missing residual at load: the engine error names the file and the Models
+  page; download it there. Its SVD is deterministic but not bit-reproducible
+  across GPUs, so the file is the truth, never recomputed on a user's machine
+  for the shipped base.
+
+Also new that day: `saveEvery` default 100 (was 50) and the ~4.2 GB
+`resume-state.bin` is deleted when a run reaches its end unless "Keep resume
+state after completion" is ticked (`keepResumeState`); a run that stops short
+keeps it. `verifyExport: true` on the request runs `--verify-export` (every
+checkpoint round-trips the runtime loader; used for the first delta run).
 
 ### New adapter knobs (2026-09-04/05) — none of this is in the recipe above
 
