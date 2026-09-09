@@ -1332,8 +1332,8 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
   if (o.scoreLast && o.scoreLast > 0) {
     args.push('--score-last', String(o.scoreLast));
     if (o.scoreLastEndOnly) args.push('--score-last-end-only');
-    if (o.verifyExport) args.push('--verify-export');
   }
+  if (o.verifyExport) args.push('--verify-export');
   if (o.lyricsDropout && o.lyricsDropout > 0) args.push('--lyrics-dropout', String(o.lyricsDropout));
   // Previews pause the trainer through a sentinel file. When they are off, say
   // so explicitly: a stray PAUSE left behind by a killed run would otherwise

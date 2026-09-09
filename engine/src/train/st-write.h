@@ -24,6 +24,11 @@ struct STWTensor {
     std::string          name;
     std::vector<int64_t> shape;  // row-major; shape[0] varies slowest
     const float *        data;   // prod(shape) f32 values, row-major
+    // Per-tensor storage override (2026-09-09): -1 = the file's dtype. Small
+    // metadata tensors (markers, meta vectors, soft-prompt rows) must stay F32
+    // in an F16 file — a loader keys on their dtype, and a byte count above
+    // 65504 (a base file's size split into two floats) is inf in F16.
+    int                  dtype_override = -1;
 };
 
 // float -> IEEE half with round-to-nearest-even (2026-09-09: the PiSSA
@@ -129,8 +134,14 @@ static bool st_write_file(const char *                                          
                           const std::vector<STWTensor> &                           tensors,
                           const std::vector<std::pair<std::string, std::string>> & metadata,
                           STWDType                                                 dtype) {
-    const size_t esz = (dtype == STW_F32) ? 4u : 2u;
-    const char * dts = (dtype == STW_F32) ? "F32" : (dtype == STW_F16) ? "F16" : "BF16";
+    auto dtype_of = [&](size_t i) -> STWDType {
+        return tensors[i].dtype_override < 0 ? dtype : (STWDType) tensors[i].dtype_override;
+    };
+    auto esz_of = [&](size_t i) -> size_t { return dtype_of(i) == STW_F32 ? 4u : 2u; };
+    auto dts_of = [&](size_t i) -> const char * {
+        const STWDType d = dtype_of(i);
+        return d == STW_F32 ? "F32" : d == STW_F16 ? "F16" : "BF16";
+    };
 
     // 1. Offsets (relative to the data section, no padding between tensors).
     std::vector<uint64_t> starts(tensors.size()), ends(tensors.size());
@@ -142,7 +153,7 @@ static bool st_write_file(const char *                                          
             return false;
         }
         starts[i] = cursor;
-        cursor += (uint64_t) n * (uint64_t) esz;
+        cursor += (uint64_t) n * (uint64_t) esz_of(i);
         ends[i] = cursor;
     }
 
@@ -162,7 +173,7 @@ static bool st_write_file(const char *                                          
 
     for (size_t i = 0; i < tensors.size(); i++) {
         yyjson_mut_val * e = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, e, "dtype", dts);
+        yyjson_mut_obj_add_str(doc, e, "dtype", dts_of(i));
         yyjson_mut_val * sh = yyjson_mut_obj_add_arr(doc, e, "shape");
         for (size_t d = 0; d < tensors[i].shape.size(); d++) {
             yyjson_mut_arr_add_sint(doc, sh, tensors[i].shape[d]);
@@ -207,9 +218,10 @@ static bool st_write_file(const char *                                          
     // 5. Stream tensor data in offset order.
     std::vector<uint16_t> scratch;
     for (size_t i = 0; ok && i < tensors.size(); i++) {
-        const int64_t n = stw_numel(tensors[i].shape);
-        const float * p = tensors[i].data;
-        if (dtype == STW_F32) {
+        const int64_t  n  = stw_numel(tensors[i].shape);
+        const float *  p  = tensors[i].data;
+        const STWDType dt = dtype_of(i);
+        if (dt == STW_F32) {
             size_t left = (size_t) n;
             while (ok && left > 0) {
                 size_t chunk = left > 65536 ? 65536 : left;
@@ -224,7 +236,7 @@ static bool st_write_file(const char *                                          
             size_t left = (size_t) n;
             while (ok && left > 0) {
                 size_t chunk = left > 65536 ? 65536 : left;
-                if (dtype == STW_F16) {
+                if (dt == STW_F16) {
                     for (size_t k = 0; k < chunk; k++) {
                         scratch[k] = stw_f32_to_f16(p[k]);
                     }

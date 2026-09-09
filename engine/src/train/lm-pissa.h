@@ -213,9 +213,10 @@ static bool lm_pissa_residual_write(const std::string & path, const PissaResidua
                                 (float) m.energy_mean,          (float) m.energy_min };
     {
         STWTensor t;
-        t.name  = "pissa.meta";
-        t.shape = { (int64_t) meta.size() };
-        t.data  = meta.data();
+        t.name           = "pissa.meta";
+        t.shape          = { (int64_t) meta.size() };
+        t.data           = meta.data();
+        t.dtype_override = STW_F32;  // base size hi/lo and the version must not round
         tensors.push_back(t);
     }
     std::vector<std::string> names;

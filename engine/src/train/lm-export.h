@@ -689,6 +689,15 @@ static bool lm_export_peft(const LmLora & L, const Qwen3LMConfig & cfg, const Lm
     if (ovr && ovr->marker == 4) {
         md.push_back({ "hot_step_pissa_delta", "v1" });
     }
+    // The marker, the PiSSA meta and the soft-prompt rows are read by dtype
+    // ("F32" or ignored) and carry values no half can hold; they stay F32 in
+    // an F16 file. Found the hard way on 2026-09-09: an F16 marker made the
+    // loader treat a delta file as a plain LoRA, and the base size went inf.
+    for (STWTensor & t : tensors) {
+        if (t.name.rfind("hot_step.", 0) == 0) {
+            t.dtype_override = STW_F32;
+        }
+    }
 
     const std::string sf = lm_join(out_dir, "adapter_model.safetensors");
     // The plain export stays F32 (Side-Step reads it); the PiSSA forms choose

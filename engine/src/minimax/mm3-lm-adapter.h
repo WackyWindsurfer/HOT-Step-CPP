@@ -566,6 +566,17 @@ static MM3LmAdapter * mm3_lm_adapter_load(const char * path, std::string * err, 
         }
     }
     const bool pissa_delta = marker == "pissa-delta";
+    // The config names a residual but the file carries no delta marker: the
+    // tensors would be applied as a plain LoRA, (B - B0)(A - A0), a delta of
+    // nothing. Refuse instead of rendering the base with a dead adapter.
+    if (!pissa_delta && !cfg.pissa_residual.empty()) {
+        st_close(&st);
+        if (err) {
+            *err = std::string("adapter ") + path + " names a PiSSA residual (" + cfg.pissa_residual +
+                   ") but carries no delta marker — the file is not one this loader can apply";
+        }
+        return nullptr;
+    }
     // A delta file's config says LORA on purpose (it IS applied as one once the
     // pair is rebuilt), so the marker/config cross-check below does not apply.
     if (!marker.empty() && !pissa_delta && cfg.present) {
