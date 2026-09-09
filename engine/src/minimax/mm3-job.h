@@ -831,7 +831,10 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     // An AR cache hit is excluded because there is nothing to interleave with:
     // stage 1 never runs, so the serial sweep starts emitting immediately.
     bool interleave = false;
-    if (req.stream && !ar_hit) {
+    if (req.stream && !ar_hit && req.gen.require_eos) {
+        fprintf(stderr, "[MM3-Job] %s: streaming stays serial - natural-ending candidates need the whole plan before "
+                        "anything renders (audio starts once planning finishes)\n", job->id.c_str());
+    } else if (req.stream && !ar_hit) {
         if (g_keep_loaded) {
             // Keep-loaded already means co-resident by policy — that is what
             // the setting buys, and it is the same reason `staged` is false.
@@ -1103,6 +1106,34 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
         };
     }
 
+    // Natural-ending candidates: the pipeline reports the surviving takes as
+    // soon as planning is done. Compact the take list NOW (the stream queues
+    // move with their take, and on_chunk keeps addressing them by original
+    // index through its own captured vector), so a client streaming take 1
+    // and the finished song called take 1 are the same take.
+    req.gen.on_candidates = [st, job](const std::vector<int> & kept) {
+        std::lock_guard<std::mutex>  lock(st->mtx);
+        std::vector<MM3TakeOutput>   next;
+        for (int t : kept) {
+            if (t >= 0 && (size_t) t < st->takes.size()) {
+                next.push_back(st->takes[(size_t) t]);
+            }
+        }
+        if (next.empty()) {
+            return;
+        }
+        st->takes_planned = st->n_takes;
+        st->takes_dropped = st->n_takes - (int) next.size();
+        st->takes         = std::move(next);
+        st->n_takes       = (int) st->takes.size();
+        st->require_eos   = true;
+        if (!st->takes.empty()) {
+            st->stream = st->takes[0].stream;
+        }
+        fprintf(stderr, "[MM3-Job] %s: candidates compacted after planning - %d of %d kept\n", job->id.c_str(),
+                st->n_takes, st->takes_planned);
+    };
+
     int                       K = st->n_takes > 0 ? st->n_takes : 1;
     std::vector<MM3GenResult> rs((size_t) K);
     const bool ok = mm3_generate_takes(g_mm3, req.gen, &g_mm3_tokenizer, progress, rs.data(), K, &err);
@@ -1134,6 +1165,7 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
             fail(2, "failed", "no candidate ended naturally");
             return;
         }
+        // K is the ORIGINAL take count (rs was sized before on_candidates ran).
         const int planned = K * kept[0].eos_rounds_used;
         rs.swap(kept);
         K = (int) rs.size();

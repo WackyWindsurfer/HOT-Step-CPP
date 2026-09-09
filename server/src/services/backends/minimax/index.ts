@@ -504,6 +504,8 @@ async function capabilities(): Promise<BackendCapabilities> {
       },
       {
         key: 'mm3LmRepMode',
+        // Meaningless while the penalty is 1.0 (off): hidden until it is raised.
+        visible_when: { key: 'mm3LmRepPenalty', not_equals: '1' },
         group: 'lm',
         type: 'select',
         label: 'Repetition Mode',
@@ -519,6 +521,7 @@ async function capabilities(): Promise<BackendCapabilities> {
       },
       {
         key: 'mm3LmRepWindow',
+        visible_when: { key: 'mm3LmRepPenalty', not_equals: '1' },
         group: 'lm',
         type: 'slider',
         label: 'Repetition Window',

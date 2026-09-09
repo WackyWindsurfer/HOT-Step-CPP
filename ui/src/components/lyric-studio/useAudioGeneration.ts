@@ -16,6 +16,7 @@ import type { Generation, Profile, AlbumPreset } from '../../services/lireekApi'
 import { resolveDuration } from '../../utils/estimateDuration';
 import { useGlobalParamsStore } from '../../stores/globalParamsStore';
 import { captionForBackend, MM3_BACKEND_ID } from '../../utils/captionForBackend';
+import { ensureMm3SourceTracks } from '../../utils/mm3CaptionSource';
 import {
   MM3_CAPTION_SOURCES_KEY, clearMm3CaptionSources,
   readMm3CaptionSelection, readMm3SourceTracks,
@@ -52,6 +53,7 @@ export function useAudioGeneration({ profiles, showToast: _showToast }: UseAudio
     // two goes in it depends on the backend that is about to render it.
     const backendId = useBackendStore.getState().activeBackendId;
     const lyricsSetId = profile?.lyrics_set_id;
+    if (backendId === MM3_BACKEND_ID) await ensureMm3SourceTracks(lyricsSetId);
     write('hs-caption', captionForBackend(gen, backendId, lyricsSetId));
     write('hs-lyrics', gen.lyrics || '');
 

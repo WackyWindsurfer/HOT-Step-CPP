@@ -892,13 +892,16 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
     // float64 — which is exactly what made three distinct takes report one
     // seed and become individually unreproducible.
     if (req.require_eos) {
-      // NOT knowable yet. The engine plans `takes` candidates and renders only
-      // the ones that ended, and a later round shifts the seeds — so the submit
-      // response's count is an upper bound and its base seed is only the FIRST
-      // round's. Publishing either would stand up cards for takes that get
-      // dropped and stamp seeds that never rendered. The truth arrives with the
-      // completion detail, and that is where these two get set.
-      job.mm3Takes = 1;
+      // The candidate count is published NOW so the browser can stand up one
+      // card per candidate and stream each one; the engine compacts the list
+      // the moment planning is done (mm3-job.h on_candidates), the poll below
+      // sees the smaller `takes` and the browser marks the dropped cards. The
+      // seeds are provisional until then (a later round moves them on).
+      job.mm3Takes = Math.max(1, Number(sub.takes ?? req.takes ?? 1));
+      if (job.mm3Takes > 1) {
+        const base = BigInt(sub.seed_str ?? String(sub.seed ?? 0));
+        job.mm3TakeSeeds = Array.from({ length: job.mm3Takes }, (_, t) => (base + BigInt(t)).toString());
+      }
       log('INFO', `[MM3] Natural ending required — planning ${req.takes ?? 1} candidate(s) per round, `
         + `up to ${req.eos_rounds ?? 1} round(s). Only plans that reach EOS are rendered.`);
     } else {
@@ -956,6 +959,20 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
         // knowable once the worker has run its VRAM check, and it is the
         // difference between "audio in seconds" and "audio after the plan", so
         // it is logged once and published for the player to be honest about.
+        // Natural-ending candidates: once the planner has dropped the capped
+        // takes the engine's `takes` shrinks and its per-take list carries the
+        // surviving seeds. Publish both mid-run so the cards update before the
+        // flow stage streams into them.
+        if (req.require_eos && d.require_eos && Number(d.takes_planned ?? 0) > 0) {
+          const survived = Math.max(1, Number(d.takes ?? job.mm3Takes ?? 1));
+          const seeds = (d.take_detail ?? []).map((t: any) => String(t?.seed_str ?? t?.seed ?? '')).filter((s: string) => s.length > 0);
+          if (survived !== job.mm3Takes) {
+            log('INFO', `[MM3] Natural ending: ${survived} of ${d.takes_planned} candidate(s) ended and will render; `
+              + `${Number(d.takes_dropped ?? 0)} capped and dropped (round ${Number(d.eos_rounds_used ?? 1)})`);
+          }
+          job.mm3Takes = survived;
+          if (seeds.length) job.mm3TakeSeeds = seeds;
+        }
         if (d.streaming && d.stream_interleaved !== undefined && job.mm3Interleaved === undefined) {
           job.mm3Interleaved = d.stream_interleaved === true;
           log('INFO', d.stream_interleaved

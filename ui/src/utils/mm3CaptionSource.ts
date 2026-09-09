@@ -91,6 +91,27 @@ export function readMm3SourceTracks(lyricsSetId: number | undefined): Mm3SourceT
   return _read<Mm3SourceTrack[]>(MM3_SOURCE_TRACKS_PREFIX + lyricsSetId) ?? [];
 }
 
+/** The render paths are plain modules that may run before the album's detail
+ *  was ever opened in this browser (a queue resumed after a reload, a song
+ *  card rendered straight from the list). Fetch and cache the album's
+ *  captioned tracks then, so "Automatic" never silently degrades to the
+ *  song's own caption just because the cache was cold. */
+export async function ensureMm3SourceTracks(lyricsSetId: number | undefined): Promise<Mm3SourceTrack[]> {
+  if (!lyricsSetId) return [];
+  const cached = readMm3SourceTracks(lyricsSetId);
+  if (cached.length) return cached;
+  try {
+    const { lireekApi } = await import('../services/lireekApi');
+    const set = await lireekApi.getLyricsSet(lyricsSetId);
+    const songs = typeof set.songs === 'string' ? JSON.parse(set.songs) : (set.songs || []);
+    const tracks = collectMm3SourceTracks(songs);
+    cacheMm3SourceTracks(lyricsSetId, tracks);
+    return tracks;
+  } catch {
+    return [];
+  }
+}
+
 /** Cache the album's captioned tracks so the render paths can resolve without
  *  an API call. Called whenever an album's detail data is loaded. */
 export function cacheMm3SourceTracks(lyricsSetId: number, tracks: Mm3SourceTrack[]): void {
@@ -168,9 +189,12 @@ export function resolveMm3Caption(
   tracks: Mm3SourceTrack[],
   sel: Mm3CaptionSelection,
 ): Mm3ResolvedCaption {
-  const own = gen.caption_mm3 || '';
+  const own = (gen.caption_mm3 || '').trim();
 
-  if (sel.mode === 'custom') return { caption: own, mode: 'custom' };
+  // Custom means the song's OWN MM3 caption. A song written before that field
+  // existed has none, and the ACE caption is not a substitute on this backend
+  // (measured off-genre), so an empty Custom falls through to the dataset.
+  if (sel.mode === 'custom' && own) return { caption: own, mode: 'custom' };
 
   if (sel.mode === 'track' && sel.selectedTitle) {
     const hit = tracks.find(track => track.title === sel.selectedTitle);

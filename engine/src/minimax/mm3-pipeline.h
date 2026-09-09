@@ -711,6 +711,11 @@ struct MM3GenRequest {
      *  render only the ones that ended. */
     bool require_eos = false;
     int  eos_rounds  = 4;
+    /** Called once, right after planning, with the ORIGINAL take indices
+     *  that ended (in order), so the job layer can compact its take list
+     *  before the flow stage: streamed chunks and the finished songs then
+     *  share one index space. Only fires when require_eos dropped something. */
+    std::function<void(const std::vector<int> &)> on_candidates;
 
     // Returns true to abort. Polled once per AR frame, once per Euler step, and
     // at every stage boundary. On abort mm3_generate() returns false with
@@ -1008,7 +1013,10 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
     //     residency", and interleaving has already run stage 2 against a live
     //     LM by the time the AR returns. The two are mutually exclusive by
     //     construction; this is the belt, and it fails SAFE (serial).
-    const bool interleave = req.stream_interleave && streaming && !req.cached_hiddens && !req.after_ar;
+    // Natural-ending candidates need the whole plan before anything renders: a
+    // window played while planning cannot be taken back when its take caps.
+    const bool interleave = req.stream_interleave && streaming && !req.cached_hiddens && !req.after_ar &&
+                            !req.require_eos;
 
     // SHARED scratch. Safe to share across takes because process_window is
     // called serially — never two windows in flight at once.
@@ -1336,6 +1344,17 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
             outs[t].dropped         = cand && !ars[(size_t) t].eos_hit;
             outs[t].round           = round;
             outs[t].eos_rounds_used = round + 1;
+        }
+        if (cand && req.on_candidates) {
+            std::vector<int> kept;
+            for (int t = 0; t < K; t++) {
+                if (!outs[t].dropped) {
+                    kept.push_back(t);
+                }
+            }
+            if ((int) kept.size() < K) {
+                req.on_candidates(kept);
+            }
         }
         double ar_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ar).count();
         // See `dispatch_ms`: on an interleaved run the windows rendered inside
