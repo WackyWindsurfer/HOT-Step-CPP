@@ -76,6 +76,24 @@ export interface MinimaxGenerationDeps {
 /** MM3's own duration ceiling (mirrors the capability manifest). */
 const MM3_MAX_DURATION_SEC = 300;
 
+// ── Natural endings ──────────────────────────────────────────────────────────
+//
+// An MM3 plan either reaches EOS or runs into the frame cap, and the second one
+// is audible: the track simply stops. The planner is also the cheap half of an
+// ensemble (the 8B LM weight read is shared across the batch), so asking for
+// three candidates and rendering only the ones that ended costs far less than
+// the odds of a truncated song do.
+//
+// 3 candidates because that is where the shared-weight-read amortisation still
+// pays and the flow stage (which is NOT shared) stays affordable; 4 rounds
+// because each round is one more batched AR pass and a prompt that cannot end
+// in twelve attempts is a prompt problem, not a luck problem.
+const MM3_ENDING_TAKES  = 3;
+const MM3_ENDING_ROUNDS = 4;
+/** Engine ceiling on `takes` (ggml amortises a quantised weight read across at
+ *  most 8 mat-vec columns, and a CFG pair costs two). */
+const MM3_MAX_TAKES = 8;
+
 // ── Low-step schedule compensation ───────────────────────────────────────────
 //
 // MM3's native schedule is UNIFORM with shift=1 (engine mm3-dit-graph.h:744),
@@ -229,10 +247,14 @@ export interface MinimaxParamMapping {
   req: Mm3SynthRequest;
   /** Non-fatal notes (clamps, ignored knobs) surfaced to the generation log. */
   notes: string[];
-  /** No length was asked for, so `req.duration` carries the CEILING and the
-   *  planner LM decides where the song ends. Everything downstream that would
-   *  otherwise report the requested length as the render's length has to know
-   *  the difference — the ceiling is not a prediction. */
+  /** `req.duration` carries the CEILING and the planner LM decides where the
+   *  song ends. Everything downstream that would otherwise report the requested
+   *  length as the render's length has to know the difference — the ceiling is
+   *  not a prediction.
+   *
+   *  Always true since MM3 stopped honouring a requested length at all; kept as
+   *  a field so every "is this number a prediction?" site still reads as the
+   *  question it is answering. */
   autoDuration: boolean;
 }
 
@@ -311,7 +333,7 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
   // would be tokenized as literal lyric text.
   const lyrics: string = params.instrumental ? '' : (params.lyrics || '');
 
-  // ── Duration: a ceiling, not a target ──────────────────────────────────────
+  // ── Duration: ALWAYS auto on this backend ──────────────────────────────────
   //
   // The wire's `duration` becomes max_frames = min(round(duration x 25), 9000)
   // in the engine (mm3-request.h) and does nothing else. It is NOT part of the
@@ -319,26 +341,29 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
   // LM cannot aim for it: it plans until it samples EOS, and the render stops
   // there or at max_frames, whichever comes first (mm3-ar-loop.h).
   //
-  // So "auto" is not a mode the engine has to grow — it is what asking for the
-  // ceiling already means. duration <= 0 (the UI's Auto) sends the ceiling and
-  // lets the stop token end the song. The old behaviour, silently substituting
-  // 60s, capped the LM at a minute of music for anyone who never touched the
-  // slider.
-  let duration = Number(params.duration);
-  const autoDuration = !(duration > 0);
-  if (autoDuration) {
-    duration = MM3_MAX_DURATION_SEC;
-    notes.push(
-      `duration: auto — the planner LM ends the song where it wants (ceiling ${MM3_MAX_DURATION_SEC}s). `
-      + `If it never emits EOS the render runs to the ceiling and stops mid-phrase; set a length to bound it.`,
-    );
-  }
+  // Which makes a requested length a HARD CAP, not a target — and a cap that
+  // lands before the LM's own ending truncates the song mid-phrase. That is
+  // exactly the failure a natural ending is supposed to prevent, so MM3 no
+  // longer honours a length from anywhere: not the Create panel, not Lyric
+  // Studio's estimate, not a reproduce/A-B replay of an older row that still
+  // carries a number. The ceiling goes over and the stop token ends the song.
+  //
+  // The UI hides its duration control in MM3 mode (MetadataSection.tsx), but
+  // this is the guarantee: every path into this backend arrives here, and a
+  // stale persisted value or a direct API caller must not be able to reinstate
+  // the cap.
+  const requestedDuration = Number(params.duration);
+  const duration = MM3_MAX_DURATION_SEC;
+  const autoDuration = true;
+  notes.push(
+    `duration: auto — the planner LM ends the song where it wants (ceiling ${MM3_MAX_DURATION_SEC}s)`
+    + (requestedDuration > 0
+        ? `. The requested ${Math.round(requestedDuration)}s was IGNORED: on this backend a length is a hard `
+          + `frame cap rather than a target, so it can only cut the ending off — MiniMax-Music3 renders are always auto.`
+        : '.'),
+  );
   // The ACE duration buffer (autoTrimEnabled + durationBuffer) is deliberately
   // NOT added: nothing trims it back off on this path.
-  if (duration > MM3_MAX_DURATION_SEC) {
-    notes.push(`duration ${Math.round(duration)}s exceeds the MiniMax-Music3 limit — clamped to ${MM3_MAX_DURATION_SEC}s`);
-    duration = MM3_MAX_DURATION_SEC;
-  }
 
   // -1 tells the engine to draw one; it echoes the resolved value back so the
   // take stays reproducible.
@@ -381,6 +406,29 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
       : undefined;
 
   const samplerPlugins = mapMinimaxSamplerPlugins(params, resolvedSteps, notes);
+
+  // ── Natural endings ────────────────────────────────────────────────────────
+  //
+  // `!== false`, not `=== true`: the declared default is ON, and the UI sends
+  // nothing for a control the user has never touched (see the mm3ReuseAr note
+  // below). An absent value therefore has to resolve to the declared default or
+  // the toggle would lie about its own state.
+  const requireEnding = params.mm3RequireEnding !== false;
+  const askedTakes = Number(params.mm3Takes) > 1
+    ? Math.min(MM3_MAX_TAKES, Math.max(1, Math.round(Number(params.mm3Takes))))
+    : 1;
+  // Variations and natural endings want the same batched AR pass, so they share
+  // it rather than fighting: asking for more variations than the ending check
+  // needs simply raises the candidate count.
+  const takes = requireEnding ? Math.max(MM3_ENDING_TAKES, askedTakes) : askedTakes;
+  if (requireEnding) {
+    notes.push(
+      `natural ending required: ${takes} candidate plans per round, up to ${MM3_ENDING_ROUNDS} rounds. `
+      + `Candidates that reach the ${MM3_MAX_DURATION_SEC}s cap without an ending are dropped before the flow `
+      + `stage, so the number of songs this produces is 1..${takes} — whatever ended. `
+      + `Turn "Require Natural Ending" off to render whatever the planner produced.`,
+    );
+  }
 
   return {
     req: {
@@ -449,7 +497,11 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
       // Ensemble takes: N different songs from this one prompt in a single
       // batched AR pass. Omitted at 1 so an ordinary render's wire request is
       // byte-for-byte what it always was.
-      ...(Number(params.mm3Takes) > 1 ? { takes: Math.min(8, Math.max(1, Math.round(Number(params.mm3Takes)))) } : {}),
+      ...(takes > 1 ? { takes } : {}),
+      // Natural endings. Omitted entirely when off, so turning the toggle off
+      // gives back exactly the request this backend sent before the feature
+      // existed.
+      ...(requireEnding ? { require_eos: true, eos_rounds: MM3_ENDING_ROUNDS } : {}),
       // MM3 Plank replay. A plank that will not load is a note, not a failure:
       // the render proceeds with a normal AR pass.
       ...(params.mm3PlankPath ? (() => {
@@ -674,9 +726,23 @@ export function minimaxStageText(d: Mm3JobDetail, elapsedSec: number): { stage: 
       return silent('MiniMax-Music3: loading weights', 6);
     case 'warm':
       return silent('MiniMax-Music3: weights resident', 8);
-    case 'ar':
+    case 'ar': {
       // The autoregressive planner — MM3's analogue of the ACE LM phase.
-      return { stage: `MiniMax-Music3: planning (frame ${d.step}/${d.n_steps})`, progress: 10 + Math.round(frac(d.step, d.n_steps) * 25) };
+      //
+      // Under the ending arbitration this one pass is planning SEVERAL
+      // candidates at once and may discard the lot and start again, so "planning
+      // (frame n/N)" would be quietly misleading: the bar can reach the end of
+      // its range and go back to the start. Say what it is doing instead.
+      const takes = Math.max(1, Number(d.takes ?? 1));
+      const round = Math.max(1, Number(d.eos_rounds_used ?? 1));
+      const what = d.require_eos
+        ? `planning ${takes} candidate${takes === 1 ? '' : 's'}${round > 1 ? `, round ${round}` : ''}`
+        : 'planning';
+      return {
+        stage: `MiniMax-Music3: ${what} (frame ${d.step}/${d.n_steps})`,
+        progress: 10 + Math.round(frac(d.step, d.n_steps) * 25),
+      };
+    }
     case 'cond':
       return { stage: `MiniMax-Music3: conditioning (window ${d.window + 1}/${d.n_windows})`, progress: 36 + Math.round(frac(d.window + 1, d.n_windows) * 4) };
     case 'flow': {
@@ -825,15 +891,27 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
     // 18226392072674864222 with its two successors all collapse onto the same
     // float64 — which is exactly what made three distinct takes report one
     // seed and become individually unreproducible.
-    job.mm3Takes = Math.max(1, Number(sub.takes ?? req.takes ?? 1));
-    if (job.mm3Takes > 1) {
-      // seed_str, never seed: the number has already lost the low digits by the
-      // time it reaches JS, so basing the takes on it would give three seeds
-      // that are all wrong and all identical.
-      const base = BigInt(sub.seed_str ?? String(sub.seed ?? 0));
-      job.mm3TakeSeeds = Array.from({ length: job.mm3Takes }, (_, t) => (base + BigInt(t)).toString());
-      log('INFO', `[MM3] Ensemble: ${job.mm3Takes} takes from one prompt, seeds `
-        + `${job.mm3TakeSeeds[0]}..${job.mm3TakeSeeds[job.mm3Takes - 1]}`);
+    if (req.require_eos) {
+      // NOT knowable yet. The engine plans `takes` candidates and renders only
+      // the ones that ended, and a later round shifts the seeds — so the submit
+      // response's count is an upper bound and its base seed is only the FIRST
+      // round's. Publishing either would stand up cards for takes that get
+      // dropped and stamp seeds that never rendered. The truth arrives with the
+      // completion detail, and that is where these two get set.
+      job.mm3Takes = 1;
+      log('INFO', `[MM3] Natural ending required — planning ${req.takes ?? 1} candidate(s) per round, `
+        + `up to ${req.eos_rounds ?? 1} round(s). Only plans that reach EOS are rendered.`);
+    } else {
+      job.mm3Takes = Math.max(1, Number(sub.takes ?? req.takes ?? 1));
+      if (job.mm3Takes > 1) {
+        // seed_str, never seed: the number has already lost the low digits by the
+        // time it reaches JS, so basing the takes on it would give three seeds
+        // that are all wrong and all identical.
+        const base = BigInt(sub.seed_str ?? String(sub.seed ?? 0));
+        job.mm3TakeSeeds = Array.from({ length: job.mm3Takes }, (_, t) => (base + BigInt(t)).toString());
+        log('INFO', `[MM3] Ensemble: ${job.mm3Takes} takes from one prompt, seeds `
+          + `${job.mm3TakeSeeds[0]}..${job.mm3TakeSeeds[job.mm3Takes - 1]}`);
+      }
     }
     if (req.stream && !job.mm3Streaming) {
       log('WARNING', '[MM3] Streaming was requested but the engine declined it — this render is not streamable');
@@ -1017,6 +1095,32 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
       ? (finalDetail as any).take_detail : [];
     if (nTakes > 1) {
       log('INFO', `[MM3] Ensemble render: ${nTakes} takes -> ${nTakes} songs`);
+    }
+
+    // ── Natural endings: the count and the seeds, finally knowable ──────────
+    //
+    // Submit-time arithmetic (base seed + t for `sub.takes` takes) is WRONG on
+    // this path: candidates that hit the cap were dropped, and a re-plan moved
+    // the seeds on by a whole round. The engine's own per-take list is the only
+    // record of which plans survived and what drew them, so it wins outright —
+    // for the song rows below and for the take count the browser reads.
+    if (req.require_eos) {
+      const planned = Math.max(nTakes, Number(finalDetail?.takes_planned ?? req.takes ?? nTakes));
+      const dropped = Number(finalDetail?.takes_dropped ?? Math.max(0, planned - nTakes));
+      const rounds  = Math.max(1, Number(finalDetail?.eos_rounds_used ?? 1));
+      const seeds   = takeDetail
+        .map(d => String(d?.seed_str ?? d?.seed ?? ''))
+        .filter(s => s.length > 0);
+      job.mm3Takes = nTakes;
+      if (seeds.length) job.mm3TakeSeeds = seeds;
+      job.mm3Ending = { planned, rendered: nTakes, dropped, rounds };
+      const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
+      log('INFO',
+        `[MM3] Natural ending: ${planned} ${plural(planned, 'candidate', 'candidates')} planned in `
+        + `${rounds} ${plural(rounds, 'round', 'rounds')}, ${nTakes} ended and `
+        + `${plural(nTakes, 'was', 'were')} rendered, ${dropped} capped and `
+        + `${plural(dropped, 'was', 'were')} dropped`
+        + (seeds.length ? ` (seeds ${seeds.join(', ')})` : ''));
     }
     const audioUrls: string[] = [];
     const songIds: string[] = [];
@@ -1273,14 +1377,21 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
       audioUrls.push(masteredUrl || audioUrl);
       songIds.push(songId);
     }
-    // Takes only share a length when one was asked for; on an auto render each
-    // take stops at its own EOS. Either way report the longest, which is the
-    // render as a whole.
+    // Every MM3 take now stops at its own EOS, so report the longest — that is
+    // the render as a whole.
+    //
+    // `duration_s` is filtered rather than trusted: the require_eos take list is
+    // emitted for candidates the engine KEPT and carries only what it knows
+    // about them, so a missing length there must fall back to the result block
+    // instead of collapsing the whole render to Math.max(1, 0) = 1 second.
+    const takeDurations = takeDetail
+      .map((d: any) => Math.round(Number(d?.duration_s) || 0))
+      .filter((n: number) => n > 0);
     const duration = Math.max(
       1,
-      ...(takeDetail.length
-        ? takeDetail.map((d: any) => Math.round(Number(d?.duration_s) || 0))
-        : [Math.round(finalDetail?.result?.duration_sec || (autoDuration ? 0 : sub.duration) || 0)]),
+      ...(takeDurations.length
+        ? takeDurations
+        : [Math.round(finalDetail?.result?.duration_sec || 0)]),
     );
 
     const totalMs = Math.round(performance.now() - pipelineStart);

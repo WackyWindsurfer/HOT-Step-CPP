@@ -140,8 +140,28 @@ export interface Mm3SynthRequest {
   /** Ensemble takes: render N DIFFERENT songs from this one prompt in a single
    *  batched autoregressive pass. Take t is drawn from seed + t. Clamped by the
    *  engine to the checkpoint's row budget (4 with a CFG pair), so read the
-   *  response's `takes` for what will actually be produced. Omit for 1. */
+   *  response's `takes` for what will actually be produced. Omit for 1.
+   *
+   *  With `require_eos` this is the number of CANDIDATES planned per round, not
+   *  the number of songs — see below. */
   takes?: number;
+
+  // ── Natural endings (engine: the require_eos arbitration) ─────────────────
+  /** Render only candidates whose plan reached EOS. The engine plans `takes`
+   *  candidates in one batched pass; any that hits the frame cap without an
+   *  ending is DROPPED before the flow stage ever sees it. If none of them
+   *  ended, it re-plans the next round (round r uses seed + r*takes + t) up to
+   *  `eos_rounds` times, and only then fails the job with an error containing
+   *  "no candidate ended naturally".
+   *
+   *  The count that comes back from GET /mm3/job is therefore the number
+   *  RENDERED (1..takes) and can differ from what was asked for — which is why
+   *  nothing may derive a song count or a seed list from the SUBMIT response on
+   *  this path. */
+  require_eos?: boolean;
+  /** Maximum planning rounds before the job fails. Only read when
+   *  `require_eos` is set. */
+  eos_rounds?: number;
   /** -1 = engine draws one; the resolved value comes back in the response. */
   seed?: number;
   /** Default = the checkpoint's flow.cfg_scale (1.7). */
@@ -322,25 +342,43 @@ export interface Mm3JobDetail {
   /** Ensemble takes this job actually rendered — always present, and 1 for an
    *  ordinary render. It is the CLAMPED count (the engine caps it at the
    *  checkpoint's row budget), so it is what exists to fetch, never what was
-   *  asked for. */
+   *  asked for. Under `require_eos` it is also the count that SURVIVED the
+   *  ending check, which can be fewer than were planned. */
   takes?: number;
-  /** Per-take summary, present only when there is more than one take. Take t's
-   *  audio is at GET /mm3/take?id=<id>&take=<t> and its live stream at
-   *  GET /mm3/stream?id=<id>&take=<t>. */
+  /** Whether this job ran the natural-ending arbitration. */
+  require_eos?: boolean;
+  /** How many planning rounds it took to get an ending (1 on the common path). */
+  eos_rounds_used?: number;
+  /** Candidates planned across all rounds. */
+  takes_planned?: number;
+  /** Candidates that hit the frame cap without an ending and were dropped
+   *  before the flow stage. `takes_planned - takes_dropped` is `takes`. */
+  takes_dropped?: number;
+  /** Per-take summary. Present whenever there is more than one take, and —
+   *  since the ending arbitration — whenever `require_eos` was set, even for a
+   *  single surviving take. Take t's audio is at
+   *  GET /mm3/take?id=<id>&take=<t> and its live stream at
+   *  GET /mm3/stream?id=<id>&take=<t>.
+   *
+   *  Everything past `eos` is optional because the require_eos emission carries
+   *  only what it knows about a candidate it kept; read nothing here without a
+   *  fallback. */
   take_detail?: Array<{
     take: number;
     seed: number;
     /** Lossless decimal-string seed — the only one safe to store or show. */
     seed_str?: string;
     frames: number;
-    duration_s: number;
     eos: boolean;
-    rms: number;
-    peak: number;
+    /** Which planning round this candidate came from (0-based). */
+    round?: number;
+    duration_s?: number;
+    rms?: number;
+    peak?: number;
     /** Take 0 is served by the shared /job?id=&result=1 as well; the rest only
      *  by /mm3/take. Reported so a client need not special-case index 0. */
-    audio_ready: boolean;
-    streaming: boolean;
+    audio_ready?: boolean;
+    streaming?: boolean;
   }>;
   /** Chunks pushed so far — 0 while the AR stage is still planning. */
   stream_chunks?: number;

@@ -399,6 +399,16 @@ export interface GenerationJob {
    *  18226392072674864222 and its successors all collapse onto one float64,
    *  so a numeric seed cannot tell three takes apart. */
   mm3_take_seeds?: string[] | null;
+  /** "Require natural ending" outcome. Null while the render is running (the
+   *  count is only knowable once the engine has finished dropping candidates)
+   *  and null entirely when the toggle was off. `dropped > 0` is why a render
+   *  that planned three candidates produced fewer songs. */
+  mm3_ending?: {
+    planned: number;
+    rendered: number;
+    dropped: number;
+    rounds: number;
+  } | null;
 }
 
 /** User profile */

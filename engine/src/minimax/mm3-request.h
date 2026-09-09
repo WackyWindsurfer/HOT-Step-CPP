@@ -599,6 +599,9 @@ struct MM3SynthRequest {
      *  rather than rejected, so a caller that asks for more gets fewer songs
      *  and a log line, not an error. Take t uses seed + t. */
     int     takes  = 1;
+    /** Natural-ending candidates: see MM3GenRequest::require_eos. */
+    bool    require_eos = false;
+    int     eos_rounds  = 4;
 
     // Replay previously-captured codes instead of sampling them. Both must be
     // present together, with acoustic == semantic * 7. Entry 0 is the
@@ -880,6 +883,29 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
         }
     }
 
+    // ── Natural-ending candidates ──
+    {
+        yyjson_val * v = yyjson_obj_get(root, "require_eos");
+        if (v && !yyjson_is_null(v)) {
+            if (!yyjson_is_bool(v)) {
+                if (err) {
+                    *err = "\"require_eos\" must be a boolean";
+                }
+                return false;
+            }
+            out->require_eos = yyjson_get_bool(v);
+        }
+        yyjson_val * r = yyjson_obj_get(root, "eos_rounds");
+        if (r && !yyjson_is_null(r)) {
+            if (!yyjson_is_int(r) || yyjson_get_sint(r) < 1 || yyjson_get_sint(r) > 16) {
+                if (err) {
+                    *err = "\"eos_rounds\" must be an integer between 1 and 16";
+                }
+                return false;
+            }
+            out->eos_rounds = (int) yyjson_get_sint(r);
+        }
+    }
     // ── Ensemble takes ──
     {
         yyjson_val * v = yyjson_obj_get(root, "takes");
@@ -1195,6 +1221,8 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
     out->gen.steps      = (int) nsteps;
     out->gen.cfg_flow   = (float) cfg;
     out->gen.flow_uncond_interval = (int) llround(uncond_iv);
+    out->gen.require_eos = out->require_eos;
+    out->gen.eos_rounds  = out->eos_rounds;
     out->gen.plugins    = plug;
     // MM3 Plank replay. MM3GenRequest holds these by value, and the job worker
     // takes the whole MM3SynthRequest by value too, so the copy chain is safe —

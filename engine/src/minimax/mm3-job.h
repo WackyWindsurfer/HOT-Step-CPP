@@ -197,6 +197,8 @@ struct MM3TakeOutput {
     double   peak        = 0.0;
     bool     eos         = false;
     bool     has_nan     = false;
+    /** Natural-ending candidates: the planning round this take came from. */
+    int      round       = 0;
 
     /** This take's live chunk queue. One per take, because the takes render in
      *  lockstep and a reader subscribes to ONE of them — a shared queue would
@@ -229,6 +231,13 @@ struct MM3JobState {
      *  False on a streamed run means the audio starts after planning, which is
      *  the difference a user actually feels. */
     bool     interleaved = false;
+    /** Natural-ending candidates (MM3GenRequest::require_eos): how many
+     *  plans were made, how many capped and were dropped, and how many
+     *  rounds it took. `n_takes` / `takes` hold the RENDERED takes only. */
+    bool     require_eos     = false;
+    int      eos_rounds_used = 0;
+    int      takes_planned   = 0;
+    int      takes_dropped   = 0;
 
     bool    have_result = false;
     int64_t frames      = 0;
@@ -1094,13 +1103,9 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
         };
     }
 
-    const int                 K = st->n_takes > 0 ? st->n_takes : 1;
+    int                       K = st->n_takes > 0 ? st->n_takes : 1;
     std::vector<MM3GenResult> rs((size_t) K);
     const bool ok = mm3_generate_takes(g_mm3, req.gen, &g_mm3_tokenizer, progress, rs.data(), K, &err);
-    // Take 0 is the job's primary result: it fills the upstream Job exactly as
-    // a one-take render always has, so nothing downstream needs to know the
-    // others exist.
-    MM3GenResult & r = rs[0];
     if (!ok) {
         if (err == MM3_ERR_CANCELLED) {
             fprintf(stderr, "[MM3-Job] %s: cancelled\n", job->id.c_str());
@@ -1111,6 +1116,49 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
         }
         return;
     }
+    // Natural-ending candidates: the capped takes were never rendered; take
+    // them out of the job here so everything downstream (take 0 = the primary
+    // result, GET /mm3/take, the job JSON) only ever sees songs that ended.
+    // The pipeline guarantees at least one survivor (it fails otherwise).
+    if (req.gen.require_eos && !st->interleaved) {
+        std::vector<MM3GenResult> kept;
+        std::string               dropped_seeds;
+        for (MM3GenResult & x : rs) {
+            if (x.dropped) {
+                dropped_seeds += (dropped_seeds.empty() ? "" : ", ") + std::to_string(x.ar.seed);
+            } else {
+                kept.push_back(std::move(x));
+            }
+        }
+        if (kept.empty()) {
+            fail(2, "failed", "no candidate ended naturally");
+            return;
+        }
+        const int planned = K * kept[0].eos_rounds_used;
+        rs.swap(kept);
+        K = (int) rs.size();
+        {
+            std::lock_guard<std::mutex> lock(st->mtx);
+            st->n_takes         = K;
+            st->takes.resize((size_t) K);
+            for (int t = 0; t < K; t++) {
+                st->takes[(size_t) t].seed  = rs[(size_t) t].ar.seed;
+                st->takes[(size_t) t].round = rs[(size_t) t].round;
+            }
+            st->require_eos     = true;
+            st->eos_rounds_used = rs[0].eos_rounds_used;
+            st->takes_planned   = planned;
+            st->takes_dropped   = planned - K;
+        }
+        const std::string tail = dropped_seeds.empty() ? std::string() : " (capped seeds in the last round: " + dropped_seeds + ")";
+        fprintf(stderr, "[MM3-Job] %s: natural ending - %d candidate(s) planned over %d round(s), %d ended and were rendered, "
+                        "%d capped and dropped%s\n",
+                job->id.c_str(), planned, rs[0].eos_rounds_used, K, planned - K, tail.c_str());
+    }
+    // Take 0 is the job's primary result: it fills the upstream Job exactly as
+    // a one-take render always has, so nothing downstream needs to know the
+    // others exist.
+    MM3GenResult & r = rs[0];
 
     // ── AR cache: restore on a hit, fill on a miss ─────────────────────────
     //
@@ -1583,7 +1631,14 @@ static void mm3_handle_job(const httplib::Request & hreq, httplib::Response & re
     // Always reported, so a caller can tell a one-take render from an ensemble
     // without inspecting the request it sent.
     yyjson_mut_obj_add_int(o, orot, "takes", st->n_takes);
-    if (st->n_takes > 1) {
+    // Natural-ending candidates: what was planned vs what survived. The
+    // per-take array is emitted whenever candidates were in play, even for a
+    // single survivor, so a client can read its seed and round.
+    yyjson_mut_obj_add_bool(o, orot, "require_eos", st->require_eos);
+    yyjson_mut_obj_add_int(o, orot, "eos_rounds_used", st->eos_rounds_used);
+    yyjson_mut_obj_add_int(o, orot, "takes_planned", st->takes_planned);
+    yyjson_mut_obj_add_int(o, orot, "takes_dropped", st->takes_dropped);
+    if (st->n_takes > 1 || st->require_eos) {
         yyjson_mut_val * arr = yyjson_mut_arr(o);
         for (int t = 0; t < (int) st->takes.size(); t++) {
             const MM3TakeOutput & to = st->takes[(size_t) t];
@@ -1596,6 +1651,7 @@ static void mm3_handle_job(const httplib::Request & hreq, httplib::Response & re
             yyjson_mut_obj_add_int(o, e, "frames", to.frames);
             yyjson_mut_obj_add_real(o, e, "duration_s", to.duration_s);
             yyjson_mut_obj_add_bool(o, e, "eos", to.eos);
+            yyjson_mut_obj_add_int(o, e, "round", to.round);
             yyjson_mut_obj_add_real(o, e, "rms", to.rms);
             yyjson_mut_obj_add_real(o, e, "peak", to.peak);
             // Take 0's audio comes from the shared GET /job?id=&result=1; the

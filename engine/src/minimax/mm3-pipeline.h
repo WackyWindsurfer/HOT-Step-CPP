@@ -698,6 +698,20 @@ struct MM3GenRequest {
 
     bool keep_window_latents = false;  // populate MM3GenResult::window_latents
 
+    /** Natural-ending candidates (2026-09-09). The takes are candidates: any
+     *  take that reaches max_frames without EOS is DROPPED before stage 2 and
+     *  never rendered, and when no take of a round ended the planner runs
+     *  again with every seed moved on by the take count (round r plans
+     *  seed + r*K + t, flow noise included). After `eos_rounds` rounds with
+     *  no ending the call fails. Serial path only: an interleaved stream has
+     *  already played what it planned, so there nothing is dropped or
+     *  re-planned (logged once). Why this exists: a capped plan is only
+     *  known to be capped at the last frame, so the cheapest reliable way to
+     *  a natural ending is to plan several at once (one batched pass) and
+     *  render only the ones that ended. */
+    bool require_eos = false;
+    int  eos_rounds  = 4;
+
     // Returns true to abort. Polled once per AR frame, once per Euler step, and
     // at every stage boundary. On abort mm3_generate() returns false with
     // *err == MM3_ERR_CANCELLED, which the job worker turns into job status 3
@@ -792,6 +806,12 @@ struct MM3GenResult {
     MM3ArResult ar;
     /** True when stage 1 was served from MM3GenRequest::cached_hiddens. */
     bool        ar_cached = false;
+    /** Natural-ending candidates: this take capped and was not rendered
+     *  (audio empty, n_windows 0). `round` is the planning round it came
+     *  from, `eos_rounds_used` how many rounds the whole call needed. */
+    bool        dropped         = false;
+    int         round           = 0;
+    int         eos_rounds_used = 1;
 
     double  ar_ms    = 0.0;
     double  cond_ms  = 0.0;
@@ -1262,9 +1282,60 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
         const auto t_ar = std::chrono::steady_clock::now();
         // One batched pass for all K takes. Every take's result lands in its own
         // MM3ArResult, and take 0 carries the shared stage timings.
-        if (!mm3_ar_plan_takes(m, ids_cond.data(), ids_uncond.data(), (int64_t) ids_cond.size(), aopt, ars.data(),
-                               err)) {
-            return false;
+        //
+        // Natural-ending candidates (MM3GenRequest::require_eos): the pass is
+        // repeated with the seeds moved on by K while no take has ended, up to
+        // eos_rounds times. mm3_ar_plan_takes resets every MM3ArResult and
+        // prefills afresh on each call, so re-running it is a clean re-plan.
+        const bool cand       = req.require_eos && !interleave;
+        const int  rounds_max = cand ? (req.eos_rounds > 0 ? req.eos_rounds : 1) : 1;
+        if (req.require_eos && interleave) {
+            fprintf(stderr, "[MM3-Pipe] require_eos ignored on an interleaved stream: what was planned has already "
+                            "been played, so nothing can be dropped or re-planned\n");
+        }
+        int round = 0;
+        for (;; round++) {
+            if (round > 0) {
+                aopt.seed += (uint64_t) K;
+                for (int t = 0; t < K; t++) {
+                    ars[(size_t) t]      = MM3ArResult{};
+                    tk[(size_t) t].seed += (uint64_t) K;   // the flow noise follows its plan
+                }
+                fprintf(stderr, "[MM3-Pipe] natural ending: no candidate ended in round %d; re-planning %d at seed %llu "
+                                "(round %d of %d)\n", round, K, (unsigned long long) aopt.seed, round + 1, rounds_max);
+                if (progress) {
+                    progress(MM3GenProgress{ "ar", -1, 0, 0, aopt.max_frames });
+                }
+            }
+            if (!mm3_ar_plan_takes(m, ids_cond.data(), ids_uncond.data(), (int64_t) ids_cond.size(), aopt, ars.data(),
+                                   err)) {
+                return false;
+            }
+            if (!cand) {
+                break;
+            }
+            int n_end = 0;
+            for (int t = 0; t < K; t++) {
+                n_end += ars[(size_t) t].eos_hit ? 1 : 0;
+            }
+            if (n_end > 0) {
+                fprintf(stderr, "[MM3-Pipe] natural ending: %d of %d candidates ended in round %d; the rest are dropped\n",
+                        n_end, K, round + 1);
+                break;
+            }
+            if (round + 1 >= rounds_max) {
+                if (err) {
+                    *err = "no candidate ended naturally after " + std::to_string(rounds_max) + " round(s) of " +
+                           std::to_string(K) + " (" + std::to_string(rounds_max * K) +
+                           " plans reached the frame cap); the adapter or prompt is not producing endings";
+                }
+                return false;
+            }
+        }
+        for (int t = 0; t < K; t++) {
+            outs[t].dropped         = cand && !ars[(size_t) t].eos_hit;
+            outs[t].round           = round;
+            outs[t].eos_rounds_used = round + 1;
         }
         double ar_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ar).count();
         // See `dispatch_ms`: on an interleaved run the windows rendered inside
@@ -1293,6 +1364,16 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
         MM3TakeRun &   st  = tk[(size_t) t];
         MM3GenResult * out = st.out;
         const int64_t  F   = ars[(size_t) t].n_frames;
+        if (out->dropped) {
+            // A capped candidate: no windows, so stage 2 below finds no work
+            // for it and it ends with empty audio. The job layer removes it.
+            st.F           = F;
+            st.NW          = 0;
+            out->n_windows = 0;
+            fprintf(stderr, "[MM3-Pipe] take %d (seed %llu) reached the cap at %lld frames without EOS: dropped, not rendered\n",
+                    t, (unsigned long long) ars[(size_t) t].seed, (long long) F);
+            continue;
+        }
         if (F <= 0) {
             if (err) {
                 *err = req.cached_hiddens ? "the cached AR block claims zero frames"

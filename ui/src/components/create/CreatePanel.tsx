@@ -165,7 +165,13 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
       lyrics: instrumental ? '[Instrumental]' : resolvedLyrics,
       ...(negativePrompt.trim() ? { negative_prompt: negativePrompt.trim() } : {}),
       instrumental,
-      bpm, duration, keyScale, timeSignature, vocalLanguage,
+      bpm, keyScale, timeSignature, vocalLanguage,
+      // MM3 has no length input — a duration there is a frame cap that can only
+      // truncate the planner's own ending, so every MM3 render is auto. The
+      // control is hidden in MM3 mode (MetadataSection), and this stops the
+      // persisted ACE value riding along behind it. The backend enforces the
+      // same thing, so a stale row or a direct API call cannot reinstate a cap.
+      duration: mm3Mode ? -1 : duration,
       // vocalGender is deliberately NOT sent: neither backend has a wire field
       // for it. It reaches the model only by being written into the caption's
       // Vocal Details section by Mm3ComposeButton, and the caption is what
