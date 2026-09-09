@@ -19,6 +19,11 @@ import { useStreamGeneration } from '../../hooks/useStreamGeneration';
 import { useBackendStore } from '../../stores/backendStore';
 import { StreamPlayer } from '../player/StreamPlayer';
 import { expandWildcards, hasWildcards, randomWildcardSeed } from '../../utils/wildcardUtils';
+import {
+  MM3_CAPTION_SOURCES_KEY, clearMm3CaptionSources, pickNearestBpmTrack,
+  readMm3CaptionSources, resolveMm3Caption,
+  type Mm3CaptionSourcesHandoff,
+} from '../../utils/mm3CaptionSource';
 import type { GenerationParams, Song } from '../../types';
 
 interface CreatePanelProps {
@@ -74,6 +79,50 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
   // Details section — there is no wire field for it on either backend.
   const [vocalGender, setVocalGender] = usePersistedState('hs-vocalGender', '');
   const [sourceLatentUrl, setSourceLatentUrl] = usePersistedState('hs-sourceLatentUrl', '');
+
+  // ── MM3 caption source (songs sent here from Lyric Studio) ──
+  // Send-to-Create leaves the album's captioned source tracks and the song's
+  // own caption in one localStorage key, so the same three-way control can be
+  // offered here with no server call. Absent key, or a non-MM3 backend, and
+  // none of this exists — the caption box is the plain editable one.
+  const [mm3Sources, setMm3Sources] = useState<Mm3CaptionSourcesHandoff | null>(() => readMm3CaptionSources());
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === MM3_CAPTION_SOURCES_KEY) setMm3Sources(readMm3CaptionSources());
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
+  const mm3SourcesActive = mm3Mode && !!mm3Sources && mm3Sources.tracks.length > 0;
+  const mm3Resolved = mm3SourcesActive
+    ? resolveMm3Caption({ bpm, caption_mm3: mm3Sources!.customCaption }, mm3Sources!.tracks, mm3Sources!)
+    : null;
+  const mm3CaptionLocked = !!mm3Resolved && mm3Resolved.mode !== 'custom';
+
+  // The resolved caption IS the caption: the request path sends `caption`
+  // unchanged, so nothing server-side needs to know a source was picked. Also
+  // re-runs when the tempo changes, since Automatic is a function of it.
+  useEffect(() => {
+    if (mm3CaptionLocked && mm3Resolved && mm3Resolved.caption !== caption) setCaption(mm3Resolved.caption);
+  }, [mm3CaptionLocked, mm3Resolved?.caption]);
+
+  const setMm3Mode = useCallback((value: string) => {
+    if (!mm3Sources) return;
+    const next: Mm3CaptionSourcesHandoff = value === 'auto' || value === 'custom'
+      ? { ...mm3Sources, mode: value, selectedTitle: undefined }
+      : { ...mm3Sources, mode: 'track', selectedTitle: value.slice('track:'.length) };
+    try { localStorage.setItem(MM3_CAPTION_SOURCES_KEY, JSON.stringify(next)); } catch { /* ignore */ }
+    setMm3Sources(next);
+    // Switching to Custom hands the box back with the song's own caption in it —
+    // otherwise it would be left holding the dataset track's.
+    if (next.mode === 'custom') setCaption(mm3Sources.customCaption);
+  }, [mm3Sources, setCaption]);
+
+  const dismissMm3Sources = useCallback(() => {
+    clearMm3CaptionSources();
+    setMm3Sources(null);
+  }, []);
 
   // Global params context — for reuse data
   const gp = useGlobalParams();
@@ -222,10 +271,59 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
           introBars={introBars} onIntroBarsChange={setIntroBars}
           autoExpand={autoExpand} onAutoExpandChange={setAutoExpand}
           wildcardSeed={gp.randomSeed ? undefined : gp.seed}
+          captionReadOnly={mm3CaptionLocked}
         />
 
-        {/* MM3 only: turn the plain-English caption into a Structured Caption */}
-        {mm3Mode && (
+        {/* MM3 only, and only for a song sent here from Lyric Studio: which
+            caption renders. Reusing a training track's own Structured Caption
+            verbatim is what reliably lands in the artist's style and reaches a
+            natural ending, so it is the default and this song's own caption is
+            the opt-in. */}
+        {mm3SourcesActive && mm3Resolved && (
+          <div className="pt-2 space-y-1">
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                {t('createPanel.mm3CaptionSource', 'Caption source')}
+              </label>
+              <button
+                onClick={dismissMm3Sources}
+                title={t('createPanel.mm3CaptionSourceDismissHint', 'Stop using the album’s captions for this panel')}
+                className="text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors px-1"
+              >
+                {t('createPanel.mm3CaptionSourceDismiss', 'Dismiss')}
+              </button>
+            </div>
+            <select
+              value={mm3Resolved.mode === 'track' && mm3Resolved.fromTitle ? `track:${mm3Resolved.fromTitle}` : mm3Resolved.mode}
+              onChange={e => setMm3Mode(e.target.value)}
+              className="w-full px-2.5 py-1.5 rounded-lg bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-white/10 text-xs text-zinc-700 dark:text-zinc-300 outline-none focus:border-cyan-500/50 transition-colors"
+            >
+              <option value="auto">
+                {t('createPanel.mm3CaptionAuto', 'Automatic from dataset')}
+                {(() => {
+                  const auto = pickNearestBpmTrack(mm3Sources!.tracks, bpm);
+                  return auto ? ` (${t('createPanel.mm3CaptionNearestTempo', 'nearest tempo')}: ${auto.title})` : '';
+                })()}
+              </option>
+              {mm3Sources!.tracks.map(track => (
+                <option key={track.title} value={`track:${track.title}`}>
+                  {t('createPanel.mm3CaptionTrack', 'Track')}: {track.title}{track.bpm ? ` · ${track.bpm} BPM` : ''}
+                </option>
+              ))}
+              <option value="custom">{t('createPanel.mm3CaptionCustom', "Custom (this song's own caption)")}</option>
+            </select>
+            {mm3CaptionLocked && (
+              <p className="text-[10px] text-cyan-400/70">
+                {t('createPanel.mm3CaptionFromTrack', 'From dataset track')}: {mm3Resolved.fromTitle}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* MM3 only: turn the plain-English caption into a Structured Caption.
+            Hidden while a dataset caption is locked in — composing would only
+            overwrite a box the user cannot edit. */}
+        {mm3Mode && !mm3CaptionLocked && (
           <div className="pt-2">
             <Mm3ComposeButton
               brief={caption}

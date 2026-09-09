@@ -5,6 +5,12 @@ import { lireekApi, streamRefine, skipThinking } from '../../services/lireekApi'
 import type { Generation, Profile } from '../../services/lireekApi';
 import { StreamingPanel } from './StreamingPanel';
 import { useStreamingStore, startStreamGenerate } from '../../stores/streamingStore';
+import { useBackendStore } from '../../stores/backendStore';
+import { MM3_BACKEND_ID } from '../../utils/captionForBackend';
+import {
+  pickNearestBpmTrack, readMm3CaptionSelection, resolveMm3Caption, writeMm3CaptionSelection,
+  type Mm3CaptionSelection, type Mm3SourceTrack,
+} from '../../utils/mm3CaptionSource';
 
 /**
  * Whether these lyrics have already produced a track, and whether one was kept.
@@ -49,9 +55,113 @@ const GenerationStatusBadge: React.FC<{ gen: Generation }> = ({ gen }) => {
   return null;
 };
 
+/**
+ * The MM3 caption for one written song, plus WHERE it comes from.
+ *
+ * On MiniMax-Music3 the caption that renders is a choice. Rendering new lyrics
+ * under one of the artist's own training-track captions — verbatim, not a fresh
+ * caption in the same style — is what reliably produces a song in the band's
+ * style and, especially, one that ends naturally. So the default is a source
+ * track picked by tempo, and this song's own caption becomes the opt-in.
+ *
+ * On ACE-Step none of this appears and the box behaves exactly as it always has.
+ */
+const Mm3CaptionField: React.FC<{
+  gen: Generation;
+  mm3Mode: boolean;
+  tracks: Mm3SourceTrack[];
+  selection: Mm3CaptionSelection;
+  onSelectionChange: (sel: Mm3CaptionSelection) => void;
+  onSaveCustom: (value: string) => void;
+}> = ({ gen, mm3Mode, tracks, selection, onSelectionChange, onSaveCustom }) => {
+  const { t } = useTranslation();
+
+  // An album with no captioned source tracks has only one thing to offer, so
+  // the control collapses to a hint and the box stays editable.
+  const hasTracks = mm3Mode && tracks.length > 0;
+  const resolved = hasTracks
+    ? resolveMm3Caption(gen, tracks, selection)
+    : { caption: gen.caption_mm3 || '', mode: 'custom' as const, fromTitle: undefined };
+  const readOnly = resolved.mode !== 'custom';
+  const autoTrack = pickNearestBpmTrack(tracks, gen.bpm);
+
+  const selectValue = resolved.mode === 'track' && resolved.fromTitle
+    ? `track:${resolved.fromTitle}`
+    : resolved.mode;
+
+  const onSelect = (value: string) => {
+    if (value === 'auto' || value === 'custom') onSelectionChange({ mode: value });
+    else onSelectionChange({ mode: 'track', selectedTitle: value.slice('track:'.length) });
+  };
+
+  return (
+    <div className="px-3 py-2 rounded-lg bg-white/5 border border-zinc-200 dark:border-white/5">
+      <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">
+        MM3 Caption <span className="text-zinc-600 normal-case tracking-normal">— MiniMax-Music3 Structured Caption</span>
+      </label>
+
+      {mm3Mode && (
+        hasTracks ? (
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-[10px] text-zinc-500 uppercase tracking-wider flex-shrink-0">
+              {t('lyric.mm3CaptionSource', 'Caption source')}
+            </span>
+            <select
+              value={selectValue}
+              onChange={e => onSelect(e.target.value)}
+              className="flex-1 min-w-0 px-2 py-1 rounded-lg bg-white/5 border border-zinc-300 dark:border-white/10 text-xs text-zinc-700 dark:text-zinc-300 focus:outline-none focus:border-cyan-500/50 transition-colors"
+            >
+              <option value="auto">
+                {t('lyric.mm3CaptionAuto', 'Automatic from dataset')}
+                {autoTrack ? ` (${t('lyric.mm3CaptionNearestTempo', 'nearest tempo')}: ${autoTrack.title})` : ''}
+              </option>
+              {tracks.map(track => (
+                <option key={track.title} value={`track:${track.title}`}>
+                  {t('lyric.mm3CaptionTrack', 'Track')}: {track.title}{track.bpm ? ` · ${track.bpm} BPM` : ''}
+                </option>
+              ))}
+              <option value="custom">{t('lyric.mm3CaptionCustom', "Custom (this song's own caption)")}</option>
+            </select>
+          </div>
+        ) : (
+          <p className="text-[10px] text-amber-400/70 mb-2">
+            {t('lyric.mm3CaptionNoTracks', 'No source track on this album has an MM3 caption — using this song’s own caption.')}
+          </p>
+        )
+      )}
+
+      {readOnly ? (
+        <>
+          <textarea
+            key={`mm3-resolved-${gen.id}`}
+            readOnly
+            className="w-full bg-transparent text-xs font-mono text-zinc-500 dark:text-zinc-500 focus:outline-none border-b border-transparent resize-y cursor-default"
+            rows={6}
+            value={resolved.caption}
+          />
+          <p className="text-[10px] text-cyan-400/70 mt-1">
+            {t('lyric.mm3CaptionFromTrack', 'From dataset track')}: {resolved.fromTitle}
+          </p>
+        </>
+      ) : (
+        <textarea
+          key={`mm3-custom-${gen.id}`}
+          className="w-full bg-transparent text-xs font-mono text-zinc-700 dark:text-zinc-300 focus:outline-none border-b border-transparent hover:border-white/20 focus:border-cyan-500/50 transition-colors resize-y"
+          rows={gen.caption_mm3 ? 6 : 2}
+          placeholder="None — written before this field existed, or the MM3 caption call failed. The MM3 backend will fall back to the caption above."
+          defaultValue={gen.caption_mm3 || ''}
+          onBlur={e => { if (e.target.value !== (gen.caption_mm3 || '')) onSaveCustom(e.target.value); }}
+        />
+      )}
+    </div>
+  );
+};
+
 interface WrittenSongsTabProps {
   generations: Generation[];
   profiles: Profile[];
+  /** Album source tracks that carry an MM3 caption, in album order. */
+  mm3SourceTracks?: Mm3SourceTrack[];
   onRefresh: () => void;
   onGenerateAudio: (gen: Generation) => void;
   onSendToCreate?: (gen: Generation) => void;
@@ -62,8 +172,8 @@ interface WrittenSongsTabProps {
 }
 
 export const WrittenSongsTab: React.FC<WrittenSongsTabProps> = ({
-  generations, profiles, onRefresh, onGenerateAudio, onSendToCreate, onViewRecordings, showToast,
-  generationModel, refinementModel,
+  generations, profiles, mm3SourceTracks = [], onRefresh, onGenerateAudio, onSendToCreate,
+  onViewRecordings, showToast, generationModel, refinementModel,
 }) => {
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const { t } = useTranslation();
@@ -71,6 +181,21 @@ export const WrittenSongsTab: React.FC<WrittenSongsTabProps> = ({
   const [refiningId, setRefiningId] = useState<number | null>(null);
   const [genCount, setGenCount] = useState(1);
   const [userSubject, setUserSubject] = useState('');
+
+  // ── MM3 caption source ──
+  // The choice has no column to live in, so it is per-generation localStorage.
+  // This map is only a render mirror of that: absent means "not touched this
+  // session", and the stored value (default Automatic) is read on demand.
+  const mm3Mode = useBackendStore(s => s.activeBackendId) === MM3_BACKEND_ID;
+  const [captionSelections, setCaptionSelections] = useState<Record<number, Mm3CaptionSelection>>({});
+  const captionSelectionFor = useCallback(
+    (genId: number): Mm3CaptionSelection => captionSelections[genId] ?? readMm3CaptionSelection(genId),
+    [captionSelections],
+  );
+  const setCaptionSelectionFor = useCallback((genId: number, sel: Mm3CaptionSelection) => {
+    writeMm3CaptionSelection(genId, sel);
+    setCaptionSelections(prev => ({ ...prev, [genId]: sel }));
+  }, []);
 
   // Persistent streaming state — survives tab navigation
   const streaming = useStreamingStore();
@@ -407,31 +532,19 @@ export const WrittenSongsTab: React.FC<WrittenSongsTabProps> = ({
                         />
                       </div>
 
-                      {/* Editable MM3 caption — a genuinely different caption, not a
-                          reformatting of the one above. MiniMax-Music3 was trained on
-                          a three-heading Structured Caption and lands off-genre when
-                          handed an ACE-Step caption instead. */}
-                      <div className="px-3 py-2 rounded-lg bg-white/5 border border-zinc-200 dark:border-white/5">
-                        <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">
-                          MM3 Caption <span className="text-zinc-600 normal-case tracking-normal">— MiniMax-Music3 Structured Caption</span>
-                        </label>
-                        {gen.caption_mm3 ? (
-                          <textarea
-                            className="w-full bg-transparent text-xs font-mono text-zinc-700 dark:text-zinc-300 focus:outline-none border-b border-transparent hover:border-white/20 focus:border-cyan-500/50 transition-colors resize-y"
-                            rows={6}
-                            defaultValue={gen.caption_mm3}
-                            onBlur={(e) => { if (e.target.value !== (gen.caption_mm3 || '')) handleSaveField(gen.id, 'caption_mm3', e.target.value); }}
-                          />
-                        ) : (
-                          <textarea
-                            className="w-full bg-transparent text-xs font-mono text-zinc-700 dark:text-zinc-300 focus:outline-none border-b border-transparent hover:border-white/20 focus:border-cyan-500/50 transition-colors resize-y"
-                            rows={2}
-                            placeholder="None — written before this field existed, or the MM3 caption call failed. The MM3 backend will fall back to the caption above."
-                            defaultValue=""
-                            onBlur={(e) => { if (e.target.value.trim()) handleSaveField(gen.id, 'caption_mm3', e.target.value); }}
-                          />
-                        )}
-                      </div>
+                      {/* MM3 caption — a genuinely different caption, not a reformatting
+                          of the one above. MiniMax-Music3 was trained on a three-heading
+                          Structured Caption and lands off-genre when handed an ACE-Step
+                          caption instead. On MM3 it also carries a SOURCE control; see
+                          Mm3CaptionField. */}
+                      <Mm3CaptionField
+                        gen={gen}
+                        mm3Mode={mm3Mode}
+                        tracks={mm3SourceTracks}
+                        selection={captionSelectionFor(gen.id)}
+                        onSelectionChange={sel => setCaptionSelectionFor(gen.id, sel)}
+                        onSaveCustom={value => handleSaveField(gen.id, 'caption_mm3', value)}
+                      />
 
                       {/* Action buttons */}
                       <div className="flex items-center gap-2 flex-wrap">

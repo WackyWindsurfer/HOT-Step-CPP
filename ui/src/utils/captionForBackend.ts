@@ -18,15 +18,29 @@
  * ACE caption, because degraded conditioning beats no conditioning — every
  * generation written before this field existed is in that state. The reverse
  * never happens; an ACE run is never handed a Structured Caption.
+ *
+ * On the MM3 side `caption_mm3` is no longer automatically the one that renders.
+ * A written song's MM3 caption has a SOURCE — by default one of the artist's own
+ * training tracks, picked by tempo — because reusing a training caption verbatim
+ * is what reliably lands in the band's style and reaches a natural ending. See
+ * utils/mm3CaptionSource.ts. Pass the album's `lyricsSetId` so that choice can be
+ * resolved; without one this degrades to the song's own caption, i.e. the
+ * behaviour above.
  */
+
+import { resolveMm3CaptionForGeneration } from './mm3CaptionSource';
 
 /** The registered id of the MiniMax-Music3 backend (server/src/services/backends/registry.ts). */
 export const MM3_BACKEND_ID = 'minimax-m3';
 
 export function captionForBackend(
-  gen: { caption?: string | null; caption_mm3?: string | null },
+  gen: { id?: number; bpm?: number; caption?: string | null; caption_mm3?: string | null },
   backendId: string | undefined,
+  lyricsSetId?: number,
 ): string {
-  if (backendId === MM3_BACKEND_ID && gen.caption_mm3?.trim()) return gen.caption_mm3;
+  if (backendId === MM3_BACKEND_ID) {
+    const resolved = resolveMm3CaptionForGeneration(gen, lyricsSetId);
+    if (resolved.caption.trim()) return resolved.caption;
+  }
   return gen.caption || '';
 }

@@ -1169,8 +1169,14 @@ async function _executeItem(item: AudioQueueItem, token: string): Promise<void> 
   // backend field entirely (routes/generate.ts), so a queue item submitted after
   // the user switched backends runs on the NEW backend. Matching the snapshot
   // here would hand MM3 the ACE caption in exactly that case.
+  //
+  // The lyrics-set id is what lets the MM3 side resolve the song's caption
+  // SOURCE — automatic-by-tempo from the album's own captioned tracks, a
+  // specific track, or the song's own caption (utils/mm3CaptionSource.ts).
+  // Items from Create/Cover Studio carry lyricsSetId 0 and simply get the
+  // song's own caption.
   const backendId = useBackendStore.getState().activeBackendId;
-  params.caption = captionForBackend(gen, backendId);
+  params.caption = captionForBackend(gen, backendId, item.lyricsSetId);
   params.title = gen.title || '';
   params.instrumental = false;
   // Duration is an ACE-only field now.

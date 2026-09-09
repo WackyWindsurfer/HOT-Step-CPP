@@ -33,6 +33,10 @@ interface ContentSectionProps {
   onAutoExpandChange: (v: boolean) => void;
   /** Seed for manual wildcard expansion; undefined = random per click */
   wildcardSeed?: number;
+  /** Caption is resolved elsewhere and must not be typed over — currently the
+   *  MM3 "caption source" control, which renders under a dataset track's own
+   *  Structured Caption. Visibly dimmed, not merely inert. */
+  captionReadOnly?: boolean;
 }
 
 export const ContentSection: React.FC<ContentSectionProps> = ({
@@ -45,6 +49,7 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
   introBars, onIntroBarsChange,
   autoExpand, onAutoExpandChange,
   wildcardSeed,
+  captionReadOnly = false,
 }) => {
   const { t } = useTranslation();
   const hasMetadata = !!(title || artist || subject);
@@ -95,7 +100,7 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
             {t('contentSection.styleDescription')}
           </label>
           <div className="flex items-center gap-1.5">
-            {hasWildcards(caption) && (
+            {!captionReadOnly && hasWildcards(caption) && (
               <button
                 onClick={() => expandField(styleRef, onCaptionChange)}
                 className="text-[9px] px-1.5 py-0.5 rounded font-mono bg-pink-500/10 text-pink-600 dark:bg-pink-900/40 dark:text-pink-300 hover:bg-pink-500/20 dark:hover:bg-pink-700/60 transition-colors"
@@ -108,11 +113,16 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
         </div>
         <textarea
           ref={styleRef}
-          className="w-full px-3 py-2.5 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-white/10 text-sm text-zinc-800 dark:text-zinc-200 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 dark:text-zinc-400 dark:placeholder:text-zinc-600 focus:border-pink-500/50 focus:ring-1 focus:ring-pink-500/20 outline-none resize-none transition-colors"
+          readOnly={captionReadOnly}
+          className={`w-full px-3 py-2.5 rounded-xl border border-zinc-300 dark:border-white/10 text-sm placeholder:text-zinc-400 dark:placeholder:text-zinc-600 outline-none resize-none transition-colors ${
+            captionReadOnly
+              ? 'bg-zinc-100 dark:bg-zinc-900/50 text-zinc-500 dark:text-zinc-500 font-mono text-xs cursor-default'
+              : 'bg-white dark:bg-zinc-900 text-zinc-800 dark:text-zinc-200 focus:border-pink-500/50 focus:ring-1 focus:ring-pink-500/20'
+          }`}
           placeholder="Dreamy indie folk, warm acoustic guitar, soft female vocals, intricate fingerpicking..."
           value={caption}
           onChange={e => onCaptionChange(e.target.value)}
-          rows={3}
+          rows={captionReadOnly ? 8 : 3}
         />
       </div>
 

@@ -16,6 +16,11 @@ import type { Generation, Profile, AlbumPreset } from '../../services/lireekApi'
 import { resolveDuration } from '../../utils/estimateDuration';
 import { useGlobalParamsStore } from '../../stores/globalParamsStore';
 import { captionForBackend, MM3_BACKEND_ID } from '../../utils/captionForBackend';
+import {
+  MM3_CAPTION_SOURCES_KEY, clearMm3CaptionSources,
+  readMm3CaptionSelection, readMm3SourceTracks,
+  type Mm3CaptionSourcesHandoff,
+} from '../../utils/mm3CaptionSource';
 import { normalizeKeyScale } from '../../utils/keyScale';
 import { useLmAdapterEnabled } from '../../utils/lmAdapterPref';
 import { useBackendStore } from '../../stores/backendStore';
@@ -46,8 +51,28 @@ export function useAudioGeneration({ profiles, showToast: _showToast }: UseAudio
     // Content. The caption box holds ONE caption, so which of the generation's
     // two goes in it depends on the backend that is about to render it.
     const backendId = useBackendStore.getState().activeBackendId;
-    write('hs-caption', captionForBackend(gen, backendId));
+    const lyricsSetId = profile?.lyrics_set_id;
+    write('hs-caption', captionForBackend(gen, backendId, lyricsSetId));
     write('hs-lyrics', gen.lyrics || '');
+
+    // MM3 caption SOURCE — hand the Create panel everything it needs to offer
+    // the same three-way control (automatic by tempo / a named source track /
+    // this song's own caption) without a server call of its own. The tracks
+    // were cached when the album loaded in Lyric Studio; an album that has no
+    // captioned tracks hands over an empty list, which the panel reads as
+    // "custom only". Cleared outright on ACE so a stale MM3 handoff cannot
+    // resurface the control after a backend switch.
+    if (backendId === MM3_BACKEND_ID) {
+      const sel = readMm3CaptionSelection(gen.id);
+      write(MM3_CAPTION_SOURCES_KEY, {
+        mode: sel.mode,
+        selectedTitle: sel.selectedTitle,
+        customCaption: gen.caption_mm3 || '',
+        tracks: readMm3SourceTracks(lyricsSetId),
+      } satisfies Mm3CaptionSourcesHandoff);
+    } else {
+      clearMm3CaptionSources();
+    }
     write('hs-instrumental', false);
 
     // Song info (Title / Artist / Subject)
