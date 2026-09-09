@@ -81,7 +81,6 @@ interface FormState {
   prefixN: number;
   /** '' = auto-pick (server-side ladder — see mm3Preview.ts). */
   previewSongId: string;
-  sharedCaption: string;
   gradAccum: number;
   seed: number;
   trigger: string;
@@ -211,7 +210,6 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
     artistTokenLr: status.defaults.artistTokenLr ?? 0.005,
     prefixN: status.defaults.prefixN ?? 0,
     previewSongId: '',
-    sharedCaption: status.sharedCaption ?? '',
     gradAccum: status.defaults.gradAccum ?? 1,
     seed: status.defaults.seed ?? 42,
     trigger: trigger ?? '',
@@ -333,7 +331,6 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
         depthLossWeight: form.depthLossWeight, depthLossFrames: form.depthLossFrames,
         optimizer: form.optimizer, muonLrScale: form.muonLrScale,
         adapterType: form.adapterType, lokrFactor: form.lokrFactor,
-        sharedCaption: form.sharedCaption,
         gradAccum: form.gradAccum, seed: form.seed,
         basePrecision: form.basePrecision, holdout: form.holdout, evalEvery: form.evalEvery,
         cropAnchor: form.cropAnchor,
@@ -899,26 +896,9 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                   <NumField label={t('trainingStudio.mm3.seed', 'Seed')} value={form.seed}
                     onChange={v => set('seed', v)} />
                 </div>
-                <label className="flex flex-col gap-1">
-                  <span className="text-[11px] font-medium text-zinc-500 uppercase tracking-wider">
-                    {t('trainingStudio.mm3.sharedCaption', 'Dataset-wide caption (fallback)')}
-                  </span>
-                  <textarea className={INPUT} rows={4} value={form.sharedCaption}
-                    placeholder={'artist name, album name, genre, guitar character, vocal character, '
-                      + 'rhythm section, production character, tempo, structure'}
-                    onChange={e => set('sharedCaption', e.target.value)} />
-                  <span className="text-[10px] text-zinc-500 leading-snug">
-                    {t('trainingStudio.mm3.sharedCaptionHint',
-                      'LEAVE BLANK to train on the per-track .mm3.txt captions generated in the '
-                      + 'Enhance panel with MOSS or Gemini, which is the intended input. Fill this in '
-                      + 'only as a fallback for a dataset without them: ONE caption then replaces '
-                      + 'every track\'s caption, so the adapter has nowhere to put the style except '
-                      + 'into itself and the caption becomes the handle that summons the album. '
-                      + 'Start with the artist name so it doubles as the trigger. Aim for 60-80 '
-                      + 'tokens of comma-separated descriptors. Saved to _shared-caption.txt beside '
-                      + 'the dataset.')}
-                  </span>
-                </label>
+                {/* The dataset-wide caption box lived here until 2026-09-09. One caption for
+                    every track replaced the per-track .mm3.txt captions the renders use, and
+                    adapters trained that way did not end songs (Green Day 0/6 vs 4/6). Removed. */}
                 {/* ── Method row (2026-09-05) ───────────────────────────────
                     Same shape as TrainDitForm's DitMethod / TrainLmForm's
                     LmMethod: LoKr is its own type, DoRA/HiRA/LoHa/HRA are the

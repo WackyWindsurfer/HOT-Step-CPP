@@ -1783,18 +1783,9 @@ router.get('/datasets/:id/mm3', async (req: Request, res: Response) => {
       }
     } catch { /* engine down or CPU-only — leave it unknown */ }
 
-    // The dataset-wide caption, so the form can show what is actually in force
-    // rather than an empty box that silently means "use per-song captions".
-    let sharedCaption = '';
-    try {
-      const p = path.join(path.dirname(ds.datasetJsonPath || ''), '_shared-caption.txt');
-      if (ds.datasetJsonPath && fs.existsSync(p)) sharedCaption = fs.readFileSync(p, 'utf-8').trim();
-    } catch { /* unreadable — treat as absent */ }
-
     res.json({
       codesDir,
       codes,
-      sharedCaption,
       encoder,
       // Reported separately because the two stages need different files: the
       // codes job wants the encoders, training wants the F16 LM + depth.
@@ -1850,7 +1841,7 @@ router.get('/datasets/:id/mm3', async (req: Request, res: Response) => {
       previewSongs: (() => {
         try {
           return listMm3PreviewCandidates(ds.datasetJsonPath, ds.sourceDir,
-            path.join(codesDir, 'codes'), MM3_LM_DEFAULTS.holdout, sharedCaption || undefined);
+            path.join(codesDir, 'codes'), MM3_LM_DEFAULTS.holdout);
         } catch { return []; }
       })(),
     });
@@ -2143,38 +2134,33 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
         : D.cropMode;
     const runName   = mm3RunName(ds.slug);
     // Per-track `<stem>.mm3.txt` captions (Enhance panel: MOSS or Gemini) are
-    // the intended input. One shared caption for the whole album is the
-    // FALLBACK for datasets without them. Convention: `_shared-caption.txt`
-    // beside the dataset.
-    const sharedCaptionPath = (() => {
-      if (typeof b.captionFile === 'string' && b.captionFile.trim()) return b.captionFile.trim();
-      const p = path.join(captionsDir, '_shared-caption.txt');
-      // A caption submitted with the job WINS and is persisted, so the file the
-      // engine reads, the preview renderer and any hand-run command all agree.
-      const typed = typeof b.sharedCaption === 'string' ? b.sharedCaption.trim() : '';
-      if (typed) {
-        try {
-          fs.writeFileSync(p, typed + '\n', 'utf-8');
-        } catch (e: any) {
-          throw new Error(`cannot write the shared caption to ${p}: ${e?.message || e}`);
-        }
-        return p;
-      }
-      return fs.existsSync(p) ? p : undefined;
-    })();
+    // the ONLY caption source. There used to be a dataset-wide fallback
+    // (`_shared-caption.txt`, auto-picked whenever the file existed): every
+    // row then trained on one caption the renders never use, and on Green Day
+    // that alone took natural endings from 4/6 to 0/6 (2026-09-09, GOODCAPS vs
+    // OLD). Removed as a feature; a stray file beside a dataset is ignored,
+    // and a request that still carries one is refused rather than honoured.
+    if ((typeof b.sharedCaption === 'string' && b.sharedCaption.trim())
+        || (typeof b.captionFile === 'string' && b.captionFile.trim())) {
+      res.status(400).json({
+        error: 'The dataset-wide caption was removed: it replaces every per-track caption with one the '
+             + 'renders never see, and adapters trained that way do not end songs. Generate per-track '
+             + '.mm3.txt captions in the Enhance panel instead.',
+      });
+      return;
+    }
 
     // The trainer skips every row without a `.mm3.txt` and, with no rows left,
     // exits 1 with nothing but SKIP lines in the log. A user read that as "the
     // file needs .mm3 in its name", renamed the ACE sidecars, and trained on
     // ACE captions. Count here and say what to do instead.
-    if (!sharedCaptionPath) {
+    {
       const c = countMm3Captions(ds.datasetJsonPath, captionsDir);
       if (c.total > 0 && c.captioned === 0) {
         res.status(400).json({
           error: `None of the ${c.total} tracks has a MiniMax-Music3 caption (<stem>.mm3.txt beside `
                + 'the audio). Generate them in the Enhance panel with MOSS (local) or Gemini, '
-               + 'both of which hear the audio. As a fallback, fill in the Dataset-wide caption '
-               + 'under Advanced. Renaming ACE sidecar .txt files does not work: the trainer '
+               + 'both of which hear the audio. Renaming ACE sidecar .txt files does not work: the trainer '
                + 'needs the MM3 Structured Caption format.',
         });
         return;
@@ -2304,7 +2290,7 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       evalCrop:    Math.min(num('evalCrop', D.evalCrop, 8, 9000),
                             num('maxFrames', D.maxFrames, 64, 9000)),
       rankDropout: num('rankDropout', D.rankDropout, 0, 0.9),
-      captionFile: sharedCaptionPath,
+      captionFile: undefined,
       adapterType,
       lokrFactor:  num('lokrFactor', D.lokrFactor, 1, 64),
       lokrDim:     num('lokrDim', D.lokrDim, 1, 8192),

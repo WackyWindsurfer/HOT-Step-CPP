@@ -59,9 +59,6 @@ export interface Mm3TrainLmRequest {
   optimizer?: 'muon' | 'adamw' | 'prodigy';
   /** 'lora' (default) or 'lokr'. LoKr writes lokr_weights.safetensors
    *  instead of a PEFT directory. */
-  /** One caption used for EVERY track, persisted to
-   *  <dataset>/_shared-caption.txt. Empty = per-song .mm3.txt files. */
-  sharedCaption?: string;
   adapterType?: 'lora' | 'lokr';
   lokrFactor?: number;
   lokrDim?: number;
