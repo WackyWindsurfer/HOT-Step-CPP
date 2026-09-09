@@ -15,9 +15,12 @@ interface EnhancePanelProps {
   /** Restrict the run to the grid selection when non-empty. */
   selectedSampleIds: string[];
   disabled: boolean;
+  /** A trainer owns the engine: MOSS captioning is blocked, cloud captioning
+   *  and Genius still run (network lane). */
+  engineBusy?: boolean;
 }
 
-export const EnhancePanel: React.FC<EnhancePanelProps> = ({ selectedSampleIds, disabled }) => {
+export const EnhancePanel: React.FC<EnhancePanelProps> = ({ selectedSampleIds, disabled, engineBusy = false }) => {
   const { t } = useTranslation();
   const caps = useTrainingStore(s => s.capabilities);
   const startGenius = useTrainingStore(s => s.startGenius);
@@ -146,7 +149,8 @@ export const EnhancePanel: React.FC<EnhancePanelProps> = ({ selectedSampleIds, d
                   )}
                   <button
                     onClick={() => void runCaption()}
-                    disabled={disabled || busy !== null}
+                    disabled={disabled || busy !== null || (engineBusy && isMoss)}
+                    title={engineBusy && isMoss ? t('trainingStudio.label.mossBlocked', 'MOSS needs the engine, which the running training job owns. Pick a cloud captioner or wait.') : undefined}
                     className={`${btn} bg-violet-500/10 border border-violet-500/20 text-violet-500 hover:bg-violet-500/20`}
                   >
                     {busy === 'caption' ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}

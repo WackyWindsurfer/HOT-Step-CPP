@@ -1083,6 +1083,8 @@ export interface ResolvedMm3TrainLmOptions {
   /** Style-step counterpart: score only the last N supervised rows of every
    *  style crop (SimpleTuner continuation objective, 2026-09-08). 0 = all. */
   scoreLast?: number;
+  /** Apply scoreLast to END crops only (interior crops keep every row scored). */
+  scoreLastEndOnly?: boolean;
   /** Lyrics dropout (2026-09-08): share of style steps trained on a prompt
    *  without lyrics (instrumental marker). 0/absent = never. */
   lyricsDropout?: number;
@@ -1315,7 +1317,10 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
   // Style-step knobs, independent of the prior. Until 2026-09-09 01:20 these
   // two sat inside the regularisation block above, so every no-prior run that
   // asked for them (CONT, FAITHFUL, FAITHLYD) silently trained without them.
-  if (o.scoreLast && o.scoreLast > 0) args.push('--score-last', String(o.scoreLast));
+  if (o.scoreLast && o.scoreLast > 0) {
+    args.push('--score-last', String(o.scoreLast));
+    if (o.scoreLastEndOnly) args.push('--score-last-end-only');
+  }
   if (o.lyricsDropout && o.lyricsDropout > 0) args.push('--lyrics-dropout', String(o.lyricsDropout));
   // Previews pause the trainer through a sentinel file. When they are off, say
   // so explicitly: a stray PAUSE left behind by a killed run would otherwise

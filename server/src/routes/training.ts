@@ -1112,6 +1112,22 @@ function pickTargets(
     .map(s => s.sampleId);
 }
 
+/** Per-dataset exclusivity, relaxed for labelling (Rob, 2026-09-09). A running
+ *  TRAINER (LM/DiT/MM3 trainers, audition, calibrations) reads captions and
+ *  lyrics once at load and never writes them, so a cloud captioner, Genius or
+ *  Essentia can run beside it in the network lane. Anything that needs the
+ *  engine or the card (MOSS, the legacy /understand step) stays blocked, and so
+ *  does labelling while a job that reads or writes the same files is active
+ *  (preprocess, codes, another label/enhance/build). Returns the blocking job
+ *  or undefined. */
+const TRAINER_KINDS = new Set<string>(['train-lm', 'train-dit', 'mm3-train-lm', 'audition', 'lm-calibrate', 'dit-calibrate']);
+function labelBlockedBy(datasetId: string, needsEngine: boolean): ReturnType<typeof queue.activeJobForDataset> {
+  const active = queue.activeJobForDataset(datasetId);
+  if (!active) return undefined;
+  if (needsEngine) return active;
+  return TRAINER_KINDS.has(active.kind) ? undefined : active;
+}
+
 router.post('/datasets/:id/label', async (req: Request, res: Response) => {
   try {
     const ds = repo.getDataset(req.params.id as string);
@@ -1119,12 +1135,20 @@ router.post('/datasets/:id/label', async (req: Request, res: Response) => {
       res.status(404).json({ error: 'Dataset not found' });
       return;
     }
-    if (queue.activeJobForDataset(ds.id)) {
-      res.status(409).json({ error: 'A job is already running for this dataset' });
-      return;
-    }
-
     const body = (req.body || {}) as LabelOptions;
+    {
+      const needsEngine = body.useUnderstand === true
+        || (body.useCaption !== false && body.caption?.provider === 'moss');
+      const blocker = labelBlockedBy(ds.id, needsEngine);
+      if (blocker) {
+        res.status(409).json({
+          error: needsEngine && TRAINER_KINDS.has(blocker.kind)
+            ? 'MOSS and the /understand step need the engine, which a training job owns. Wait for it, or caption with a cloud provider (Gemini) instead.'
+            : 'A job is already running for this dataset',
+        });
+        return;
+      }
+    }
     const useEssentia = body.useEssentia !== false;
     // 2026-07-27 pivot: understand is LEGACY and opt-in; the default flow is
     // Essentia + Genius + LLM caption, all engine-free.
@@ -1267,7 +1291,7 @@ router.post('/datasets/:id/enhance/genius', async (req: Request, res: Response) 
       res.status(404).json({ error: 'Dataset not found' });
       return;
     }
-    if (queue.activeJobForDataset(ds.id)) {
+    if (labelBlockedBy(ds.id, false)) {
       res.status(409).json({ error: 'A job is already running for this dataset' });
       return;
     }
@@ -1303,13 +1327,19 @@ router.post('/datasets/:id/enhance/caption', async (req: Request, res: Response)
       res.status(404).json({ error: 'Dataset not found' });
       return;
     }
-    if (queue.activeJobForDataset(ds.id)) {
-      res.status(409).json({ error: 'A job is already running for this dataset' });
-      return;
-    }
-
     const body = (req.body || {}) as CaptionOptions;
     const providerName = body.provider || config.lireek.defaultProvider;
+    {
+      const blocker = labelBlockedBy(ds.id, providerName === 'moss');
+      if (blocker) {
+        res.status(409).json({
+          error: providerName === 'moss' && TRAINER_KINDS.has(blocker.kind)
+            ? 'MOSS needs the engine, which a training job owns. Wait for it, or caption with a cloud provider (Gemini) instead.'
+            : 'A job is already running for this dataset',
+        });
+        return;
+      }
+    }
     // MOSS is not in the LLM registry — it is a local binary, not a chat API — so
     // it must be admitted BEFORE getProvider(), which throws on an unknown id.
     // Its availability check is "binary built + weights on disk", and the failure
@@ -2267,6 +2297,7 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       endCropMin:  num('endCropMin', 128, 1, 9000),
       regScoreLast: num('regScoreLast', 0, 0, 9000),
       scoreLast:    num('scoreLast', 0, 0, 9000),
+      scoreLastEndOnly: b.scoreLastEndOnly === true,
       lyricsDropout: num('lyricsDropout', 0, 0, 1),
       trimTrailingSilence: b.trimTrailingSilence === true,
       depthLossWeight: num('depthLossWeight', D.depthLossWeight, 0, 10),

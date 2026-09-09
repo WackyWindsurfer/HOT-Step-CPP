@@ -635,6 +635,12 @@ struct MM3LmTrainArgs {
      *  and its adapters end songs ~30-67% of the time where ours never do; this
      *  ports that half of the objective. 0 = every row (today's behaviour). */
     int         score_last = 0;
+    /** --score-last-end-only (2026-09-09): apply --score-last to END crops
+     *  only. Interior crops keep every row scored, so the style supervision
+     *  that FAITHSL threw away (6/6 endings, zero likeness) stays intact, and
+     *  the ending still gets its concentrated share on the crops that hold
+     *  one. */
+    bool        score_last_end_only = false;
     /** Where the captured base distributions live. Empty = <reg-codes>/../prior,
      *  so a second run over the same corpus reuses them. */
     std::string reg_prior_dir;
@@ -3911,11 +3917,13 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                 smp.n_masked = (int) (P + lead);
                 smp.n_prompt = (int) P;
                 smp.s_tr     = (int) n_sup;
-                if (!prior && a.score_last > 0 && (int) n_sup > a.score_last) {
+                if (!prior && a.score_last > 0 && (int) n_sup > a.score_last &&
+                    (!a.score_last_end_only || at_end)) {
                     // --score-last: the earlier rows stay as input context and
                     // leave the loss; same column arithmetic as the head.
                     const int skip = (int) n_sup - a.score_last;
                     smp.n_masked += skip;
+                    smp.col_skip  = skip;   // the depth loss indexes by crop frame
                     smp.s_tr      = a.score_last;
                     smp.targets.assign(tgt.begin() + skip, tgt.begin() + skip + a.score_last);
                 }

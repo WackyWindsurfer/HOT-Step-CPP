@@ -55,10 +55,21 @@ export const LabelPanel: React.FC = () => {
 
   const selCount = selectedSampleIds.size;
   const jobRunning = !!activeJob && (activeJob.status === 'queued' || activeJob.status === 'running');
+  // A running TRAINER no longer blocks labelling (server rule, 2026-09-09):
+  // cloud captioning, Genius and Essentia run in the network lane beside it.
+  // Only MOSS and the legacy /understand step need the engine, and only those
+  // keep the button disabled while a trainer runs. Any other active job
+  // (preprocess, codes, another label) still blocks, as before.
+  const TRAINER_KINDS = ['train-lm', 'train-dit', 'mm3-train-lm', 'audition', 'lm-calibrate', 'dit-calibrate'];
+  const trainerRunning = jobRunning && TRAINER_KINDS.includes(String(activeJob?.kind));
   const effectiveEssentia = useEssentia && essentiaOk;
   const effectiveGenius = useGenius && geniusOk;
   const effectiveCaption = useCaption && captionOk;
   const anyStep = effectiveEssentia || effectiveGenius || effectiveCaption;
+  // What this run would need the engine for: MOSS captioning. (The legacy
+  // /understand step is not offered by this panel.)
+  const needsEngine = effectiveCaption && (captionProvider || (mossOk ? 'moss' : '')) === 'moss';
+  const blockedByJob = trainerRunning ? needsEngine : jobRunning;
 
   const handleStart = async () => {
     setStarting(true);
@@ -233,7 +244,8 @@ export const LabelPanel: React.FC = () => {
 
         <button
           onClick={() => void handleStart()}
-          disabled={jobRunning || starting || !anyStep}
+          disabled={blockedByJob || starting || !anyStep}
+          title={trainerRunning && needsEngine ? t('trainingStudio.label.mossBlocked', 'MOSS needs the engine, which the running training job owns. Pick a cloud captioner or wait.') : undefined}
           className="self-start flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
         >
           {starting ? <Loader2 size={15} className="animate-spin" /> : <Play size={15} />}
@@ -243,7 +255,7 @@ export const LabelPanel: React.FC = () => {
 
       <JobProgress />
 
-      <EnhancePanel selectedSampleIds={Array.from(selectedSampleIds)} disabled={jobRunning} />
+      <EnhancePanel selectedSampleIds={Array.from(selectedSampleIds)} disabled={jobRunning && !trainerRunning} engineBusy={trainerRunning} />
     </div>
   );
 };
