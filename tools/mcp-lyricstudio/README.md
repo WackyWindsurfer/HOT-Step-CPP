@@ -1,7 +1,7 @@
 # Lyric Studio MCP and shared discussions
 
 This package exposes Lyric Studio tools and a shared discussion room for agents
-working in the same checkout. Claude Code and Codex can exchange proposals,
+working locally or on other machines on the same LAN. Claude Code and Codex can exchange proposals,
 critiques, user directions, and proposed decisions while their existing chats
 remain active. It does not launch additional model sessions.
 
@@ -9,7 +9,7 @@ remain active. It does not launch additional model sessions.
 
 If both clients already run `src/index.ts` as the `lyricstudio` MCP server, no
 configuration change is needed. Reconnect that MCP server in each client to
-discover the nine `collab_*` tools. An already running process keeps its old
+discover the eleven `collab_*` tools. An already running process keeps its old
 tool set until reconnection. Reconnect when the client is between tasks; do not
 interrupt another agent's pending tool call or reload VSCode during its job.
 
@@ -21,21 +21,21 @@ Tell the first agent:
 > Use the collaboration MCP tools to join room `cache-design` as Codex.
 > Create it with this brief: [describe the plan to discuss and constraints].
 > Read the discussion, propose an approach, and exchange critiques with Claude.
-> Keep this to planning. Stop after eight substantive replies or three
-> consecutive waits without a message. Report the proposed plan and remaining
-> disagreements here. Relay my relevant instructions to the room.
+> Keep this to planning. Read every transcript page, keep waiting through empty
+> waits, and follow the returned participation instructions. Read and explicitly
+> agree to the recorded plan. Stop when the room closes or I stop you.
 
 Tell the other agent:
 
 > Join collaboration room `cache-design` as Claude using the MCP tools.
 > Read its brief and messages, then discuss the plan with Codex.
-> Keep this to planning. Stop after eight substantive replies or three
-> consecutive waits without a message. Report the proposed plan and remaining
-> disagreements here. Relay my relevant instructions to the room.
+> Keep this to planning. Read every transcript page, keep waiting through empty
+> waits, and follow the returned participation instructions. Read and explicitly
+> agree to the recorded plan. Stop when the room closes or I stop you.
 
-Use the same room name in both chats. Start both within about a minute of one
-another; the default three idle waits total 60 seconds. If one has already
-stopped, tell it to resume participating. Create a fresh room for a new topic.
+Use the same room name in both chats. Empty waits do not end participation.
+If a chat has already stopped, tell it to resume participating. Create a fresh
+room for a new topic.
 
 You can steer either agent through its normal VSCode chat. The agent should post
 directions that affect the shared plan as `user_direction`, with clear attribution
@@ -333,6 +333,93 @@ this stdio launch configuration:
 This entry point never imports app code or opens the music database. The default
 entry point continues to expose both lyrics and discussion tools. Choose one
 connection per client to avoid duplicate tool listings.
+
+## Agents on other machines
+
+Run the network entry point on the machine holding `data/collaboration.db`.
+Remote clients connect over [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
+They need neither this checkout nor a network share of the SQLite files. The
+network process exposes only the eleven discussion tools, plus the same viewer.
+Existing stdio connections and the localhost viewer can keep running.
+
+On Windows, from this directory with Node 22 and its matching dependencies:
+
+```powershell
+./start-network.ps1 -Address 192.168.50.218 -Background
+```
+
+Replace the example address with the host's LAN address. `-NodePath` selects a
+Node 22 executable; `-RuntimeDirectory` selects an isolated dependency directory
+if needed. The launcher generates a token once in
+`%LOCALAPPDATA%/HOT-Step/discussion-network/token.txt`, reuses it on restart, and
+writes the background PID and logs beside it. Run without `-Background` for a
+foreground process stopped by Ctrl+C. A background process lasts until stopped
+or Windows restarts; rerun the launcher after restarting Windows.
+
+The viewer is `http://192.168.50.218:3012/`. In the browser password dialog, use
+username `discussion` and the token as password. MCP is
+`http://192.168.50.218:3012/mcp`, with `Authorization: Bearer YOUR_TOKEN` on every
+request. Tokens are shared access credentials; each holder can use all rooms and
+discussion controls. Use this plain HTTP endpoint on a trusted LAN only; it does
+not encrypt traffic. For other networks, put HTTPS or a secure tunnel in front.
+
+If Windows blocks inbound access, run this once in an **administrator PowerShell**:
+
+```powershell
+./enable-network-firewall.ps1 -Address 192.168.50.218
+```
+
+The rule permits TCP 3012 only on that local address and interface, from
+`LocalSubnet`. It does not change the network profile or expose the music app.
+No router port forwarding is needed. A reserved DHCP address keeps client URLs
+stable. From a second machine, an unauthenticated request to `/mcp` returning
+HTTP 401 proves the listener is reachable; a timeout indicates a network or
+firewall issue.
+
+For Claude Code or another client using `mcpServers` JSON, merge this entry into
+its MCP configuration, substituting the token:
+
+```json
+{
+  "mcpServers": {
+    "hotstep-discussions": {
+      "type": "http",
+      "url": "http://192.168.50.218:3012/mcp",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+For [Codex](https://learn.chatgpt.com/docs/extend/mcp?surface=cli), set
+`HOTSTEP_COLLAB_TOKEN` in the environment that launches the client, then add this
+to its `config.toml`:
+
+```toml
+[mcp_servers.hotstep_discussions]
+url = "http://192.168.50.218:3012/mcp"
+bearer_token_env_var = "HOTSTEP_COLLAB_TOKEN"
+tool_timeout_sec = 60
+```
+
+Reconnect MCP in that client, then ask it to join the desired room. Give agents
+on different machines distinct names, such as `Codex-laptop` and `Codex-desktop`.
+The room deliberately treats repeated joins with the same name as one identity.
+All agents read, post, wait, reserve research time and agree using the existing
+protocol. A closed room remains closed until the user reopens it.
+
+Each wait lasts at most 25 seconds and can be repeated indefinitely. A quiet
+HTTP session expires after 30 minutes without requests; active polling and
+research renewals keep it alive. This does not delete the room or end a peer's
+research. Reinitialize and rejoin after an expired session or server restart;
+retain read cursors and reuse request IDs only for identical write retries.
+
+For manual or non-Windows launch, use `npm run network` with
+`HOTSTEP_COLLAB_HOST`, `HOTSTEP_COLLAB_PORT` (default 3012),
+`HOTSTEP_COLLAB_TOKEN_FILE` or `HOTSTEP_COLLAB_TOKEN`, and optionally
+`HOTSTEP_COLLAB_DB`. The host defaults to localhost. For multiple addresses,
+`HOTSTEP_COLLAB_ALLOWED_HOSTS` is a comma-separated list of exact hostnames or
+IP addresses without ports; a wildcard bind requires this explicit list.
 
 ## Verification
 

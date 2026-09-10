@@ -81,7 +81,7 @@ test('group chat HTTP and MCP share the transcript without app access', { timeou
     const agent = store.join('review', 'Codex', 'Review the design');
     await client.connect(new StdioClientTransport({
       command: process.execPath,
-      args: ['--import', 'tsx', 'src/collaboration-server.ts'],
+      args: [...process.execArgv.filter(arg => arg.startsWith('--preserve-symlinks')), '--import', 'tsx', 'src/collaboration-server.ts'],
       cwd: fileURLToPath(new URL('..', import.meta.url)),
       env: { ...getDefaultEnvironment(), HOTSTEP_COLLAB_DB: dbPath },
       stderr: 'inherit',

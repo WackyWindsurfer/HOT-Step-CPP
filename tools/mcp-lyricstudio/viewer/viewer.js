@@ -13,6 +13,15 @@ let sending = false;
 let roomStatus = 'active';
 let selectionVersion = 0;
 const memory = new Map();
+function requestId() {
+  // randomUUID requires HTTPS or localhost. getRandomValues also works on LAN HTTP.
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 15) | 64;
+  bytes[8] = (bytes[8] & 63) | 128;
+  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 function saved(key, value) {
   if (value !== undefined) {
     memory.set(key, value);
@@ -23,7 +32,7 @@ function saved(key, value) {
 }
 function identity(room) {
   const key = `hotstep-participant:${room}`;
-  return saved(key) || saved(key, crypto.randomUUID());
+  return saved(key) || saved(key, requestId());
 }
 
 function updateControls() {
@@ -95,7 +104,7 @@ byId('create-room').addEventListener('submit', async event => {
   let pending;
   try { pending = JSON.parse(saved(key) || 'null'); } catch { /* Replace invalid saved state. */ }
   if (!pending || pending.brief !== brief || pending.participant_id !== participant_id) {
-    pending = { room, brief, participant_id, request_id: crypto.randomUUID() };
+    pending = { room, brief, participant_id, request_id: requestId() };
   }
   saved(key, JSON.stringify(pending));
   byId('create-status').textContent = 'Creating discussion...';
@@ -152,7 +161,7 @@ async function write(endpoint, body, status, action) {
   let pending;
   try { pending = JSON.parse(saved(key) || 'null'); } catch { /* Replace an invalid saved request. */ }
   if (!pending || pending.body !== body || pending.status !== status || pending.action !== action || pending.participant_id !== content.participant_id) {
-    pending = { ...content, request_id: crypto.randomUUID() };
+    pending = { ...content, request_id: requestId() };
   }
   saved(key, JSON.stringify(pending));
   byId('send-status').textContent = 'Sending...';

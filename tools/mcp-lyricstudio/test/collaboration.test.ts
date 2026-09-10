@@ -21,7 +21,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
     clients.push(client);
     await client.connect(new StdioClientTransport({
       command: process.execPath,
-      args: ['--import', 'tsx', 'src/collaboration-server.ts'],
+      args: [...process.execArgv.filter(arg => arg.startsWith('--preserve-symlinks')), '--import', 'tsx', 'src/collaboration-server.ts'],
       cwd: packageDir,
       env: { ...getDefaultEnvironment(), HOTSTEP_COLLAB_DB: dbPath },
       stderr: 'inherit',

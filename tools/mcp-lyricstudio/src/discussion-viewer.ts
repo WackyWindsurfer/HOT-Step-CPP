@@ -1,9 +1,9 @@
-import { createServer, type IncomingMessage } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { DEFAULT_COLLAB_DB, DiscussionStore } from './collaboration.js';
 
-async function readJson(request: IncomingMessage) {
+export async function readJson(request: IncomingMessage) {
   return new Promise<unknown>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -35,7 +35,10 @@ const humanCreate = humanWrite.pick({ participant_id: true, request_id: true }).
 
 // Local group chat. Reads use read-only SQLite connections; explicit human
 // posts and status changes write only to the separate collaboration database.
-export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ?? DEFAULT_COLLAB_DB) {
+export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ?? DEFAULT_COLLAB_DB, options: {
+  allowedHostnames?: string[];
+  handleRequest?: (request: IncomingMessage, response: ServerResponse) => Promise<boolean>;
+} = {}) {
   const assetFiles: Record<string, { type: string; file: string }> = {
     '/': { type: 'text/html', file: 'index.html' },
     '/viewer.js': { type: 'text/javascript', file: 'viewer.js' },
@@ -54,16 +57,24 @@ export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ??
     };
     const address = server.address();
     const port = address && typeof address !== 'string' ? address.port : 0;
-    const hosts = [`127.0.0.1:${port}`, `localhost:${port}`];
+    const hosts = (options.allowedHostnames ?? ['127.0.0.1', 'localhost']).map(host => `${host}:${port}`);
     if (!hosts.includes(request.headers.host ?? '') || (request.headers.origin && request.headers.origin !== `http://${request.headers.host}`)) {
-      send(403, { error: 'Open this room from its localhost address.' }); return;
+      send(403, { error: 'Use the configured discussion address and a same-origin page.' }); return;
+    }
+    if (options.handleRequest) {
+      try { if (await options.handleRequest(request, response)) return; }
+      catch {
+        if (!response.headersSent) send(500, { error: 'Discussion request failed.' });
+        else response.end();
+        return;
+      }
     }
     if (request.method !== 'GET' && request.method !== 'POST') {
       response.setHeader('Allow', 'GET, POST');
       send(405, { error: 'Method not allowed.' }); return;
     }
     if (request.method === 'POST' && (request.headers.origin !== `http://${request.headers.host}` || !request.headers['content-type']?.startsWith('application/json'))) {
-      send(403, { error: 'Send messages from the local discussion page.' }); return;
+      send(403, { error: 'Send messages from the discussion page.' }); return;
     }
     let store: DiscussionStore | undefined;
     try {
