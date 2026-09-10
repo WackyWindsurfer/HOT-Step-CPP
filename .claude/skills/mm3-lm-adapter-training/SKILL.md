@@ -25,17 +25,18 @@ survives a fresh clone.
 --lm mm3-lm-q8_0.gguf
 --rank 128 --alpha 128 --adapter-type lora --hot-pizza          # HOT-PiZZA: PiSSA with principal-subspace dropout (2026-09-06)
 --pissa-frozen-f16 --pissa-cache-dir <adapters>/mm3-lm-adapters/_pissa-init-cache
---optimizer adamw --lr 8e-5 --lr-end-frac 0.005 --warmup 25    # AdamW tied Prodigy by ear, 2.3 GB lighter
---attn flash --prefix-frames 2048                              # flash + prefix compose since 7070238e; 2048 tied 4096
---max-frames 750 --crop-mode structured --crop-start-frac 0.55 --crop-end-frac 0.15
+--optimizer adamw --lr 8e-5 --lr-end-frac 0.005 --warmup 25    # AdamW tied Prodigy by ear, 2.3 GB lighter (2x LR broke vocals)
+--attn flash --prefix-frames 2048 --prefix-chunk 256           # Balanced (2026-09-09): the GOODCAPS recipe, 4/6 endings + full likeness
+--max-frames 750 --crop-mode structured --crop-start-frac 0.2 --crop-end-frac 0.15   # Fast = 300 steps, chunk 1024; Thorough = 1000 steps, prefix 4096
 --crop-start-tiles 3 --crop-anchor song
 --rank-dropout 0.1                                             # the mask IS the method under --hot-pizza; never 0
---steps 500 --save-every 50                                    # stop on STEPS: train loss reads 2.7-5 under HOT-PiZZA
+--steps 500 --save-every 50                                    # stop on STEPS: train loss reads 2.7-5 under HOT-PiZZA (Balanced; Fast = 300)
 --depth-loss-weight 1.0 --depth-loss-frames 128
-# captions: per-track <stem>.mm3.txt from MOSS/Gemini (the default input);
-# --caption-file <shared caption> is the FALLBACK when tracks have none
+# captions: per-track <stem>.mm3.txt from MOSS/Gemini, and ONLY those. No --caption-file:
+# the shared caption killed endings (0/6 vs 4/6) and was removed on 2026-09-09.
+# NO --reg-* prior by default (it was a workaround for the shared caption; costs likeness)
 --trigger "<artist>" --trigger-prepend
---holdout 0.15 --eval-every 250 --eval-crop 750
+--holdout 0.15 --eval-every 250 --eval-crop 500
 ```
 
 Previews: every 50 steps (= every checkpoint), 40 s, control + baseline off,
@@ -47,6 +48,36 @@ alk3_crimson: 4.7 s/step, 39 min for 500 steps, peak 25.9 GB — against the
 2026-09-05 LoKr/Prodigy/exact/4096 line's 5.9 s, 49 min, 30.4 GB. Every
 lever was first tied individually in a blind set, then stacked and heard.
 The earlier LoKr line stays in the git history of this file.
+
+**2026-09-07, the safe stack.** An overnight one-lever-at-a-time speed trial
+(`overnight-speed/COSTS.md` + `blind-speed/RESULTS.md` in the alk3 hub) found
+prefix 1024 (69 of 90) and crop 500 (67.5) tie the reference (68), while the
+prefill chunk 256 → 1024 cuts 17% off the step with an identical step-1 loss.
+Combined and heard blind (`blind-confirm/RESULTS.md`): safe stack 67 vs the
+crop-750 recipe 70.5, inside the ~6 noise floor, at 3.1 s/step and 26 min per
+500 steps (was 4.5 s, 37 min). That is the recipe block above. What did NOT
+survive: doubling the LR (every 2x arm 3-4 under, and a 2x-LR/300-step stack
+produced a vocal-free plan on 1 of 6 songs across two seeds) and turning the
+acoustic loss off (lowest score). Held-out loss every 50 has the same shape in
+every arm — it follows the seed's crop order, not the adapter — so it is not a
+stopping signal.
+
+**Presets (Rob, 2026-09-07, `MM3_LM_PRESETS` in mm3Train.ts, a Recipe row in
+the Training Studio card; the route lays `preset` under the request's own
+fields, so `{preset:'thorough'}` alone trains Thorough):**
+
+| preset | steps | lr | crop | history | min/album (5090) | record |
+|---|---|---|---|---|---|---|
+| Fast (EXPERIMENTAL) | 300 | 1.6e-4 | 500 | 1024 | 15 | tied blind on 90 s previews, then 5/5 full-album runs on greenday_warning had Simlish / missing vocals / an out-of-tune organ; lr and chunk cleared as sole causes |
+| **Balanced** (default) | 500 | 8e-5 | 750 | 2048 (chunk 256) | 35 | the rock-10 recipe; retrained on the same binary it reproduced the morning's adapter and Rob heard intelligible vocals |
+| Thorough | 1000 | 8e-5 | 750 | 4096 | ~80 | crop/history of the top scores (72, 70.5) at the top-scoring depth (1000 = 72 vs 68 at 500, inside noise); Rob's call over my 500 |
+
+All three share flash, AdamW, HOT-PiZZA r128, f16 factors, structured crops
+and the acoustic loss. `MM3_LM_DEFAULTS` carries the Balanced values, so an
+empty API body trains Balanced. Since 2026-09-07 the route also turns on prior
+preservation against base-model endings by default (corpus under
+`<training>/mm3-reg-corpus/base-endings-k500`, every 3rd step, steps grown by
+half so the artist keeps 500 updates); `regularisation: null` disables it.
 
 **Rob, 2026-08-25, on the LoKr configuration this replaced: "the closest we've ever gotten to
 artist replication."** Crop 750 = 30 s = ~3 s/step; he set it by ear after
@@ -622,13 +653,40 @@ keep 250-granularity checkpoints rather than assuming 2500 transfers.
   "more tracks = later optimum" trend across five albums was flatly contradicted
   by the sixth. Do not plan around it.
 
-## Captions: per-track .mm3.txt first, shared caption as the fallback
+## Captions: per-track .mm3.txt ONLY (the shared caption was removed 2026-09-09)
 
-**Rob's direction, 2026-09-03: the correct input is a per-track
+**The shared caption was the endings bug.** From 2026-08-24 the route
+auto-picked an existing `_shared-caption.txt` and the trainer replaced every
+per-track caption with it, while renders used the per-track captions. On
+Green Day the identical recipe went 0/6 natural endings (shared) to 4/6
+(per-track) with likeness Rob called perfect. Rob: "if shared captions break
+endings, we should not offer it as a feature at all." The box, the route
+fallback and the status field are gone (fdc4a970); five datasets carried the
+file (renamed `*.retired-2026-09-09`) and adapters trained from them under it
+need retraining. The prior-preservation default that had papered over it is
+off unless a corpus is named (b0eacf91).
+
+**Endings are decided by the caption x lyrics pair at render time.** Same
+adapter, same seeds: one lyric ended 1/6 under its nearest-tempo training
+caption and 4/6 under another training caption; that caption ended 4/6 with
+different lyrics too. Plans copy nothing from the training track (no shared
+run of four codes). So a training caption used word for word with new lyrics
+is a strong style prompt, which is what the caption source picker in Lyric
+Studio / Create does (Automatic = nearest tempo). Single-sentence edits flip
+a failing pair in both directions; the official templates mention fades in
+377/1000 and outros in 723/1000, so there is no banned word. The candidates
+loop (3 plans, capped ones dropped) turns a two-thirds per-plan rate into a
+96% first-round success.
+
+**Training-side ending levers all failed by ear (2026-09-09):** end-only
+score-last 0/6; score-last on all crops 2/6 + early stops, looping, pitch
+drift; lyrics dropout 0/6; FAITHSL (bghira-shape recipe + score-last) 6/6 but
+zero likeness. `--score-last` / `--score-last-end-only` exist as diagnostics
+only. Do not spend GPU re-deriving this.
+
+**Rob's direction, 2026-09-03, still the rule: the correct input is a per-track
 `<stem>.mm3.txt` Structured Caption generated in the Training Studio's Enhance
-panel with MOSS (local, hears the audio) or Gemini (hears the audio). The
-Dataset-wide caption (`_shared-caption.txt`, `--caption-file`) is a FALLBACK
-for datasets whose tracks have no `.mm3.txt`, not the recommendation.** Never
+panel with MOSS (local, hears the audio) or Gemini (hears the audio).** Never
 suggest renaming ACE sidecar `.txt` files to `.mm3.txt`: the trainer's skip
 exists because an ACE caption trains the wrong genre, and the rename also
 puts the lyrics in the prompt twice. The server now refuses a run with no
@@ -638,18 +696,9 @@ Historical note: the 2026-08-23/24 sweep found per-song MOSS captions "hardly
 worked" and shared captions bound the style better. That verdict predates the
 crop fix and the acoustic loss, and Rob's direction above supersedes it.
 
-When you DO fall back to a shared caption: ONE caption, ~60–80 tokens,
-comma-separated descriptors, **opening with the trigger** so
-`--trigger-prepend` is a no-op on the text and only the sidecar records it.
-Shape:
-
-```
-<artist>, <album> album, <genre>, <guitar/instrument character>, <vocal
-character>, <rhythm section>, <production character>, <tempo>, <structure>
-```
-
-At generation time the caption should look like the training caption. You do
-not have to type the trigger: the app adds it for you.
+At generation time the caption should look like a training caption: the
+picker's Automatic mode copies the nearest-tempo dataset track's caption
+verbatim. You do not have to type the trigger: the app adds it for you.
 
 ### The trigger is added for you, and typing it anyway is harmless
 
@@ -694,8 +743,7 @@ what the LM sees : green day, warning album, pop punk, bright major-key ...
 Passing `{skipPresent: true}` at the translateParams call site would make this
 robust; it is not done today. See
 [mm3-captioning](../mm3-captioning/SKILL.md) for the MM3 Structured Caption
-format used elsewhere — note this recipe deliberately uses the short
-comma-separated style, not the three-section format, for the *training* caption.
+format; training and rendering both use the three-section per-track format.
 
 ## Lyrics shape matters as much as the adapter
 

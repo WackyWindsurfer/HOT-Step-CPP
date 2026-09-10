@@ -101,6 +101,20 @@ export interface GenerationJob {
    *  float64, which is exactly what made three distinct takes report one seed
    *  and become individually unreproducible. */
   mm3TakeSeeds?: string[];
+  /** MM3 "require natural ending" outcome, set once the engine has finished.
+   *  Present only on a render that ran the arbitration, and only then — so
+   *  `dropped > 0` is the honest answer to "why did I ask for three and get
+   *  two?" rather than something the UI has to infer from a count. */
+  mm3Ending?: {
+    /** Candidate plans drawn across every round. */
+    planned: number;
+    /** Candidates that reached EOS and became songs. */
+    rendered: number;
+    /** Candidates that hit the frame cap and were thrown away unrendered. */
+    dropped: number;
+    /** Planning rounds it took (1 on the common path). */
+    rounds: number;
+  };
   /** Stream preview WAV files emitted by the DEMON-style ring buffer */
   streamPreviews?: Array<{
     path: string;
@@ -1741,6 +1755,10 @@ router.get('/status/:id', (req, res) => {
     // the end, which is the one thing streaming exists to avoid.
     mm3_takes: job.mm3Takes ?? 1,
     mm3_take_seeds: job.mm3TakeSeeds ?? null,
+    // Natural-ending arbitration outcome. Null until the render is done (the
+    // count is not knowable before then — see the note in
+    // backends/minimax/generate.ts), and null entirely when the toggle was off.
+    mm3_ending: job.mm3Ending ?? null,
   });
 });
 

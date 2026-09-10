@@ -12,7 +12,7 @@
  * Ported from hot-step-9000 with import path + API adaptations for the C++ engine.
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { usePersistedState } from '../../hooks/usePersistedState';
 import { lireekApi } from '../../services/lireekApi';
@@ -45,6 +45,7 @@ import { PromptEditor } from './PromptEditor';
 // streamingStore used via queue panel
 import { loadSelections } from './ProviderSelector';
 import { useDisguiseMode } from '../../hooks/useDisguiseMode';
+import { cacheMm3SourceTracks, collectMm3SourceTracks } from '../../utils/mm3CaptionSource';
 
 
 // ── URL helpers ──────────────────────────────────────────────────────────────
@@ -572,6 +573,20 @@ export const LyricStudioV2: React.FC = () => {
 
   const sourceLyricsCount = nav.selectedAlbum ? parseSongs(nav.selectedAlbum.songs).length : 0;
 
+  // ── MM3 caption sources ──
+  // The album's own source tracks that carry an MM3 Structured Caption. A
+  // written song renders under ONE of these by default (nearest tempo), which
+  // is what reliably lands in the band's style and reaches a natural ending.
+  // Cached to localStorage because the two render paths — the audio queue and
+  // Send-to-Create — are plain modules with no access to this component's data.
+  const mm3SourceTracks = useMemo(
+    () => (nav.selectedAlbum ? collectMm3SourceTracks(parseSongs(nav.selectedAlbum.songs)) : []),
+    [nav.selectedAlbum],
+  );
+  useEffect(() => {
+    if (nav.selectedAlbum) cacheMm3SourceTracks(nav.selectedAlbum.id, mm3SourceTracks);
+  }, [nav.selectedAlbum?.id, mm3SourceTracks]);
+
   // Queue open helper
   const openQueuePanel = useCallback(async () => {
     try {
@@ -746,6 +761,7 @@ export const LyricStudioV2: React.FC = () => {
                     )}
                     {activeTab === 'written-songs' && (
                       <WrittenSongsTab generations={generations} profiles={profiles}
+                        mm3SourceTracks={mm3SourceTracks}
                         onRefresh={refreshAlbumData} onGenerateAudio={handleGenerateAudio}
                         onSendToCreate={handleSendToCreate}
                         onViewRecordings={(genId) => {

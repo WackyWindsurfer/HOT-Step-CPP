@@ -36,10 +36,25 @@ import {
 } from '../../stores/audioGenQueueStore';
 import type { GenerationParams } from '../../types';
 import { VOCAL_LANGUAGES } from '../../constants/languages';
+import { useBackendStore } from '../../stores/backendStore';
+import { MM3_BACKEND_ID } from '../../utils/captionForBackend';
 import { CoverArtSubjectSection } from '../shared/CoverArtSubjectSection';
 
 type LyricMode = 'instrumental' | 'lyrics' | 'lyrics-ai';
 type Phase = 'input' | 'inspiring' | 'preview' | 'generating';
+
+/** True when the render about to be submitted will run on MiniMax-Music3.
+ *
+ *  MM3 has no length input: a duration becomes a frame cap and nothing else, so
+ *  the LLM's estimate can only cut the planner's own ending off. Every MM3
+ *  render is auto, enforced server-side in backends/minimax/generate.ts — this
+ *  just keeps the estimate out of the request in the first place.
+ *
+ *  Read LIVE rather than captured, for the same reason audioGenQueueStore does:
+ *  the server routes on the ACTIVE backend at dequeue time and ignores the
+ *  request's own `backend` field. */
+const isMm3Render = (): boolean =>
+  useBackendStore.getState().activeBackendId === MM3_BACKEND_ID;
 
 interface InstaGenPanelProps {
   onSongCreated?: (song: any) => void;
@@ -327,7 +342,7 @@ export const InstaGenPanel: React.FC<InstaGenPanelProps> = ({ onSongCreated, act
     params.title = inspireResult.title || deriveTitleFromLyrics(editedLyrics) || computedCaption;
     // Include metadata from inspire result
     if (inspireResult.bpm) params.bpm = inspireResult.bpm;
-    if (inspireResult.duration) params.duration = inspireResult.duration;
+    if (inspireResult.duration && !isMm3Render()) params.duration = inspireResult.duration;
     if (inspireResult.keyScale) params.keyScale = inspireResult.keyScale;
     if (inspireResult.timeSignature) params.timeSignature = inspireResult.timeSignature;
 
@@ -478,7 +493,7 @@ export const InstaGenPanel: React.FC<InstaGenPanelProps> = ({ onSongCreated, act
             const params = buildParams(finalLyrics, resolvedCaption);
             params.title = llmTitle || deriveTitleFromLyrics(finalLyrics) || resolvedCaption;
             if (llmResult.bpm) params.bpm = llmResult.bpm;
-            if (llmResult.duration) params.duration = llmResult.duration;
+            if (llmResult.duration && !isMm3Render()) params.duration = llmResult.duration;
             if (llmResult.key) params.keyScale = llmResult.key;
             if (llmResult.timeSignature) params.timeSignature = llmResult.timeSignature;
 
@@ -579,7 +594,7 @@ export const InstaGenPanel: React.FC<InstaGenPanelProps> = ({ onSongCreated, act
         const params = buildParams(finalLyrics, finalCaption);
         params.title = llmTitle || deriveTitleFromLyrics(finalLyrics) || resolvedCaption;
         if (inspireResult.bpm) params.bpm = inspireResult.bpm;
-        if (inspireResult.duration) params.duration = inspireResult.duration;
+        if (inspireResult.duration && !isMm3Render()) params.duration = inspireResult.duration;
         if (inspireResult.keyScale) params.keyScale = inspireResult.keyScale;
         if (inspireResult.timeSignature) params.timeSignature = inspireResult.timeSignature;
 
@@ -664,7 +679,11 @@ export const InstaGenPanel: React.FC<InstaGenPanelProps> = ({ onSongCreated, act
       localStorage.setItem('hs-lyrics', JSON.stringify(editedLyrics));
       localStorage.setItem('hs-instrumental', JSON.stringify(lyricMode === 'instrumental'));
       if (inspireResult.bpm) localStorage.setItem('hs-bpm', JSON.stringify(inspireResult.bpm));
-      if (inspireResult.duration) localStorage.setItem('hs-duration', JSON.stringify(inspireResult.duration));
+      // Not in MM3 mode: the Create panel hides its duration control there, so
+      // writing one would leave a number in a box nobody can see or clear.
+      if (inspireResult.duration && !isMm3Render()) {
+        localStorage.setItem('hs-duration', JSON.stringify(inspireResult.duration));
+      }
       if (inspireResult.keyScale) localStorage.setItem('hs-keyScale', JSON.stringify(inspireResult.keyScale));
       if (inspireResult.timeSignature) localStorage.setItem('hs-timeSignature', JSON.stringify(inspireResult.timeSignature));
       if (vocalLanguage) localStorage.setItem('hs-vocalLanguage', JSON.stringify(vocalLanguage));

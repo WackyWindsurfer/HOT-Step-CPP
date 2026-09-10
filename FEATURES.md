@@ -44,7 +44,9 @@ Fine-tunes style adapters for both models on your own GPU, with no Python and no
 | **Objective evaluation** | Calibration and evaluation passes score adapters, with the score shown in the adapter picker, so the best checkpoint is identifiable rather than assumed to be the last. |
 | **Pause, resume, survive** | Runs pause and resume, batch pipelines are restart-proof and resumable from their record, and a saved plan refuses to load against the wrong model. |
 | **Audition mode** | Hear what the planner learned with zero DiT influence, A/B against the base, with the dataset's own metadata pinned so the comparison is fair. |
-| **Validated defaults** | MM3 adapter defaults follow the recipe published by the SimpleTuner author, cross-checked against our own runs: prior preservation, caption dropout to the trigger word, rank dropout, and crops anchored where they truly sit in the song. |
+| **Validated defaults** | MM3 adapter defaults are the recipe that ended songs naturally with full likeness by ear: per-track Structured Captions, HOT-PiZZA, an 82-second frozen history in front of every crop, crops anchored where they truly sit in the song, 500 steps. Faster and more thorough presets keep the same geometry. |
+| **Natural endings** | Every MiniMax-Music3 render plans three candidate songs in one batched pass, drops any that hit the length cap without ending, re-plans with fresh seeds if none did, and renders only the ones that end. On by default in the Generation dropdown; songs on this backend are always their natural length. |
+| **Caption source** | In Lyric Studio and Create, an MM3 render's caption can come from the trained dataset itself: the source track nearest in tempo (default), a chosen track, or the song's own caption. A dataset caption with new lyrics renders as a new song in the band's style. |
 | **Target-loss stopping** | Stop on a target loss measured over whole passes rather than a step count, and continue a run that already stopped. |
 
 ---

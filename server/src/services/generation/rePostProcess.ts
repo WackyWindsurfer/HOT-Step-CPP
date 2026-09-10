@@ -236,14 +236,23 @@ export function startRePostProcess(song: any, params: PostProcessParams): RePost
     [songCaption],
   );
   const stages = requestedPpStages(ppParams);
+  // Gain, a VST chain, reference mastering and the normalizer are CPU work;
+  // only StableStep, the PP-VAE re-encode, the Spectral Lifter and the Vocal
+  // Naturalizer touch the engine. A chain made only of CPU stages does not
+  // belong behind a render in the GPU lane (Rob, 2026-09-09).
+  const CPU_ONLY_STAGES = new Set(['Gain Offset', 'VST chain', 'Mastering', 'Final Normalizer']);
+  const cpuOnly = stages.length > 0 && stages.every(s => CPU_ONLY_STAGES.has(s));
+  if (cpuOnly) job.stage = 'Queued (CPU only, runs now)';
 
   startGenerationLog(jobId, 'postprocess');
   logGeneration(jobId, 'INFO', `[Post-Processing] Re-run for song ${song.id} (${song.title || 'untitled'})`);
   logGeneration(jobId, 'INFO', `[Post-Processing] Source: ${audioUrl}`);
   logGeneration(jobId, 'INFO', `[Post-Processing] Stages: ${stages.join(' -> ')}`);
   logGenerationParams(jobId, ppParams as Record<string, any>);
+  if (cpuOnly) logGeneration(jobId, 'INFO', '[Post-Processing] CPU-only chain: running beside the GPU lane');
 
-  void runOnGpuLane(async () => {
+  const lane = cpuOnly ? (fn: () => Promise<void>) => fn() : runOnGpuLane;
+  void lane(async () => {
     job.status = 'running';
     job.stage = 'Starting...';
 

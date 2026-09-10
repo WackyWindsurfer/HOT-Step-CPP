@@ -54,8 +54,13 @@ export const BackendExtensionControls: React.FC<{
     const dep = all.find((d) => d.key === key);
     return gp.backendParams?.[key] ?? dep?.default;
   };
-  const params = declared.filter((p) =>
-    !p.visible_when || String(valueOf(p.visible_when.key) ?? '') === p.visible_when.equals);
+  const params = declared.filter((p) => {
+    const vw = p.visible_when as { key: string; equals?: string; not_equals?: string } | undefined;
+    if (!vw) return true;
+    const cur = String(valueOf(vw.key) ?? '');
+    if (vw.not_equals !== undefined) return Number(cur) !== Number(vw.not_equals) && cur !== vw.not_equals;
+    return cur === vw.equals;
+  });
 
   return (
     <>

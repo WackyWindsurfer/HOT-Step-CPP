@@ -428,6 +428,29 @@ async function capabilities(): Promise<BackendCapabilities> {
         default: 1,
       },
       {
+        // ── Natural endings ──
+        //
+        // A plan either reaches EOS or runs into the frame cap, and the second
+        // one is audible: the song just stops. This spends the ensemble
+        // machinery above on that problem instead of on variety — the planner's
+        // weight read is shared across the batch, so three candidates cost
+        // nowhere near three planners, and the ones that did not end are thrown
+        // away BEFORE the expensive flow stage.
+        //
+        // Default ON, so the same `!== false` idiom as mm3ReuseAr applies in
+        // generate.ts: an untouched control sends nothing and must still mean on.
+        key: 'mm3RequireEnding',
+        type: 'toggle',
+        label: 'Require Natural Ending',
+        hint: 'Plans 3 candidates from the seed; renders only the ones that end '
+            + 'naturally, re-plans with the next seeds if none do. Candidates that run '
+            + 'to the length ceiling without an ending are dropped before the flow '
+            + 'stage, so they cost planning time only — and you get one song per '
+            + 'candidate that ended, up to 3. Off renders whatever the planner '
+            + 'produced, endings included or not.',
+        default: true,
+      },
+      {
         key: 'mm3LmTemperature',
         group: 'lm',
         type: 'slider',
@@ -481,6 +504,8 @@ async function capabilities(): Promise<BackendCapabilities> {
       },
       {
         key: 'mm3LmRepMode',
+        // Meaningless while the penalty is 1.0 (off): hidden until it is raised.
+        visible_when: { key: 'mm3LmRepPenalty', not_equals: '1' },
         group: 'lm',
         type: 'select',
         label: 'Repetition Mode',
@@ -496,6 +521,7 @@ async function capabilities(): Promise<BackendCapabilities> {
       },
       {
         key: 'mm3LmRepWindow',
+        visible_when: { key: 'mm3LmRepPenalty', not_equals: '1' },
         group: 'lm',
         type: 'slider',
         label: 'Repetition Window',

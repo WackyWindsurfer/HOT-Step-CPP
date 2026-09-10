@@ -251,7 +251,10 @@ export interface PluginParamSchema {
   // select
   options?: { value: string; label: string }[];
   // conditional visibility
-  visible_when?: { key: string; equals: string };
+  /** Show only while another param equals (or does not equal) a value,
+   *  compared as strings. `not_equals` exists for "hide when off" cases
+   *  where off is one value and on is a whole range. */
+  visible_when?: { key: string; equals?: string; not_equals?: string };
 }
 
 /** Plugin metadata from Lua plugin files */

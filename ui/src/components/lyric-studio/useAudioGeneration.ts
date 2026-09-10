@@ -15,7 +15,13 @@ import { writePersistedState } from '../../hooks/usePersistedState';
 import type { Generation, Profile, AlbumPreset } from '../../services/lireekApi';
 import { resolveDuration } from '../../utils/estimateDuration';
 import { useGlobalParamsStore } from '../../stores/globalParamsStore';
-import { captionForBackend } from '../../utils/captionForBackend';
+import { captionForBackend, MM3_BACKEND_ID } from '../../utils/captionForBackend';
+import { ensureMm3SourceTracks } from '../../utils/mm3CaptionSource';
+import {
+  MM3_CAPTION_SOURCES_KEY, clearMm3CaptionSources,
+  readMm3CaptionSelection, readMm3SourceTracks,
+  type Mm3CaptionSourcesHandoff,
+} from '../../utils/mm3CaptionSource';
 import { normalizeKeyScale } from '../../utils/keyScale';
 import { useLmAdapterEnabled } from '../../utils/lmAdapterPref';
 import { useBackendStore } from '../../stores/backendStore';
@@ -45,8 +51,30 @@ export function useAudioGeneration({ profiles, showToast: _showToast }: UseAudio
 
     // Content. The caption box holds ONE caption, so which of the generation's
     // two goes in it depends on the backend that is about to render it.
-    write('hs-caption', captionForBackend(gen, useBackendStore.getState().activeBackendId));
+    const backendId = useBackendStore.getState().activeBackendId;
+    const lyricsSetId = profile?.lyrics_set_id;
+    if (backendId === MM3_BACKEND_ID) await ensureMm3SourceTracks(lyricsSetId);
+    write('hs-caption', captionForBackend(gen, backendId, lyricsSetId));
     write('hs-lyrics', gen.lyrics || '');
+
+    // MM3 caption SOURCE — hand the Create panel everything it needs to offer
+    // the same three-way control (automatic by tempo / a named source track /
+    // this song's own caption) without a server call of its own. The tracks
+    // were cached when the album loaded in Lyric Studio; an album that has no
+    // captioned tracks hands over an empty list, which the panel reads as
+    // "custom only". Cleared outright on ACE so a stale MM3 handoff cannot
+    // resurface the control after a backend switch.
+    if (backendId === MM3_BACKEND_ID) {
+      const sel = readMm3CaptionSelection(gen.id);
+      write(MM3_CAPTION_SOURCES_KEY, {
+        mode: sel.mode,
+        selectedTitle: sel.selectedTitle,
+        customCaption: gen.caption_mm3 || '',
+        tracks: readMm3SourceTracks(lyricsSetId),
+      } satisfies Mm3CaptionSourcesHandoff);
+    } else {
+      clearMm3CaptionSources();
+    }
     write('hs-instrumental', false);
 
     // Song info (Title / Artist / Subject)
@@ -57,13 +85,15 @@ export function useAudioGeneration({ profiles, showToast: _showToast }: UseAudio
     // Metadata
     if (gen.bpm) write('hs-bpm', gen.bpm);
     if (gen.key) write('hs-keyScale', normalizeKeyScale(gen.key));
-    // Duration. resolveDuration estimates a length from the lyrics and tempo.
-    // ACE's LM is told the length and aims for it. For MM3 the number is a
-    // frame ceiling: the planner LM stops on its own EOS if that comes first.
-    // Both backends get the estimate. Sending Auto for MM3 (7d574365) meant the
-    // 300s ceiling, and the planner does not reliably stop early, so songs
-    // that should have been three minutes ran to five.
-    if (gen.duration || gen.bpm) {
+    // Duration — ACE only. resolveDuration estimates a length from the lyrics
+    // and tempo, and ACE's LM is told that length and aims for it. MM3 has no
+    // length input at all: the number becomes a frame cap, so it can only ever
+    // truncate the song. (7d574365 sent Auto for MM3 and was reverted because
+    // renders then ran to the 300s ceiling — the ending arbitration is what
+    // actually fixes that, and it makes the cap pure downside.) The Create
+    // panel hides the control in MM3 mode and the backend ignores the field, so
+    // this only avoids leaving a stale number in a box the user cannot see.
+    if (backendId !== MM3_BACKEND_ID && (gen.duration || gen.bpm)) {
       write('hs-duration', resolveDuration(gen.duration, gen.lyrics || '', gen.bpm || 120));
     }
 

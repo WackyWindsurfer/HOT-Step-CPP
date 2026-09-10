@@ -508,7 +508,7 @@ export const MM3_LM_DEFAULTS = {
   // copy, are on MM3LmTrainArgs in engine/src/train/mm3-lm-train-run.h.
   rank: 128,
   alpha: 128,
-  lr: 8e-5,
+  lr: 8e-5,     // the default (Balanced) recipe; Fast's 1.6e-4 is experimental — see MM3_LM_PRESETS
   /** 1200, down from 2500, because a step is no longer the same size. At the
    *  128-frame crop a step supervised 5 seconds; at 4272 it supervises 171, so
    *  2500 steps went from 320k supervised frames to 10.7M — 312 epochs over 8
@@ -534,7 +534,7 @@ export const MM3_LM_DEFAULTS = {
    *  250 on 2026-08-26 to give a target-loss run room to reach one; a 250-step
    *  cap would have ended almost every run before the target could bind, which
    *  is the same as not having a target. */
-  steps: 500,
+  steps: 500,   // the default (Balanced) recipe; Fast's 300 is experimental — see MM3_LM_PRESETS
   /** ── Stopping strategy ──────────────────────────────────────────────────
    *
    *  'steps', 500, since 2026-09-06 (Rob): the default method is HOT-PiZZA
@@ -638,6 +638,10 @@ export const MM3_LM_DEFAULTS = {
    *  song-structure duties the long window carried are now covered elsewhere
    *  — structured start/end crops teach openings and EOS, and the acoustic
    *  loss holds timbre. ~5.4 GB of activations at q8/r128 instead of ~19. */
+  /** 500 since 2026-09-07 (Rob): the speed trial's crop-500 arm tied crop 750
+   *  blind (67.5 vs 68 of 90) and the combined safe stack (crop 500 + prefix
+   *  1024 + prefill chunk 1024) tied the crop-750 recipe again (67 vs 70.5,
+   *  noise ~6) at 3.1 s/step against 4.5: 26 min per 500 steps instead of 37. */
   maxFrames: 750,
   /** `structured`: a fixed share of steps pinned to frame 0, a fixed share
    *  flush to the track's end, the rest random.
@@ -834,10 +838,14 @@ export const MM3_LM_DEFAULTS = {
   /** 2048 since 2026-09-06 (Rob): tied 4096 blind (71 vs 72 of 90) and takes
    *  14% off the step, 0.8 GB off the peak. The per-step cost of a prefix is
    *  the prefill through every layer, not the attention over it. */
+  /** 1024 since 2026-09-07 (Rob): tied 2048 blind (69 vs 68 of 90) and takes
+   *  another 12% off the step; part of the safe stack with crop 500. */
   prefixFrames: 2048,
   /** Prefill positions per graph. Trades host graph-build overhead against the
    *  transient attention scores of one chunk; 256 is a middle setting and has
-   *  no effect on the result, only on speed and peak. */
+   *  no effect on the result, only on speed and peak. 1024 since 2026-09-07:
+   *  3.72 vs 4.46 s/step at 256 with the same step-1 loss and peak, then
+   *  heard inside the safe stack. */
   prefixChunk: 256,
   /** Prove the prefix before training on it. Attention over [prefix ; window]
    *  is mathematically identical to one long crop covering both, so the
@@ -953,6 +961,50 @@ export const MM3_LM_DEFAULTS = {
   prefixN: 0,
 } as const;
 
+/** The three MM3 training presets. Each is a set of overrides on
+ *  MM3_LM_DEFAULTS; everything not listed is shared.
+ *
+ *   balanced  THE DEFAULT: crop 750, a 2048-frame history prefilled in
+ *             256-token chunks, 500 steps at 8e-5, per-track captions, no
+ *             prior. ~36 min per album. On 2026-09-09 this exact recipe
+ *             (GOODCAPS) gave Green Day 4/6 natural endings with likeness,
+ *             intelligibility and style Rob rated perfect; the same recipe
+ *             under the old dataset-wide caption ended 0/6.
+ *   fast      Balanced's geometry (crop 750, history 2048) over 300 steps,
+ *             with the history prefilled in 1024-token chunks: ~22 min. The
+ *             2026-09-07 Fast (crop 500, history 1024, 2x LR) broke vocals on
+ *             greenday_warning; each of those three ingredients is gone here
+ *             and the chunk size was cleared as a lever in that bisect. The
+ *             300-step depth is the one thing not re-heard since.
+ *   thorough  crop 750 and a 4096-frame history over 1000 steps, prefilled
+ *             in the verified 256-token chunks: ~85 min. The window and
+ *             history behind the highest scores recorded here (72 and 70.5
+ *             of 90); the gain over Balanced sat inside the listening noise.
+ *
+ *  MM3_LM_DEFAULTS carries the Balanced values, so an empty request and the
+ *  form's initial state are the same recipe. The route applies a named
+ *  preset UNDER the request's own fields (applyMm3Preset). */
+export type Mm3PresetName = 'fast' | 'balanced' | 'thorough';
+export const MM3_LM_DEFAULT_PRESET: Mm3PresetName = 'balanced';
+export const MM3_LM_PRESETS: Record<Mm3PresetName, {
+  steps: number; lr: number; maxFrames: number; prefixFrames: number; prefixChunk: number;
+}> = {
+  fast:     { steps: 300, lr: 8e-5,   maxFrames: 750, prefixFrames: 2048, prefixChunk: 1024 },
+  balanced: { steps: 500, lr: 8e-5,   maxFrames: 750, prefixFrames: 2048, prefixChunk: 256 },
+  thorough: { steps: 1000, lr: 8e-5,  maxFrames: 750, prefixFrames: 4096, prefixChunk: 256 },
+};
+export function isMm3PresetName(v: unknown): v is Mm3PresetName {
+  return v === 'fast' || v === 'balanced' || v === 'thorough';
+}
+/** Defaults with a named preset laid over them; an unknown or absent name
+ *  returns the defaults untouched (which are the Balanced preset). */
+type Mm3PresetFields = (typeof MM3_LM_PRESETS)[Mm3PresetName];
+/** The defaults with the preset-governed fields widened to plain numbers. */
+export type Mm3EffectiveDefaults = Omit<typeof MM3_LM_DEFAULTS, keyof Mm3PresetFields> & Mm3PresetFields;
+export function applyMm3Preset(defaults: typeof MM3_LM_DEFAULTS, preset: unknown): Mm3EffectiveDefaults {
+  return isMm3PresetName(preset) ? { ...defaults, ...MM3_LM_PRESETS[preset] } : defaults;
+}
+
 /** Where a regularisation corpus's captured base distributions live.
  *
  *  Beside the dataset's codes rather than under the training run, because the
@@ -1021,6 +1073,25 @@ export interface ResolvedMm3TrainLmOptions {
   cropStartFrac: number;
   cropEndFrac: number;
   cropStartTiles: number;
+  /** Lever 4a (2026-09-08): end crops draw their length in [endCropMin, K] and
+   *  their frozen-prefix span in [0, prefixFrames]. Off unless asked. */
+  endCropVary?: boolean;
+  endCropMin?: number;
+  /** Rev-7 ending-targeted prior (2026-09-08): score a reg step's loss on the
+   *  last N supervised rows only. 0/absent = every row. */
+  regScoreLast?: number;
+  /** Style-step counterpart: score only the last N supervised rows of every
+   *  style crop (SimpleTuner continuation objective, 2026-09-08). 0 = all. */
+  scoreLast?: number;
+  /** Apply scoreLast to END crops only (interior crops keep every row scored). */
+  scoreLastEndOnly?: boolean;
+  /** Lyrics dropout (2026-09-08): share of style steps trained on a prompt
+   *  without lyrics (instrumental marker). 0/absent = never. */
+  lyricsDropout?: number;
+  /** Stage A (2026-09-07): drop each style track's trailing digital silence
+   *  before the EOS target, from <codes>/trim.json (tools/mm3-trim-silence).
+   *  Off unless the request asks; the file must exist when it does. */
+  trimTrailingSilence?: boolean;
   depthLossWeight: number;
   depthLossFrames: number;
   optimizer: 'muon' | 'adamw' | 'prodigy';
@@ -1137,8 +1208,13 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
   if (o.cropMode === 'structured') {
     args.push('--crop-start-frac', String(o.cropStartFrac));
     args.push('--crop-end-frac', String(o.cropEndFrac));
+    if (o.endCropVary) {
+      args.push('--end-crop-vary');
+      if (o.endCropMin) args.push('--end-crop-min', String(o.endCropMin));
+    }
     args.push('--crop-start-tiles', String(o.cropStartTiles));
   }
+  if (o.trimTrailingSilence) args.push('--trim-trailing-silence');
   // The second stopping strategy. --steps is still passed above and is still
   // the cap: a target the run never reaches has to end somewhere, and "runs
   // forever" is not an acceptable answer to "train until the loss is 0.2".
@@ -1234,9 +1310,18 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     args.push('--reg-captions', o.regCaptionsDir);
     args.push('--reg-codes', o.regCodesDir);
     args.push('--reg-every', String(o.regEvery));
+    if (o.regScoreLast && o.regScoreLast > 0) args.push('--reg-score-last', String(o.regScoreLast));
     args.push('--reg-topk', String(o.regTopK ?? MM3_LM_DEFAULTS.regTopK));
     if (o.regPriorDir) args.push('--reg-prior', o.regPriorDir);
   }
+  // Style-step knobs, independent of the prior. Until 2026-09-09 01:20 these
+  // two sat inside the regularisation block above, so every no-prior run that
+  // asked for them (CONT, FAITHFUL, FAITHLYD) silently trained without them.
+  if (o.scoreLast && o.scoreLast > 0) {
+    args.push('--score-last', String(o.scoreLast));
+    if (o.scoreLastEndOnly) args.push('--score-last-end-only');
+  }
+  if (o.lyricsDropout && o.lyricsDropout > 0) args.push('--lyrics-dropout', String(o.lyricsDropout));
   // Previews pause the trainer through a sentinel file. When they are off, say
   // so explicitly: a stray PAUSE left behind by a killed run would otherwise
   // stop the next run at its first step.

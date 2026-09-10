@@ -63,7 +63,8 @@
 import { Router, Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
-import { config } from '../config.js';
+import { fileURLToPath } from 'url';
+import { config, PORTABLE_MODE, PROJECT_ROOT } from '../config.js';
 import { engineReady } from '../engineState.js';
 import { aceClient } from '../services/aceClient.js';
 import { listProviders, getProvider } from '../services/lireek/llm/registry.js';
@@ -85,7 +86,8 @@ import {
 import { getTrainingDefaults, setTrainingDefaults } from '../services/training/trainingDefaults.js';
 import {
   availableMm3Bases, MM3_VRAM_MODEL, mm3FlashVramCalibrated, recommendMm3Config,
-  MM3_LM_DEFAULTS, missingMm3TrainModels, mm3AdapterRunDir, mm3CodesDir, mm3PriorDir,
+  MM3_LM_DEFAULTS, MM3_LM_PRESETS, MM3_LM_DEFAULT_PRESET, applyMm3Preset,
+  missingMm3TrainModels, mm3AdapterRunDir, mm3CodesDir, mm3PriorDir,
   mm3RunName,
   type Mm3BasePrecision,
 } from '../services/training/mm3Train.js';
@@ -1110,6 +1112,22 @@ function pickTargets(
     .map(s => s.sampleId);
 }
 
+/** Per-dataset exclusivity, relaxed for labelling (Rob, 2026-09-09). A running
+ *  TRAINER (LM/DiT/MM3 trainers, audition, calibrations) reads captions and
+ *  lyrics once at load and never writes them, so a cloud captioner, Genius or
+ *  Essentia can run beside it in the network lane. Anything that needs the
+ *  engine or the card (MOSS, the legacy /understand step) stays blocked, and so
+ *  does labelling while a job that reads or writes the same files is active
+ *  (preprocess, codes, another label/enhance/build). Returns the blocking job
+ *  or undefined. */
+const TRAINER_KINDS = new Set<string>(['train-lm', 'train-dit', 'mm3-train-lm', 'audition', 'lm-calibrate', 'dit-calibrate']);
+function labelBlockedBy(datasetId: string, needsEngine: boolean): ReturnType<typeof queue.activeJobForDataset> {
+  const active = queue.activeJobForDataset(datasetId);
+  if (!active) return undefined;
+  if (needsEngine) return active;
+  return TRAINER_KINDS.has(active.kind) ? undefined : active;
+}
+
 router.post('/datasets/:id/label', async (req: Request, res: Response) => {
   try {
     const ds = repo.getDataset(req.params.id as string);
@@ -1117,12 +1135,20 @@ router.post('/datasets/:id/label', async (req: Request, res: Response) => {
       res.status(404).json({ error: 'Dataset not found' });
       return;
     }
-    if (queue.activeJobForDataset(ds.id)) {
-      res.status(409).json({ error: 'A job is already running for this dataset' });
-      return;
-    }
-
     const body = (req.body || {}) as LabelOptions;
+    {
+      const needsEngine = body.useUnderstand === true
+        || (body.useCaption !== false && body.caption?.provider === 'moss');
+      const blocker = labelBlockedBy(ds.id, needsEngine);
+      if (blocker) {
+        res.status(409).json({
+          error: needsEngine && TRAINER_KINDS.has(blocker.kind)
+            ? 'MOSS and the /understand step need the engine, which a training job owns. Wait for it, or caption with a cloud provider (Gemini) instead.'
+            : 'A job is already running for this dataset',
+        });
+        return;
+      }
+    }
     const useEssentia = body.useEssentia !== false;
     // 2026-07-27 pivot: understand is LEGACY and opt-in; the default flow is
     // Essentia + Genius + LLM caption, all engine-free.
@@ -1265,7 +1291,7 @@ router.post('/datasets/:id/enhance/genius', async (req: Request, res: Response) 
       res.status(404).json({ error: 'Dataset not found' });
       return;
     }
-    if (queue.activeJobForDataset(ds.id)) {
+    if (labelBlockedBy(ds.id, false)) {
       res.status(409).json({ error: 'A job is already running for this dataset' });
       return;
     }
@@ -1301,13 +1327,19 @@ router.post('/datasets/:id/enhance/caption', async (req: Request, res: Response)
       res.status(404).json({ error: 'Dataset not found' });
       return;
     }
-    if (queue.activeJobForDataset(ds.id)) {
-      res.status(409).json({ error: 'A job is already running for this dataset' });
-      return;
-    }
-
     const body = (req.body || {}) as CaptionOptions;
     const providerName = body.provider || config.lireek.defaultProvider;
+    {
+      const blocker = labelBlockedBy(ds.id, providerName === 'moss');
+      if (blocker) {
+        res.status(409).json({
+          error: providerName === 'moss' && TRAINER_KINDS.has(blocker.kind)
+            ? 'MOSS needs the engine, which a training job owns. Wait for it, or caption with a cloud provider (Gemini) instead.'
+            : 'A job is already running for this dataset',
+        });
+        return;
+      }
+    }
     // MOSS is not in the LLM registry — it is a local binary, not a chat API — so
     // it must be admitted BEFORE getProvider(), which throws on an unknown id.
     // Its availability check is "binary built + weights on disk", and the failure
@@ -1781,18 +1813,9 @@ router.get('/datasets/:id/mm3', async (req: Request, res: Response) => {
       }
     } catch { /* engine down or CPU-only — leave it unknown */ }
 
-    // The dataset-wide caption, so the form can show what is actually in force
-    // rather than an empty box that silently means "use per-song captions".
-    let sharedCaption = '';
-    try {
-      const p = path.join(path.dirname(ds.datasetJsonPath || ''), '_shared-caption.txt');
-      if (ds.datasetJsonPath && fs.existsSync(p)) sharedCaption = fs.readFileSync(p, 'utf-8').trim();
-    } catch { /* unreadable — treat as absent */ }
-
     res.json({
       codesDir,
       codes,
-      sharedCaption,
       encoder,
       // Reported separately because the two stages need different files: the
       // codes job wants the encoders, training wants the F16 LM + depth.
@@ -1837,6 +1860,8 @@ router.get('/datasets/:id/mm3', async (req: Request, res: Response) => {
       // present it as a proven saving.
       flashVramCalibrated: mm3FlashVramCalibrated(),
       defaults: MM3_LM_DEFAULTS,
+      presets: MM3_LM_PRESETS,
+      defaultPreset: MM3_LM_DEFAULT_PRESET,
       // For the preview-song picker (Mm3TrainCard's select, default = auto).
       // Empty when the dataset has no codes cache yet — the picker then just
       // shows "auto". Computed at the DEFAULT holdout; the card's own auto
@@ -1846,7 +1871,7 @@ router.get('/datasets/:id/mm3', async (req: Request, res: Response) => {
       previewSongs: (() => {
         try {
           return listMm3PreviewCandidates(ds.datasetJsonPath, ds.sourceDir,
-            path.join(codesDir, 'codes'), MM3_LM_DEFAULTS.holdout, sharedCaption || undefined);
+            path.join(codesDir, 'codes'), MM3_LM_DEFAULTS.holdout);
         } catch { return []; }
       })(),
     });
@@ -1973,6 +1998,32 @@ function resolveMm3Regularisation(raw: unknown, styleDatasetId: string): Partial
   if (!raw || typeof raw !== 'object') return {};
   const r = raw as Record<string, unknown>;
   const every = Number.isFinite(Number(r.every)) ? Math.trunc(Number(r.every)) : MM3_LM_DEFAULTS.regEvery;
+  // Stage C (2026-09-07): a corpus that is not a Training Studio dataset — a
+  // folder holding dataset.json, <stem>.mm3.txt captions and codes/<id>.codes,
+  // e.g. the base-plan ENDING EXCERPTS built by tools/mm3-reg-corpus. Same
+  // three inputs the trainer needs, without a scan of audio that does not exist.
+  if (typeof r.corpusDir === 'string' && r.corpusDir) {
+    if (every <= 0) return {};
+    if (every < 2) {
+      throw new Error('Regularisation cadence must be at least 2 — at 1 every step would be a '
+                    + 'regularisation step and nothing would learn the artist.');
+    }
+    const dir = r.corpusDir;
+    const manifest = path.join(dir, 'dataset.json');
+    const codes = path.join(dir, 'codes');
+    if (!fs.existsSync(manifest)) throw new Error(`Regularisation corpus has no dataset.json: ${dir}`);
+    const n = fs.existsSync(codes) ? fs.readdirSync(codes).filter(f => f.endsWith('.codes')).length : 0;
+    if (n === 0) throw new Error(`Regularisation corpus has no codes/*.codes: ${dir}`);
+    const topK = Number.isFinite(Number(r.topK)) ? Math.trunc(Number(r.topK)) : MM3_LM_DEFAULTS.regTopK;
+    return {
+      regManifest:    manifest,
+      regCaptionsDir: dir,
+      regCodesDir:    codes,
+      regPriorDir:    path.join(dir, 'prior'),
+      regEvery:       every,
+      regTopK:        Math.min(256, Math.max(1, topK)),
+    };
+  }
   const id = typeof r.datasetId === 'string' ? r.datasetId : '';
   if (!id || every <= 0) return {};
   if (every < 2) {
@@ -2072,7 +2123,20 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       const v = Number(b[k]);
       return Number.isFinite(v) && v >= lo && v <= hi ? v : d;
     };
-    const D = MM3_LM_DEFAULTS;
+    // A named preset (fast / balanced / thorough) sits UNDER the request's own
+    // fields: `{preset:'thorough'}` alone trains Thorough, `{preset:'thorough',
+    // steps: 800}` trains Thorough for 800 steps. No name = the defaults = Fast.
+    const D = applyMm3Preset(MM3_LM_DEFAULTS, b.preset);
+    // Prior preservation is OFF unless the request names a corpus. From
+    // 2026-09-07 to 2026-09-09 an absent `regularisation` silently defaulted
+    // the shipped base-endings corpus in (and grew the step count by half),
+    // while the form told the user the prior was off. It was a workaround for
+    // endings that the dataset-wide caption had broken; with per-track
+    // captions the plain recipe ends songs (GOODCAPS 4/6, 2026-09-09) and the
+    // prior only cost likeness by ear. The shipped corpus stays available to
+    // a request that asks for it by dataset or path.
+    const regRaw = b.regularisation ?? undefined;
+    const stepsDefault = D.steps;
     // Three-way now. The old two-way collapsed anything that was not 'adamw'
     // onto the default, which with a prodigy default would have silently
     // ignored a request for muon.
@@ -2091,38 +2155,33 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
         : D.cropMode;
     const runName   = mm3RunName(ds.slug);
     // Per-track `<stem>.mm3.txt` captions (Enhance panel: MOSS or Gemini) are
-    // the intended input. One shared caption for the whole album is the
-    // FALLBACK for datasets without them. Convention: `_shared-caption.txt`
-    // beside the dataset.
-    const sharedCaptionPath = (() => {
-      if (typeof b.captionFile === 'string' && b.captionFile.trim()) return b.captionFile.trim();
-      const p = path.join(captionsDir, '_shared-caption.txt');
-      // A caption submitted with the job WINS and is persisted, so the file the
-      // engine reads, the preview renderer and any hand-run command all agree.
-      const typed = typeof b.sharedCaption === 'string' ? b.sharedCaption.trim() : '';
-      if (typed) {
-        try {
-          fs.writeFileSync(p, typed + '\n', 'utf-8');
-        } catch (e: any) {
-          throw new Error(`cannot write the shared caption to ${p}: ${e?.message || e}`);
-        }
-        return p;
-      }
-      return fs.existsSync(p) ? p : undefined;
-    })();
+    // the ONLY caption source. There used to be a dataset-wide fallback
+    // (`_shared-caption.txt`, auto-picked whenever the file existed): every
+    // row then trained on one caption the renders never use, and on Green Day
+    // that alone took natural endings from 4/6 to 0/6 (2026-09-09, GOODCAPS vs
+    // OLD). Removed as a feature; a stray file beside a dataset is ignored,
+    // and a request that still carries one is refused rather than honoured.
+    if ((typeof b.sharedCaption === 'string' && b.sharedCaption.trim())
+        || (typeof b.captionFile === 'string' && b.captionFile.trim())) {
+      res.status(400).json({
+        error: 'The dataset-wide caption was removed: it replaces every per-track caption with one the '
+             + 'renders never see, and adapters trained that way do not end songs. Generate per-track '
+             + '.mm3.txt captions in the Enhance panel instead.',
+      });
+      return;
+    }
 
     // The trainer skips every row without a `.mm3.txt` and, with no rows left,
     // exits 1 with nothing but SKIP lines in the log. A user read that as "the
     // file needs .mm3 in its name", renamed the ACE sidecars, and trained on
     // ACE captions. Count here and say what to do instead.
-    if (!sharedCaptionPath) {
+    {
       const c = countMm3Captions(ds.datasetJsonPath, captionsDir);
       if (c.total > 0 && c.captioned === 0) {
         res.status(400).json({
           error: `None of the ${c.total} tracks has a MiniMax-Music3 caption (<stem>.mm3.txt beside `
                + 'the audio). Generate them in the Enhance panel with MOSS (local) or Gemini, '
-               + 'both of which hear the audio. As a fallback, fill in the Dataset-wide caption '
-               + 'under Advanced. Renaming ACE sidecar .txt files does not work: the trainer '
+               + 'both of which hear the audio. Renaming ACE sidecar .txt files does not work: the trainer '
                + 'needs the MM3 Structured Caption format.',
         });
         return;
@@ -2139,7 +2198,7 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
     // the user can act on, not a 500 from inside the queue.
     let reg: ReturnType<typeof resolveMm3Regularisation>;
     try {
-      reg = resolveMm3Regularisation(b.regularisation, ds.id);
+      reg = resolveMm3Regularisation(regRaw, ds.id);
     } catch (err: any) {
       res.status(400).json({ error: err?.message || String(err) });
       return;
@@ -2224,7 +2283,7 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       rank:        num('rank', D.rank, 1, 512),
       alpha:       num('alpha', D.alpha, 1, 2048),
       lr:          num('lr', D.lr, 1e-7, 1e-2),
-      steps:       num('steps', D.steps, 1, 100000),
+      steps:       num('steps', stepsDefault, 1, 100000),
       saveEvery:   num('saveEvery', D.saveEvery, 0, 100000),
       warmup:      num('warmup', D.warmup, 0, 100000),
       gradAccum:   num('gradAccum', D.gradAccum, 1, 64),
@@ -2234,6 +2293,13 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       cropStartFrac: num('cropStartFrac', D.cropStartFrac, 0, 1),
       cropEndFrac:   num('cropEndFrac', D.cropEndFrac, 0, 1),
       cropStartTiles: num('cropStartTiles', D.cropStartTiles, 1, 64),
+      endCropVary: b.endCropVary === true,
+      endCropMin:  num('endCropMin', 128, 1, 9000),
+      regScoreLast: num('regScoreLast', 0, 0, 9000),
+      scoreLast:    num('scoreLast', 0, 0, 9000),
+      scoreLastEndOnly: b.scoreLastEndOnly === true,
+      lyricsDropout: num('lyricsDropout', 0, 0, 1),
+      trimTrailingSilence: b.trimTrailingSilence === true,
       depthLossWeight: num('depthLossWeight', D.depthLossWeight, 0, 10),
       depthLossFrames: num('depthLossFrames', D.depthLossFrames, 1, 1024),
       optimizer,
@@ -2246,7 +2312,7 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       evalCrop:    Math.min(num('evalCrop', D.evalCrop, 8, 9000),
                             num('maxFrames', D.maxFrames, 64, 9000)),
       rankDropout: num('rankDropout', D.rankDropout, 0, 0.9),
-      captionFile: sharedCaptionPath,
+      captionFile: undefined,
       adapterType,
       lokrFactor:  num('lokrFactor', D.lokrFactor, 1, 64),
       lokrDim:     num('lokrDim', D.lokrDim, 1, 8192),

@@ -23,7 +23,8 @@ import { addToPlaylist } from '../components/lyric-studio/playlistStore';
 import type { GenerationParams, GenerationJob } from '../types';
 import { resolveDuration } from '../utils/estimateDuration';
 import { createGenerationTimer, getGenerationTimeoutMinutes } from '../utils/generationTimer';
-import { captionForBackend } from '../utils/captionForBackend';
+import { captionForBackend, MM3_BACKEND_ID } from '../utils/captionForBackend';
+import { ensureMm3SourceTracks } from '../utils/mm3CaptionSource';
 import { normalizeKeyScale } from '../utils/keyScale';
 import { useLmAdapterEnabled } from '../utils/lmAdapterPref';
 import { useBackendStore } from './backendStore';
@@ -176,10 +177,24 @@ function _expandTakes(item: AudioQueueItem, status: GenerationJob): void {
 /** Mirror the polling entry's live state onto its take siblings. They share one
  *  render, so progress, stage and streaming flags are common to all of them;
  *  only the finished OUTPUT differs, and that is assigned per take on success. */
-function _syncTakeSiblings(item: AudioQueueItem): void {
+function _syncTakeSiblings(item: AudioQueueItem, status?: GenerationJob): void {
   if (!item.mm3TakeCount || item.mm3TakeCount <= 1) return;
+  // Natural-ending candidates: the server's take count SHRINKS once the planner
+  // has dropped the capped candidates. Any sibling past the surviving count is
+  // a plan that never reached an ending and will never get audio; say so on
+  // its card instead of leaving it spinning until the render finishes.
+  const survived = status ? Number(status.mm3_takes ?? item.mm3TakeCount) : item.mm3TakeCount;
   for (const s of _state.items) {
     if (s.mm3TakeOf !== item.id) continue;
+    if ((s.mm3Take ?? 0) >= survived) {
+      if (s.status !== 'failed') {
+        s.status = 'failed';
+        s.progress = 0;
+        s.stage = 'No natural ending';
+        s.error = 'Reached the length cap without ending; dropped by Require Natural Ending';
+      }
+      continue;
+    }
     s.status = item.status;
     s.progress = item.progress;
     s.stage = item.stage;
@@ -755,7 +770,7 @@ export async function enqueueSimpleGen(
         item.stage = status.stage || 'Generating…';
         item.elapsed = t.elapsed;
         _captureMm3Stream(item, status);
-        _syncTakeSiblings(item);
+        _syncTakeSiblings(item, status);
         _emit();  // progress tick — debounced persistence
 
         if (status.status === 'succeeded') {
@@ -774,6 +789,7 @@ export async function enqueueSimpleGen(
             for (const s of _state.items) {
               if (s.mm3TakeOf !== item.id) continue;
               const t = s.mm3Take ?? 0;
+              if (t >= songIds.length) continue;   // dropped candidate, already marked
               s.status = 'succeeded';
               s.progress = 100;
               s.stage = 'Complete!';
@@ -1169,14 +1185,31 @@ async function _executeItem(item: AudioQueueItem, token: string): Promise<void> 
   // backend field entirely (routes/generate.ts), so a queue item submitted after
   // the user switched backends runs on the NEW backend. Matching the snapshot
   // here would hand MM3 the ACE caption in exactly that case.
-  params.caption = captionForBackend(gen, useBackendStore.getState().activeBackendId);
+  //
+  // The lyrics-set id is what lets the MM3 side resolve the song's caption
+  // SOURCE — automatic-by-tempo from the album's own captioned tracks, a
+  // specific track, or the song's own caption (utils/mm3CaptionSource.ts).
+  // Items from Create/Cover Studio carry lyricsSetId 0 and simply get the
+  // song's own caption.
+  const backendId = useBackendStore.getState().activeBackendId;
+  if (backendId === MM3_BACKEND_ID) await ensureMm3SourceTracks(item.lyricsSetId);
+  params.caption = captionForBackend(gen, backendId, item.lyricsSetId);
   params.title = gen.title || '';
   params.instrumental = false;
-  // Same as sendToCreate: the lyric-derived estimate goes to both backends.
-  // For ACE it is a target; for MM3 it is a ceiling the planner LM may stop
-  // short of. Auto (-1) for MM3 was tried in 7d574365 and reverted: the
-  // planner does not reliably stop early, so songs ran to the 300s ceiling.
-  params.duration = resolveDuration(gen.duration, gen.lyrics || '', gen.bpm || 120);
+  // Duration is an ACE-only field now.
+  //
+  // The lyric-derived estimate is a TARGET for ACE, which is told a length and
+  // aims for it. MM3 has no such input: the number becomes a frame cap and
+  // nothing else, so it can only truncate — and 7d574365's "send Auto instead"
+  // was reverted because the planner ran to the 300s ceiling instead of ending.
+  // The ending arbitration fixes the actual problem (candidates that never
+  // reach EOS are dropped and re-planned), which leaves the cap with nothing
+  // left to do except cut songs short. So MM3 renders are always auto.
+  if (backendId !== MM3_BACKEND_ID) {
+    params.duration = resolveDuration(gen.duration, gen.lyrics || '', gen.bpm || 120);
+  } else {
+    params.duration = -1;
+  }
   if (gen.bpm) params.bpm = gen.bpm;
   // Canonical spelling — the engine's metadata FSM only accepts a lower-case
   // mode, and 99.6% of stored generations carry a capitalised one.
@@ -1351,12 +1384,33 @@ async function _pollUntilDone(item: AudioQueueItem, _token: string): Promise<voi
       item.stage = status.stage || 'Generating…';
       item.elapsed = t.elapsed;
       _captureMm3Stream(item, status);
+      _syncTakeSiblings(item, status);
       _emit();  // progress tick — debounced persistence
 
       if (status.status === 'succeeded') {
-        const audioUrl = status.result?.audioUrls?.[0];
-        const songId = status.result?.songIds?.[0];
+        const audioUrls = status.result?.audioUrls || [];
+        const songIds = status.result?.songIds || [];
+        const audioUrl = audioUrls[0];
+        const songId = songIds[0];
         const masteredUrl = status.result?.masteredAudioUrl;
+        // Ensemble / natural-ending candidates: the server returns the rendered
+        // takes in take order, so sibling t owns audioUrls[t] and songIds[t] —
+        // the same split the Create page does. Until 2026-09-09 this loop only
+        // ever took index 0, so a Lyric Studio render that produced three
+        // ended candidates showed one and silently lost two.
+        if (item.mm3TakeCount && item.mm3TakeCount > 1) {
+          for (const s of _state.items) {
+            if (s.mm3TakeOf !== item.id) continue;
+            const t = s.mm3Take ?? 0;
+            if (t >= songIds.length) continue;   // dropped candidate, already marked
+            s.status = 'succeeded';
+            s.progress = 100;
+            s.stage = 'Complete!';
+            s.audioUrl = audioUrls[t] || '';
+            s.songId = songIds[t];
+            s.audioDuration = status.result?.duration;
+          }
+        }
         if (audioUrl) {
           item.audioUrl = audioUrl;
           if (songId) item.songId = songId;

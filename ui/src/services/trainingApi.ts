@@ -28,6 +28,9 @@ export type TrainingJobStatus = 'queued' | 'running' | 'done' | 'failed' | 'canc
 // ─── MiniMax-Music3 training (mirrors server types.ts) ────────────────────
 
 /** GET /api/training/datasets/:id/mm3 */
+export type Mm3PresetName = 'fast' | 'balanced' | 'thorough';
+export interface Mm3Preset { steps: number; lr: number; maxFrames: number; prefixFrames: number; prefixChunk: number }
+
 export interface Mm3Status {
   codesDir: string;
   /** How many .codes files the cache holds (0 = never exported). */
@@ -36,9 +39,6 @@ export interface Mm3Status {
   codesLaundered?: number;
   /** Which encoder produced them, from codes.json ('' = unknown). */
   encoder: string;
-  /** The dataset-wide caption currently in force ('' = none, so the trainer
-   *  falls back to per-song .mm3.txt and skips tracks that have none). */
-  sharedCaption?: string;
   /** Per-stage, because the stages need different files. Non-empty = disable. */
   missingForCodes: string[];
   missingForLaunder?: string[];
@@ -63,6 +63,11 @@ export interface Mm3Status {
   defaults: Mm3TrainLmRequest & { maxFrames: number; cropMode: string;
                                   previewEverySteps?: number;
                                   previewEveryMinutes?: number };
+  /** Named recipes the form offers (2026-09-07): each a set of overrides on
+   *  `defaults`. Absent on an older server, in which case the form shows no
+   *  preset row and behaves as before. */
+  presets?: Record<Mm3PresetName, Mm3Preset>;
+  defaultPreset?: Mm3PresetName;
   /** Datasets usable as a prior-preservation corpus: they have RVQ codes and
    *  are not this one. Absent on an older server. */
   regCandidates?: Array<{ id: string; name: string; songs: number }>;
@@ -174,6 +179,8 @@ export interface Mm3CodesRequest {
 /** Every field optional: omitted means the validated recipe, which lives
  *  server-side in services/training/mm3Train.ts and nowhere else. */
 export interface Mm3TrainLmRequest {
+  /** Named recipe laid under the fields by the route (fast / balanced / thorough). */
+  preset?: Mm3PresetName;
   /** Train on the cover-laundered codes cache instead of the standard one.
    *  Requires a laundered export; absent/false = the standard cache. */
   launder?: boolean;
@@ -194,9 +201,6 @@ export interface Mm3TrainLmRequest {
   depthLossWeight?: number;
   depthLossFrames?: number;
   optimizer?: 'muon' | 'adamw' | 'prodigy';
-  /** One caption used for EVERY track, persisted to
-   *  <dataset>/_shared-caption.txt. Empty = per-song .mm3.txt files. */
-  sharedCaption?: string;
   adapterType?: 'lora' | 'lokr';
   lokrFactor?: number;
   lokrDim?: number;

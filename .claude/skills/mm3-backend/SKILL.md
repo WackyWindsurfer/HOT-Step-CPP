@@ -118,6 +118,24 @@ template (`<|im_start|><|caption_start|>…<|lyrics_start|>[start]…<|audio_sta
 Node-side `[Generate] … caption=N chars` line is the send-side half; a mismatch between the two
 counts localises a drop to the wire rather than the UI.
 
+## Natural-ending candidates (SHIPPED 2026-09-09, 00e3e7af)
+
+`POST /mm3/synth` accepts `require_eos: true` and `eos_rounds: N` (1..16) with
+`takes: K`. The planner runs K takes in one batched pass (seed+t); any take that
+reaches max_frames without EOS is DROPPED before the flow stage; if none ended
+the plan repeats at seed + K (round r plans seed + r*K + t) up to `eos_rounds`
+times, then fails with "no candidate ended naturally". The job JSON's `takes`
+is the number RENDERED; `takes_planned`, `takes_dropped`, `eos_rounds_used`,
+`require_eos` and a per-take `round` are added, and `take_detail` is emitted
+whenever candidates were in play. Ignored on an interleaved stream (logged).
+Server: `mm3RequireEnding` (default on, Generation dropdown) sends takes 3,
+eos_rounds 4 and reads the surviving count/seeds from the completion detail.
+Duration on MM3 is ALWAYS auto (a requested length was a hard cap that cut
+endings off); the Create panel hides the control in MM3 mode. Batched take 0
+is a different song from the same seed by design (check-mm3-ensemble.mjs).
+Knock-ons: Save Plan To Disk is dead while the toggle is on; each ended
+candidate costs its own flow pass.
+
 ## The trap list (each cost real debugging — do not relearn)
 
 1. **ComfyUI's wrapper NEGATES the DiT output; the diffusers reference (and our port) does not.**

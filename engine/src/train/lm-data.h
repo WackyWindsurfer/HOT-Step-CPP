@@ -31,6 +31,11 @@ struct LmSample {
     std::vector<int32_t> targets;   // s_tr entries; targets[i] = tokens[n_masked + i]
     int                  n_masked = 0;
     int                  s_tr     = 0;  // == (int)tokens.size() - n_masked
+    /** Rows dropped from the FRONT of the supervised span by --score-last:
+     *  n_masked was moved on by this many, so a consumer that indexes the
+     *  sequence by crop frame (the MM3 depth loss) uses n_masked - col_skip
+     *  as its column base. 0 = the span was not trimmed. */
+    int                  col_skip = 0;
 
     // Leading positions that must stay BLIND to a frozen KV prefix — the
     // caption, which the history FOLLOWS rather than precedes. It is not the

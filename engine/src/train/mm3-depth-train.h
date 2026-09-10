@@ -253,13 +253,16 @@ static bool mm3_depth_train_head(LmCkptRun & r, const LmSample & s, void * user)
     // Host-side gathers: h columns out of t_H, ids and one-hot labels from the
     // ground-truth codes. Column j of the supervised span lives at full-
     // sequence column n_masked-1+j — the same offset the semantic head uses.
+    // Under --score-last n_masked has been moved on by col_skip rows, so the
+    // crop-frame base is n_masked - col_skip (2026-09-09: without this the
+    // gather read past the sequence and ggml asserted out of bounds).
     std::vector<float>   h_host((size_t) (H * K));
     std::vector<int32_t> sem_ids((size_t) K);
     std::vector<int32_t> ac_ids((size_t) (6 * K));   // feedback books 1..6
     std::vector<float>   labels((size_t) (7 * AV * K), 0.0f);
     for (int64_t i = 0; i < K; i++) {
         const int64_t j   = frames[(size_t) i];
-        const size_t  col = (size_t) (s.n_masked - 1 + j);
+        const size_t  col = (size_t) (s.n_masked - s.col_skip - 1 + j);
         ggml_backend_tensor_get(st.t_H, h_host.data() + (size_t) (i * H),
                                 col * st.t_H->nb[1], (size_t) H * sizeof(float));
         const int32_t * f = d.codes + (size_t) ((d.c0 + j) * 8);
@@ -470,7 +473,7 @@ static bool mm3_depth_train_head(LmCkptRun & r, const LmSample & s, void * user)
     std::vector<float> col((size_t) H);
     for (int64_t i = 0; i < K; i++) {
         const int64_t j   = frames[(size_t) i];
-        const size_t  off = (size_t) (s.n_masked - 1 + j) * t_G->nb[1];
+        const size_t  off = (size_t) (s.n_masked - s.col_skip - 1 + j) * t_G->nb[1];
         ggml_backend_tensor_get(t_G, col.data(), off, (size_t) H * sizeof(float));
         const float * g = ghost.data() + (size_t) (i * H);
         for (int64_t e = 0; e < H; e++) {
@@ -523,8 +526,8 @@ static bool mm3_depth_train_fdcheck(MM3DepthTrain & d, LmCkptRun & r, const LmSa
         return false;
     }
     const int64_t j0   = frames[0];
-    const size_t  gcol = (size_t) (s.n_masked - 1 + j0) * st.Gh[0]->nb[1];
-    const size_t  hcol = (size_t) (s.n_masked - 1 + j0) * st.t_H->nb[1];
+    const size_t  gcol = (size_t) (s.n_masked - s.col_skip - 1 + j0) * st.Gh[0]->nb[1];
+    const size_t  hcol = (size_t) (s.n_masked - s.col_skip - 1 + j0) * st.t_H->nb[1];
     std::vector<float> g((size_t) H), h0((size_t) H), hp((size_t) H);
     ggml_backend_tensor_get(st.Gh[0], g.data(), gcol, (size_t) H * sizeof(float));
     ggml_backend_tensor_get(st.t_H, h0.data(), hcol, (size_t) H * sizeof(float));

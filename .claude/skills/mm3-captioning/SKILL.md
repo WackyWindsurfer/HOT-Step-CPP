@@ -366,6 +366,33 @@ established above: mechanically restructuring an ACE caption never reached the
 target genre in five ear-judged rounds. A backfill should re-run the real MM3
 caption call per song, not restructure.
 
+## Captions decide whether an adapter's song ENDS (2026-09-09)
+
+Measured on a Green Day adapter (GOODCAPS: quality recipe, per-track captions),
+plan-only, same six seeds, candidates off:
+
+| lyrics | caption (a training track's own, verbatim) | natural endings |
+|---|---|---|
+| 5528 | castaway | 1/6 |
+| 5528 | warning | 4/6 |
+| 5530 | warning | 4/6 |
+| 5530 | castaway | 4/6 |
+
+- It is the caption x lyrics PAIR, not the song and not the caption alone.
+- Single-sentence edits of the failing caption flip it: Warning's tempo/key/genre
+  line alone -> 4/6; deleting the outro sentence ('ad-libs over fading guitar
+  feedback and sustained synth tones') alone -> 4/6. A boundary case, not a
+  banned word: the 1000 official templates say 'fade' in 377 and 'outro' in 723.
+- A training caption with new lyrics is a style prompt, not a lookup key: no run
+  of four semantic codes is shared with the training track; Rob's ear: unique
+  Green Day songs. That is what the Automatic caption source (nearest-tempo
+  dataset track) in Lyric Studio / Create relies on.
+- The shared dataset-wide caption (a comma list with no arc) took the same
+  recipe to 0/6 and was removed as a feature.
+- Lyric Studio's own generated MM3 captions are being screened the same way
+  (`_experiments/2026-09-07-mm3-eos-probe/caption_stage2b.py`); if they
+  underperform training captions, the caption prompt is the lever.
+
 ## Directory contents
 
 ```

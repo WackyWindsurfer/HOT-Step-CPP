@@ -98,6 +98,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -221,6 +222,17 @@ struct MM3LmTrainArgs {
      *  behaviour exactly. 3 at crop 750 covers what crop 2496's start share
      *  used to. */
     int         crop_start_tiles = 3;
+    /** Varied end supervision (lever 4a, 2026-09-08). The end share above is a
+     *  single deterministic crop per song, so twelve songs teach twelve
+     *  memorised frames and the adapter's own plans never reach a state it
+     *  recognises as an ending (P(EOS) = 1.0 at the trained frame, 0 one frame
+     *  earlier). With this on, every end step draws its crop length uniformly
+     *  in [end_crop_min, K] and its frozen-prefix span uniformly in
+     *  [0, prefix_frames], so the same real ending is seen from many distances
+     *  and with many amounts of history: an ending as a STATE, not a frame.
+     *  Off = the pinned crop exactly as before. */
+    bool        end_crop_vary = false;
+    int64_t     end_crop_min  = 128;
     int         grad_accum = 1, seed = 42;
     // ADAMW BY DEFAULT as of 2026-08-23, because the recipe it belongs to is
     // now rank 64.
@@ -283,6 +295,14 @@ struct MM3LmTrainArgs {
      *  Drawn from the training RNG, so it is reproducible and survives a resume
      *  along with everything else. */
     double      caption_dropout = 0.0;
+    /** Lyrics dropout (2026-09-08): share of style steps whose prompt carries
+     *  NO lyrics (the assembler writes the instrumental marker). SimpleTuner's
+     *  positioned continuation spans train without lyrics on most steps, and
+     *  its adapters end songs where ours do not; the hypothesis is that always
+     *  training with the full lyrics binds song structure to them so tightly
+     *  that the base's "lyrics done, wrap up, stop" is overwritten. Reg steps
+     *  never drop (their teacher was captured with the full prompt). */
+    double      lyrics_dropout = 0.0;
 
     /** Artist token (textual inversion), V3. k learned vectors accumulated onto
      *  the first k prompt positions, whose ids are placeholder copies spliced at
@@ -515,6 +535,14 @@ struct MM3LmTrainArgs {
     // the pacing. Kept switchable because it changes the recipe: a run trained
     // under "zero" is not comparable with one trained under "song".
     std::string crop_anchor = "song";     // song | zero
+    /** Stage A of the end-of-song work (2026-09-07). When set, the style corpus
+     *  loader reads `<codes_dir>/trim.json` ({"<id>": keep_frames}) and drops
+     *  every frame after keep_frames, so the EOS target follows the last
+     *  MUSICAL frame instead of the 2-4 s of digital silence most rips carry.
+     *  The file is produced from the AUDIO (tools/mm3-trim-silence) and is
+     *  inspected before use; the trainer only applies it. Reg corpora are never
+     *  trimmed. Off by default. */
+    bool        trim_trailing_silence = false;
 
     // ── FROZEN KV PREFIX (train/lm-kvprefix.h) ─────────────────────────────
     //
@@ -590,6 +618,29 @@ struct MM3LmTrainArgs {
     /** Classes kept per position. 64 is his; the producer logs the measured
      *  probability mass it covers so the choice is checkable. */
     int         reg_topk = 64;
+    /** Ending-targeted prior (room plan rev 7, 2026-09-08). A reg step scores
+     *  its soft-target loss on the LAST N supervised rows of the excerpt only;
+     *  inputs, prefix and teacher are unchanged, so the model still sees the
+     *  whole context and only the trained span shrinks (n_masked moves up,
+     *  s_tr = N). The base teacher puts its stopping decision on the final row
+     *  and ~no EOS mass anywhere else, so scoring all ~500 rows is 500 rows of
+     *  "be the base" to 1 of "stop": the likeness cost measured on 2026-09-08.
+     *  0 = every row (today's behaviour, bit-identical). The loss is a mean
+     *  over the scored rows, so each retained row's coefficient rises by
+     *  n_sup/N; that number is logged. */
+    int         reg_score_last = 0;
+    /** Style-step counterpart (2026-09-08 evening): score only the last N
+     *  supervised rows of every style crop. SimpleTuner's `continuation` mode
+     *  scores the last 128 frames of a span whose earlier frames are context,
+     *  and its adapters end songs ~30-67% of the time where ours never do; this
+     *  ports that half of the objective. 0 = every row (today's behaviour). */
+    int         score_last = 0;
+    /** --score-last-end-only (2026-09-09): apply --score-last to END crops
+     *  only. Interior crops keep every row scored, so the style supervision
+     *  that FAITHSL threw away (6/6 endings, zero likeness) stays intact, and
+     *  the ending still gets its concentrated share on the crops that hold
+     *  one. */
+    bool        score_last_end_only = false;
     /** Where the captured base distributions live. Empty = <reg-codes>/../prior,
      *  so a second run over the same corpus reuses them. */
     std::string reg_prior_dir;
@@ -605,8 +656,16 @@ struct MM3LmSample {
      *  short string per song at load, and doing it per step would put the BPE
      *  tokenizer inside the training loop. */
     std::vector<int32_t> prompt_trigger_only;
+    std::vector<int32_t> prompt_no_lyrics;      // lyrics dropout: caption kept, lyrics replaced by the instrumental marker
     std::vector<int32_t> codes;           // [n_frames * 8], warm-up row already dropped
     int64_t              n_frames = 0;
+    /** Absolute frame index of codes[0] in the track this sample was cut from.
+     *  0 for ordinary corpora. A regularisation corpus of EXCERPTS (the last K
+     *  frames of a base-model plan, so the excerpt ends at a real EOS) carries
+     *  the excerpt's true start here, read from the manifest's `frame_offset`,
+     *  so under --crop-anchor song the teacher capture and the reg step both
+     *  place the frames at the positions the base saw. */
+    int64_t              frame_offset = 0;
 };
 
 // ── data ────────────────────────────────────────────────────────────────────
@@ -772,10 +831,36 @@ static bool mm3_lm_load_samples_from(const std::string & manifest, const std::st
                                      const std::string & codes_dir, const std::string & lm_path,
                                      const std::string & trigger_prefix,
                                      const std::string & caption_override,
+                                     bool trim_trailing,
                                      const MM3TrainLm & t,
                                      std::vector<MM3LmSample> * out, std::string * err) {
     struct { std::string manifest, captions_dir, codes_dir, lm_path; } a {
         manifest, captions_dir, codes_dir, lm_path };
+    // Stage A: per-track keep_frames from <codes_dir>/trim.json, applied below.
+    std::map<std::string, int64_t> trim;
+    if (trim_trailing) {
+        std::string tbuf;
+        if (!mm3_lm_read_file(a.codes_dir + "/trim.json", &tbuf)) {
+            if (err) *err = "--trim-trailing-silence set but " + a.codes_dir + "/trim.json is missing";
+            return false;
+        }
+        yyjson_doc * td = yyjson_read(tbuf.c_str(), tbuf.size(), 0);
+        yyjson_val * tr = td ? yyjson_doc_get_root(td) : nullptr;
+        if (!tr || !yyjson_is_obj(tr)) {
+            if (td) yyjson_doc_free(td);
+            if (err) *err = a.codes_dir + "/trim.json is not a JSON object";
+            return false;
+        }
+        yyjson_obj_iter ti = yyjson_obj_iter_with(tr);
+        yyjson_val *    tk;
+        while ((tk = yyjson_obj_iter_next(&ti))) {
+            yyjson_val * tv = yyjson_obj_iter_get_val(tk);
+            if (tv && yyjson_is_num(tv)) trim[yyjson_get_str(tk)] = (int64_t) yyjson_get_num(tv);
+        }
+        yyjson_doc_free(td);
+        fprintf(stderr, "[mm3-lm-train] trailing-silence trim: %zu entries from %s/trim.json\n", trim.size(),
+                a.codes_dir.c_str());
+    }
     std::vector<MM3LmSample> & samples = *out;
         std::string jbuf;
         if (!mm3_lm_read_file(a.manifest, &jbuf)) {
@@ -834,6 +919,20 @@ static bool mm3_lm_load_samples_from(const std::string & manifest, const std::st
             sm.n_frames = n_rows - 1;                        // drop the warm-up row
             sm.codes.resize((size_t) (sm.n_frames * 8));
             memcpy(sm.codes.data(), cbuf.data() + 8 * sizeof(int32_t), sm.codes.size() * sizeof(int32_t));
+            {
+                auto tit = trim.find(id);
+                if (tit != trim.end() && tit->second > 0 && tit->second < sm.n_frames) {
+                    fprintf(stderr, "[mm3-lm-train] trim %s: %lld -> %lld frames (-%.1f s of trailing silence)\n",
+                            id.c_str(), (long long) sm.n_frames, (long long) tit->second,
+                            (double) (sm.n_frames - tit->second) / 25.0);
+                    sm.n_frames = tit->second;
+                    sm.codes.resize((size_t) (sm.n_frames * 8));
+                }
+            }
+            {
+                yyjson_val * ov = yyjson_obj_get(s, "frame_offset");
+                if (ov && yyjson_is_num(ov)) sm.frame_offset = (int64_t) yyjson_get_num(ov);
+            }
             if (!trigger_prefix.empty()) {
                 // Front of the FIRST line, comma + space — the training-row shape.
                 size_t lead = caption.find_first_not_of(" \t\r\n\xEF\xBB\xBF");
@@ -855,6 +954,7 @@ static bool mm3_lm_load_samples_from(const std::string & manifest, const std::st
                 fprintf(stderr, "[mm3-lm-train] first training caption begins: %.120s\n", head.c_str());
             }
             mm3_tokenizer_encode(tok, mm3_assemble_prompt(caption, lyrics), &sm.prompt);
+            mm3_tokenizer_encode(tok, mm3_assemble_prompt(caption, std::string()), &sm.prompt_no_lyrics);
             if (!trigger_prefix.empty()) {
                 // Caption dropout's alternative prompt: the trigger and nothing
                 // else. Lyrics are KEPT — dropping those too would change what
@@ -887,7 +987,7 @@ static bool mm3_lm_load_samples(const MM3LmTrainArgs & a, const MM3TrainLm & t,
     }
     return mm3_lm_load_samples_from(a.manifest, a.captions_dir, a.codes_dir, a.lm_path,
                                     a.trigger_prepend && !a.trigger.empty() ? a.trigger + ", " : "",
-                                    shared, t, out, err);
+                                    shared, a.trim_trailing_silence, t, out, err);
 }
 
 // ── finite-difference gradient check ────────────────────────────────────────
@@ -1958,6 +2058,29 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     int64_t max_prompt = 0;
     for (const auto & s : samples) max_prompt = std::max(max_prompt, (int64_t) s.prompt.size());
     for (const auto & s : holdout) max_prompt = std::max(max_prompt, (int64_t) s.prompt.size());
+    // A regularisation corpus carries its own prompts, and they are not bounded
+    // by the style corpus: a Lyric Studio MM3 caption runs ~1,100-1,300 tokens
+    // against ~600 for a captioned album track. Sizing the graph off the style
+    // corpus alone made every such reg sample "sequence exceeds S_max" at
+    // capture time, and a reg step with no prior is a silent no-op (2026-09-07:
+    // a 450-step run with 150 reg steps that trained exactly like the 300-step
+    // baseline). Pre-scan the corpus here so the graph fits it; the samples are
+    // loaded again where the priors are captured.
+    if (a.reg_every > 0 && !a.reg_manifest.empty()) {
+        std::vector<MM3LmSample> reg_probe;
+        std::string              perr;
+        if (mm3_lm_load_samples_from(a.reg_manifest, a.reg_captions_dir, a.reg_codes_dir, a.lm_path,
+                                     /*trigger_prefix=*/"", /*caption_override=*/"", /*trim_trailing=*/false, t,
+                                     &reg_probe, &perr)) {
+            int64_t reg_max = 0;
+            for (const auto & s : reg_probe) reg_max = std::max(reg_max, (int64_t) s.prompt.size());
+            fprintf(stderr, "[mm3-lm-train] reg corpus: %zu samples, longest prompt %lld tok (style %lld) - graph sized to fit both\n",
+                    reg_probe.size(), (long long) reg_max, (long long) max_prompt);
+            max_prompt = std::max(max_prompt, reg_max);
+        } else {
+            fprintf(stderr, "[mm3-lm-train] reg corpus pre-scan failed (%s); sizing off the style corpus only\n", perr.c_str());
+        }
+    }
     const int64_t K_max = a.max_frames > 0 ? a.max_frames : 4096;
     // A crop that reaches the track end uses all K frames as INPUT, and with a
     // prefix the window takes one more in front of them (see `lead`). So the
@@ -2742,6 +2865,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                 "half over %d aligned tiles), %.0f%% flush to the end (EOS), %.0f%% random\n",
                 a.crop_start_frac * 100.0, a.crop_start_tiles, a.crop_end_frac * 100.0,
                 (1.0 - a.crop_start_frac - a.crop_end_frac) * 100.0);
+        if (a.end_crop_vary) {
+            fprintf(stderr, "[mm3-lm-train] varied end supervision: end crops draw their length in [%lld, K] and "
+                            "their history in [0, %lld] frames (lever 4a)\n",
+                    (long long) a.end_crop_min, (long long) a.prefix_frames);
+        }
     }
     jl("{\"type\":\"cropPolicy\",\"mode\":\"%s\",\"startFrac\":%.3f,\"endFrac\":%.3f}",
        a.crop_mode.c_str(), a.crop_start_frac, a.crop_end_frac);
@@ -2769,7 +2897,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     // the rate. Reporting the segment is honest and needs no change to the
     // resume format — which matters, since bumping it would strand every state
     // file already on disk.
-    int                  n_dropped   = 0;   // caption-dropout steps, THIS SEGMENT
+    int                  n_dropped   = 0;
+   // caption-dropout steps, THIS SEGMENT
+    int64_t n_end_vary = 0;   // lever 4a: end steps that drew a varied window/history
+    bool    reg_span_logged = false;   // rev-7 ending-targeted prior: announce the scored span once
+    int64_t n_lyrics_dropped = 0;      // lyrics dropout: style steps trained without lyrics
     int                  n_style_seg = 0;   // style steps, THIS SEGMENT
 
     auto save_ckpt = [&](int step, double loss) -> std::string {
@@ -3353,7 +3485,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     if (reg_on && rc == 0) {
         std::string rerr;
         if (!mm3_lm_load_samples_from(a.reg_manifest, a.reg_captions_dir, a.reg_codes_dir, a.lm_path,
-                                      /*trigger_prefix=*/"", /*caption_override=*/"", t,
+                                      /*trigger_prefix=*/"", /*caption_override=*/"", /*trim_trailing=*/false, t,
                                       &reg_samples, &rerr)
             || reg_samples.empty()) {
             fatal_msg = "regularisation set has no usable samples"
@@ -3381,18 +3513,37 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             // only true because the recipe truncates from the start. A random
             // crop would need a cache per offset, or a teacher that disagrees
             // with the student about which audio it is looking at.
+            // The window. An excerpt no longer than K is rehearsed whole from
+            // its first frame. An excerpt LONGER than K carries history: its
+            // last K frames are the window and the frames before them go into
+            // the frozen KV prefix, exactly as a style crop's history does
+            // (Phase 4 step 2b, 2026-09-07). Either way the window reaches the
+            // excerpt's end, so the base's stopping decision is the last
+            // supervised position. Same arithmetic as the reg step below.
             const int64_t K      = std::min<int64_t>(K_max, rs.n_frames);
-            const bool    at_end = K >= rs.n_frames;
-            const int64_t Fin    = at_end ? K : K - 1;
-            const int64_t n_sup  = at_end ? K + 1 : K;
+            const int64_t c0     = rs.n_frames - K;              // 0 for a history-free excerpt
+            const bool    at_end = true;                         // c0 + K == n_frames
+            const int64_t lead   = (kv_on && c0 > 0) ? 1 : 0;   // frame c0-1 as input, as in a style crop
+            const int64_t f0     = c0 - lead;
+            const int64_t Fin    = K + lead;                     // input frames, lead included
+            const int64_t n_sup  = K + 1;
             const int64_t P      = (int64_t) rs.prompt.size();
             const int64_t S      = P + Fin;
-            if (S > S_max || Fin < 1) {
+            const int64_t npfx   = kv_on ? f0 - std::max<int64_t>(0, f0 - a.prefix_frames) : 0;
+            if (S > S_max || K < 1) {
                 fprintf(stderr, "[mm3-lm-train] SKIP reg %s: sequence %lld exceeds %lld\n",
                         rs.id.c_str(), (long long) S, (long long) S_max);
                 continue;
             }
-            const std::string path = mm3_prior_path(prior_dir, rs.id, a.lm_path, a.reg_topk);
+            // An excerpt's teacher was captured at ITS positions; a cache for the
+            // same id at another offset is a different teacher, so the offset is
+            // in the name like the base model and K already are.
+            std::string cache_id = rs.id;
+            if (rs.frame_offset) cache_id += ".o" + std::to_string((long long) rs.frame_offset);
+            // A windowed excerpt's teacher saw a prefix; a cache captured with
+            // another window or history length is a different teacher.
+            if (c0 > 0) cache_id += ".c" + std::to_string((long long) c0) + ".p" + std::to_string((long long) npfx);
+            const std::string path = mm3_prior_path(prior_dir, cache_id, a.lm_path, a.reg_topk);
             std::string       lerr;
             if (mm3_prior_load(path, a.reg_topk, (int) n_sup, W, &reg_priors[i], &lerr)) {
                 loaded++;
@@ -3415,7 +3566,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             sem_in.resize((size_t) Fin);
             ac_in.resize((size_t) (Fin * NC));
             for (int64_t j = 0; j < Fin; j++) {
-                const int32_t * f = &rs.codes[(size_t) (j * 8)];
+                const int32_t * f = &rs.codes[(size_t) ((f0 + j) * 8)];
                 sem_in[(size_t) j] = f[0] + (int32_t) t.semantic_vocab_offset;
                 for (int64_t k2 = 0; k2 < NC; k2++) {
                     ac_in[(size_t) (k2 * Fin + j)] = f[1 + k2] + (int32_t) (k2 * AV);
@@ -3425,7 +3576,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             for (int64_t j = 0; j < n_sup; j++) {
                 tgt[(size_t) j] = (at_end && j == n_sup - 1)
                                     ? mm3_lm_train_slice_eos(t)
-                                    : mm3_lm_train_slice_index(t, rs.codes[(size_t) (j * 8)]);
+                                    : mm3_lm_train_slice_index(t, rs.codes[(size_t) ((c0 + j) * 8)]);
             }
             // Skipped entirely under a trainable prefix: lm_ckpt_upload_mask
             // owns t_msk then (the mask is rectangular, [n + S, S]), and a
@@ -3437,7 +3588,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             }
             pos.resize((size_t) S);
             for (int64_t j = 0; j < P; j++)   pos[(size_t) j] = (int32_t) j;
-            for (int64_t j = 0; j < Fin; j++) pos[(size_t) (P + j)] = (int32_t) (P + j);
+            // Excerpt corpora carry their true start; under --crop-anchor song the
+            // teacher sees the frames where the base saw them (frame_offset is 0
+            // for ordinary corpora, so this is the old P + j there).
+            const int64_t cap_off = anchor_song ? rs.frame_offset : 0;
+            for (int64_t j = 0; j < Fin; j++) pos[(size_t) (P + j)] = (int32_t) (P + cap_off + f0 + j);
             ggml_backend_tensor_set(t_prompt, rs.prompt.data(), 0, (size_t) P * sizeof(int32_t));
             ggml_backend_tensor_set(t_sem, sem_in.data(), 0, sem_in.size() * sizeof(int32_t));
             ggml_backend_tensor_set(t_ac, ac_in.data(), 0, ac_in.size() * sizeof(int32_t));
@@ -3447,6 +3602,32 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             // the capture too — the teacher distribution has to be the one the
             // reg steps below will be scored against, and those run token-free.
             set_art(false);
+            set_rank_mask(false);  // the teacher is the base, not a subnetwork (prefix included)
+            // The frozen prefix for a history-bearing excerpt, built the way the
+            // reg step will build it. Q == 0 still runs when the store is on:
+            // it clears K/V a longer previous capture left behind.
+            if (kv_on) {
+                int64_t Q = 0;
+                if (c0 > 0) {
+                    const int64_t pfx_lo = f0 - npfx;
+                    pfx_ctx.prompt       = rs.prompt.data();
+                    pfx_ctx.codes        = rs.codes.data();
+                    pfx_ctx.P            = P;
+                    pfx_ctx.pfx_lo       = pfx_lo;
+                    Q                    = P + npfx;
+                    pfx_pos.resize((size_t) Q);
+                    for (int64_t i2 = 0; i2 < P; i2++)    pfx_pos[(size_t) i2] = (int32_t) i2;
+                    for (int64_t i2 = 0; i2 < npfx; i2++) pfx_pos[(size_t) (P + i2)] = (int32_t) (P + cap_off + pfx_lo + i2);
+                }
+                std::string perr;
+                if (!lm_kvprefix_run(&kvpfx, &t.lm, sched, arena, lm_ckpt_layer_opts(ckpt_st),
+                                     mm3_lm_prefix_embed, &pfx_ctx, pfx_pos.data(), Q, &perr)) {
+                    fatal_msg = "prior capture prefix failed for " + rs.id + ": " + perr;
+                    fprintf(stderr, "[mm3-lm-train] %s\n", fatal_msg.c_str());
+                    rc = 1;
+                    break;
+                }
+            }
 
             MM3PriorCache pc;
             pc.k = a.reg_topk; pc.n_pos = (int) n_sup; pc.width = W;
@@ -3460,7 +3641,8 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             LmSample smp;
             smp.tokens.assign((size_t) S, 0);
             smp.targets  = tgt;
-            smp.n_masked = (int) P;
+            smp.n_masked = (int) (P + lead);
+            smp.n_prompt = (int) P;
             smp.s_tr     = (int) n_sup;
             const bool ok = lm_ckpt_micro_step(ckpt_run, smp, false, nullptr);
             ckpt_run.capture_k   = 0;
@@ -3541,8 +3723,12 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             const bool drop_caption =
                 !is_reg && a.caption_dropout > 0.0 && !s.prompt_trigger_only.empty()
                 && lm_rng_uniform(&rng) < (float) a.caption_dropout;
+            const bool drop_lyrics =
+                !is_reg && !drop_caption && a.lyrics_dropout > 0.0 && !s.prompt_no_lyrics.empty()
+                && lm_rng_uniform(&rng) < (float) a.lyrics_dropout;
             const std::vector<int32_t> & prompt_ids =
-                drop_caption ? s.prompt_trigger_only : s.prompt;
+                drop_caption ? s.prompt_trigger_only : (drop_lyrics ? s.prompt_no_lyrics : s.prompt);
+            if (drop_lyrics) n_lyrics_dropped++;
             const int64_t       P = (int64_t) prompt_ids.size();
 
             // Fresh crop every time this song comes up. `beginning` exists only
@@ -3551,6 +3737,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             // exactly that crop and no other.
             int64_t K = std::min<int64_t>(K_max, s.n_frames);
             int64_t c0 = 0;
+            int64_t pfx_span = a.prefix_frames;   // history in front of the window; lever 4a shortens it on end steps
+            // A history-bearing reg excerpt (longer than K) is windowed flush to
+            // its end and its history becomes the prefix — the capture above
+            // used the same window, so the cached teacher matches.
+            if (is_reg && s.n_frames > K) c0 = s.n_frames - K;
             if (!is_reg && a.crop_mode != "beginning" && s.n_frames > K) {
                 const int64_t span = s.n_frames - K;          // largest legal c0
                 if (a.crop_mode == "structured") {
@@ -3577,7 +3768,18 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                                      : K * (1 + (int64_t) (lm_rng_next(&rng) % (uint64_t) (max_tiles - 1)));
                         }
                     } else if (u < a.crop_start_frac + a.crop_end_frac) {
-                        c0 = span;                            // flush to the end: EOS
+                        if (a.end_crop_vary) {
+                            // Lever 4a: a shorter window still flush to the
+                            // end, and a random slice of history in front of
+                            // it. Extra RNG draws ride the resume state.
+                            const int64_t k_lo = std::max<int64_t>(1, std::min<int64_t>(a.end_crop_min, K));
+                            K = k_lo + (int64_t) (lm_rng_next(&rng) % (uint64_t) (K - k_lo + 1));
+                            if (kv_on && a.prefix_frames > 0) {
+                                pfx_span = (int64_t) (lm_rng_next(&rng) % (uint64_t) (a.prefix_frames + 1));
+                            }
+                            n_end_vary++;
+                        }
+                        c0 = s.n_frames - K;                  // flush to the end: EOS
                     } else {
                         c0 = (int64_t) (lm_rng_next(&rng) % (uint64_t) (span + 1));
                     }
@@ -3596,11 +3798,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             // at frame 0. With history in front, frame c0-1 comes in as an
             // input and becomes that row instead; the caption stays blind to
             // the prefix, so its own states are unchanged.
-            const int64_t lead   = (kv_on && !is_reg && c0 > 0) ? 1 : 0;
+            const int64_t lead   = (kv_on && c0 > 0) ? 1 : 0;   // a reg step: only with a windowed excerpt
             const int64_t f0     = c0 - lead;               // first INPUT frame
             const int64_t Finw   = Fin + lead;
             const int64_t S      = P + Finw;
-            const int64_t anchor0 = anchor_song ? f0 : 0;
+            const int64_t anchor0 = anchor_song ? (s.frame_offset + f0) : 0;   // frame_offset: excerpt corpora only
 
             // Acoustic loss inputs for this micro-step. Reg steps opt out: the
             // prior path scores soft targets from the base model and has no
@@ -3654,15 +3856,16 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
 
             // ── frozen KV prefix ──────────────────────────────────────
             //
-            // A regularisation step gets NO prefix: its teacher distribution
-            // was captured with none, and scoring against it through a
-            // different context would be measuring drift that is not there.
+            // A regularisation step gets the prefix its teacher was captured
+            // with: none for a history-free excerpt, the excerpt's own history
+            // for a windowed one. Scoring through any other context would be
+            // measuring drift that is not there.
             if (kv_on) {
                 int64_t Q = 0;
-                if (!is_reg) {
+                if (!is_reg || c0 > 0) {
                     // History runs up to f0, because frame f0 itself is an
                     // input to the window (see `lead`).
-                    const int64_t pfx_lo = std::max<int64_t>(0, f0 - a.prefix_frames);
+                    const int64_t pfx_lo = std::max<int64_t>(0, f0 - pfx_span);
                     const int64_t npfx   = f0 - pfx_lo;
                     pfx_ctx.prompt       = prompt_ids.data();
                     pfx_ctx.codes        = s.codes.data();
@@ -3673,8 +3876,11 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                     for (int64_t i = 0; i < P; i++) {
                         pfx_pos[(size_t) i] = (int32_t) i;
                     }
+                    // Excerpt corpora carry their true start (frame_offset is 0
+                    // for ordinary corpora): the history sits where the base saw it.
+                    const int64_t pfx_off = anchor_song ? s.frame_offset : 0;
                     for (int64_t i = 0; i < npfx; i++) {
-                        pfx_pos[(size_t) (P + i)] = (int32_t) (P + pfx_lo + i);
+                        pfx_pos[(size_t) (P + i)] = (int32_t) (P + pfx_off + pfx_lo + i);
                     }
                 }
                 // Q == 0 still runs, because it is what CLEARS the store: the
@@ -3711,14 +3917,44 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                 smp.n_masked = (int) (P + lead);
                 smp.n_prompt = (int) P;
                 smp.s_tr     = (int) n_sup;
+                if (!prior && a.score_last > 0 && (int) n_sup > a.score_last &&
+                    (!a.score_last_end_only || at_end)) {
+                    // --score-last: the earlier rows stay as input context and
+                    // leave the loss; same column arithmetic as the head.
+                    const int skip = (int) n_sup - a.score_last;
+                    smp.n_masked += skip;
+                    smp.col_skip  = skip;   // the depth loss indexes by crop frame
+                    smp.s_tr      = a.score_last;
+                    smp.targets.assign(tgt.begin() + skip, tgt.begin() + skip + a.score_last);
+                }
                 if (prior) {
                     // Score against what the base model itself predicted here,
                     // not against this song's actual codes. `targets` goes
                     // unused; LmChunkLabelGuard switches on soft_k.
                     smp.soft_k   = prior->k;
-                    smp.soft_idx = prior->idx;
-                    smp.soft_p   = prior->p;
                     smp.s_tr     = std::min<int>(smp.s_tr, prior->n_pos);
+                    const int skip = (a.reg_score_last > 0 && smp.s_tr > a.reg_score_last)
+                                         ? smp.s_tr - a.reg_score_last : 0;
+                    if (skip > 0) {
+                        // Ending-targeted: the first `skip` supervised rows stay
+                        // as INPUT context and drop out of the loss. Same
+                        // column arithmetic as the head (n_masked - 1 + i).
+                        smp.n_masked += skip;
+                        smp.s_tr     -= skip;
+                        smp.soft_idx.assign(prior->idx.begin() + (size_t) skip * (size_t) prior->k,
+                                            prior->idx.begin() + (size_t) (skip + smp.s_tr) * (size_t) prior->k);
+                        smp.soft_p.assign(prior->p.begin() + (size_t) skip * (size_t) prior->k,
+                                          prior->p.begin() + (size_t) (skip + smp.s_tr) * (size_t) prior->k);
+                    } else {
+                        smp.soft_idx = prior->idx;
+                        smp.soft_p   = prior->p;
+                    }
+                    if (!reg_span_logged) {
+                        reg_span_logged = true;
+                        fprintf(stderr, "[mm3-lm-train] prior preservation: scoring the last %d of %d supervised rows per reg step "
+                                        "(per-row coefficient x%.3g vs the full window)\n",
+                                smp.s_tr, (int) n_sup, (double) n_sup / (double) smp.s_tr);
+                    }
                 }
                 ok = lm_ckpt_micro_step(ckpt_run, smp, true, &ce);
                 // The gradient tripwire, once, on the first real step: central
@@ -4003,6 +4239,14 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             fprintf(stderr, "[mm3-lm-train] could not write the final resume state: %s\n",
                     ferr.c_str());
         }
+    }
+    if (a.lyrics_dropout > 0.0) {
+        fprintf(stderr, "[mm3-lm-train] lyrics dropout: %lld style steps trained without lyrics (asked for %.1f%%)\n",
+                (long long) n_lyrics_dropped, 100.0 * a.lyrics_dropout);
+    }
+    if (a.end_crop_vary) {
+        fprintf(stderr, "[mm3-lm-train] varied end supervision: %lld end steps drew a varied window/history\n",
+                (long long) n_end_vary);
     }
     if (n_dropped > 0) {
         fprintf(stderr, "[mm3-lm-train] caption dropout: %d of %d style steps THIS SEGMENT "

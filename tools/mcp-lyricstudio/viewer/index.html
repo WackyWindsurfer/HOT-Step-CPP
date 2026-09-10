@@ -39,13 +39,19 @@
         <p id="brief" class="prose"></p>
         <h2>Participants</h2>
         <p id="participants" class="hint"></p>
+        <p class="hint">Agents appear while monitoring or researching. Disconnected chats disappear within 90 seconds of their last check; an active research hold lasts until its displayed expiry.</p>
         <section id="coordination" aria-live="polite">
           <p id="research-status" class="hint"></p>
           <button id="release-research" type="button" hidden>Release research hold</button>
           <div id="pending-requests"></div>
           <button id="clear-requests" type="button" hidden>Clear pending pings</button>
         </section>
-        <div class="room-controls"><button id="pause" type="button">Pause discussion</button><button id="resume" type="button" hidden>Resume discussion</button></div>
+        <div class="room-controls"><button id="pause" type="button">Pause discussion</button><button id="resume" type="button" hidden>Resume discussion</button><button id="end-discussion" type="button">End Discussion</button></div>
+        <section id="consensus" aria-live="polite" hidden>
+          <h2 id="consensus-title">Plan agreement</h2>
+          <p id="consensus-status" class="hint"></p>
+          <p id="consensus-agents" class="hint"></p>
+        </section>
         <details id="decision" hidden>
           <summary>Current proposed plan <span id="revision"></span></summary>
           <p><a id="export-plan" download>Download plan (.md)</a></p>

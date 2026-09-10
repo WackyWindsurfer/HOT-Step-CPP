@@ -199,6 +199,23 @@ test('group chat HTTP and MCP share the transcript without app access', { timeou
       const script = await (await fetch(base + '/viewer.js')).text();
       assert.match(script, /Automatic wake is not connected/);
     });
+    await t.test('End Discussion closes through HTTP and releases an MCP waiter', async () => {
+      const html = await (await fetch(base + '/')).text();
+      assert.match(html, /id="end-discussion"[^>]*>End Discussion/);
+      const script = await (await fetch(base + '/viewer.js')).text();
+      assert.match(script, /byId\('end-discussion'\)\.addEventListener\('click'.*'closed'/);
+      assert.match(script, /Consensus reached/);
+      const cursor = store!.read('review', 0, 1000).next_after_id;
+      const waiting = client.callTool({ name: 'collab_wait_for_message', arguments: { room: 'review', after_id: cursor, timeout_ms: 2000 } });
+      assert.equal((await write('status', { status: 'closed', body: 'User ended the discussion.' })).status, 200);
+      const received = JSON.parse(((await waiting).content as { text: string }[])[0].text);
+      assert.equal(received.discussion.status, 'closed');
+      assert.equal(received.timed_out, false);
+      assert.equal((await write('messages', { body: 'After ending' })).status, 409);
+      const ended = await (await fetch(base + '/api/discussions/review')).json() as any;
+      assert.equal(ended.consensus.reached, false);
+      assert.ok(ended.decision);
+    });
   } finally {
     await client.close();
     server.closeAllConnections();

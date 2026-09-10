@@ -150,6 +150,16 @@ struct MM3ArResult {
     int64_t n_codebooks  = 0;  // 8 = 1 semantic + 7 acoustic
     int64_t sem_vocab    = 0;  // SV
     bool    eos_hit      = false;
+    // EOS trace (MM3ArOptions::eos_trace), one entry per iteration, take 0 only:
+    //   eos_p_cond   softmax of the raw CONDITIONAL candidate row at EOS
+    //   eos_p_final  what the sampler would draw: CFG-guided, masked by the
+    //                conditional top-k, then top-k'd again (mm3_sample_top_k)
+    //   eos_rank     EOS's rank in the conditional row (0 = argmax)
+    //   eos_topk_ok  1 when EOS survived the conditional top-k mask
+    // Exists to answer "does the adapter still predict an ending at the true
+    // end of a real track" under forced replay, without touching sampling.
+    std::vector<float>   eos_p_cond, eos_p_final;
+    std::vector<int32_t> eos_rank, eos_topk_ok;
     // LRC text derived from the LM's own decode attention (mm3-align.h). Empty
     // when alignment was off, the track was instrumental, or alignment failed —
     // never a reason to fail the run.
@@ -210,6 +220,15 @@ struct MM3ArOptions {
 
     int64_t dump_iters      = 0;
     bool    collect_hiddens = true;
+    // Record per-iteration EOS statistics into MM3ArResult (see there). Costs
+    // two O(NCAND) passes per step on the host; off by default.
+    bool    eos_trace       = false;
+    // Forced replay normally stops at the end of the forced frames. With this
+    // on it hands over to free sampling there and runs to EOS or max_frames:
+    // the model continues someone else's plan (lever 4b, 2026-09-08: the base
+    // finishes an adapter's song; the same KV was built from the forced codes,
+    // so nothing is spliced). Needs full forcing (both code streams).
+    bool    forced_continue = false;
 
     // Lyric timestamps: capture the alignment heads' decode attention and emit
     // LRC into MM3ArResult::lrc. Needs the tokenizer to turn the lyric token
@@ -403,7 +422,13 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
             }
             return false;
         }
-        if (opt.forced_len - 1 < max_frames) {
+        if (opt.forced_continue && !forced_ac_given) {
+            if (err) {
+                *err = "forced_continue needs both forced_semantic and forced_acoustic";
+            }
+            return false;
+        }
+        if (!opt.forced_continue && opt.forced_len - 1 < max_frames) {
             max_frames = opt.forced_len - 1;  // entry 0 is the un-emitted iteration
         }
         if (max_frames <= 0) {
@@ -625,9 +650,11 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
     }
 
     for (int64_t it = 0; it <= max_frames; it++) {
-        if (forced && it >= opt.forced_len) {
+        if (forced && it >= opt.forced_len && !opt.forced_continue) {
             break;
         }
+        // Under forced_continue the iterations past the forced frames sample freely.
+        const bool forced_it = forced && it < opt.forced_len;
         const auto t_host0 = std::chrono::steady_clock::now();
 
         // ── sample this iteration's semantic code, once per take ──
@@ -701,17 +728,79 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
                         cand_guided[(size_t) i] = -INFINITY;
                     }
                 }
+                if (opt.eos_trace && t == 0) {
+                    // Raw conditional softmax at EOS, and EOS's rank in that row.
+                    double  cmax = -INFINITY;
+                    int64_t rank = 0;
+                    for (int64_t i = 0; i < NCAND; i++) {
+                        const double x = (double) cand_cond[(size_t) i];
+                        if (x > cmax) {
+                            cmax = x;
+                        }
+                        if (i > 0 && x > (double) cand_cond[0]) {
+                            rank++;
+                        }
+                    }
+                    double csum = 0.0;
+                    for (int64_t i = 0; i < NCAND; i++) {
+                        const double x = (double) cand_cond[(size_t) i];
+                        if (std::isfinite(x)) {
+                            csum += std::exp(x - cmax);
+                        }
+                    }
+                    const float p_cond = std::isfinite((double) cand_cond[0]) && csum > 0.0
+                                             ? (float) (std::exp((double) cand_cond[0] - cmax) / csum)
+                                             : 0.0f;
+                    // What the draw would see: the second top-k over the guided row
+                    // (mm3_sample_top_k), softmax over its survivors.
+                    float p_final = 0.0f;
+                    {
+                        int64_t k2 = TOPK > 0 ? (int64_t) TOPK : NCAND;
+                        if (k2 > NCAND) {
+                            k2 = NCAND;
+                        }
+                        float thr2 = -INFINITY;
+                        if (k2 < NCAND) {
+                            sel_scratch = cand_guided;
+                            std::nth_element(sel_scratch.begin(), sel_scratch.begin() + (size_t) (k2 - 1),
+                                             sel_scratch.end(), std::greater<float>());
+                            thr2 = sel_scratch[(size_t) (k2 - 1)];
+                        }
+                        double gmax = -INFINITY;
+                        for (int64_t i = 0; i < NCAND; i++) {
+                            const float g = cand_guided[(size_t) i];
+                            if (g >= thr2 && std::isfinite(g) && (double) g > gmax) {
+                                gmax = (double) g;
+                            }
+                        }
+                        double gsum = 0.0;
+                        for (int64_t i = 0; i < NCAND; i++) {
+                            const float g = cand_guided[(size_t) i];
+                            if (g >= thr2 && std::isfinite(g)) {
+                                gsum += std::exp((double) g - gmax);
+                            }
+                        }
+                        const float g0 = cand_guided[0];
+                        if (std::isfinite(g0) && g0 >= thr2 && gsum > 0.0) {
+                            p_final = (float) (std::exp((double) g0 - gmax) / gsum);
+                        }
+                    }
+                    outs[0].eos_p_cond.push_back(p_cond);
+                    outs[0].eos_p_final.push_back(p_final);
+                    outs[0].eos_rank.push_back((int32_t) rank);
+                    outs[0].eos_topk_ok.push_back(std::isfinite(cand_guided[0]) ? 1 : 0);
+                }
             }
 
             // ── repetition penalty on the guided candidates (knobs at
             // defaults: no-op). History = this take's emitted codes. ──
-            if (!forced && opt.knobs.rep_penalty > 1.0f) {
+            if (!forced_it && opt.knobs.rep_penalty > 1.0f) {
                 mm3_apply_rep_penalty(cand_guided.data(), NCAND, outs[t].semantic_all.data(),
                                       (int64_t) outs[t].semantic_all.size(), opt.knobs);
             }
 
             // ── sample (or replay) ──
-            if (forced) {
+            if (forced_it) {
                 const int32_t fs = opt.forced_semantic[it];
                 if (fs < 0 || (int64_t) fs >= SV) {
                     if (err) {
@@ -762,9 +851,10 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
         // ── depth decoder: the seven acoustic codes and their hidden states ──
         // Semantic-only forcing keeps the RNG alive so the depth decoder samples
         // the acoustic codebooks; full forcing passes null and replays them.
-        const int32_t * forced_ac = forced_ac_given ? opt.forced_acoustic + it * NC : nullptr;
+        const bool      forced_ac_it = forced_ac_given && it < opt.forced_len;
+        const int32_t * forced_ac = forced_ac_it ? opt.forced_acoustic + it * NC : nullptr;
         if (!mm3_depth_decode_takes(m, hidden.data(), sem_code.data(), forced_ac, frames.data(), err,
-                                    forced_ac_given ? nullptr : rngs.data(), TOPK)) {
+                                    forced_ac_it ? nullptr : rngs.data(), TOPK)) {
             return false;
         }
         out->depth_ms += frames[0].ms;

@@ -1163,6 +1163,8 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
     opt.max_frames      = mm3_json_i64(root, "max_frames", 300);
     opt.seed            = (uint64_t) mm3_json_i64(root, "seed", 42);
     opt.collect_hiddens = mm3_json_bool(root, "hiddens", false);
+    opt.eos_trace       = mm3_json_bool(root, "eos_trace", false);   // per-iteration EOS stats, JSON body only
+    opt.forced_continue = mm3_json_bool(root, "forced_continue", false);   // replay, then sample on to EOS
     opt.dump_iters      = req.has_param("dump") ? strtoll(req.get_param_value("dump").c_str(), nullptr, 10) : 0;
     // Ensemble takes: plan K independent songs from this prompt in one batched
     // pass (mm3-ar-loop.h). Clamped inside mm3_ar_plan_takes to the row budget.
@@ -1389,6 +1391,27 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
     yyjson_mut_obj_add_real(o, orot, "prefill_sum", r.prefill_sum);
     yyjson_mut_obj_add_real(o, orot, "iter0_max", r.iter0_max);
     yyjson_mut_obj_add_int(o, orot, "iter0_argmax", r.iter0_argmax);
+
+    // EOS trace (opt-in, take 0): parallel arrays indexed by iteration. See
+    // MM3ArResult for what each one measures.
+    if (opt.eos_trace) {
+        yyjson_mut_val * et = yyjson_mut_obj(o);
+        yyjson_mut_val * pc = yyjson_mut_arr(o);
+        yyjson_mut_val * pf = yyjson_mut_arr(o);
+        yyjson_mut_val * rk = yyjson_mut_arr(o);
+        yyjson_mut_val * ok = yyjson_mut_arr(o);
+        for (size_t i = 0; i < r.eos_p_cond.size(); i++) {
+            yyjson_mut_arr_add_real(o, pc, (double) r.eos_p_cond[i]);
+            yyjson_mut_arr_add_real(o, pf, (double) r.eos_p_final[i]);
+            yyjson_mut_arr_add_int(o, rk, r.eos_rank[i]);
+            yyjson_mut_arr_add_int(o, ok, r.eos_topk_ok[i]);
+        }
+        yyjson_mut_obj_add_val(o, et, "p_cond", pc);
+        yyjson_mut_obj_add_val(o, et, "p_final", pf);
+        yyjson_mut_obj_add_val(o, et, "rank", rk);
+        yyjson_mut_obj_add_val(o, et, "topk_ok", ok);
+        yyjson_mut_obj_add_val(o, orot, "eos_trace", et);
+    }
 
     // One entry per take: its seed, how far it got, and its own semantic code
     // sequence. The codes are what an ensemble has to be judged on — two takes

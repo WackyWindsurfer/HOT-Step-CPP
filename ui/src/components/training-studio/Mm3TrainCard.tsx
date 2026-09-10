@@ -22,7 +22,7 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { estimateMm3PeakMb, estimateMm3PrefixMb, mm3FlashVramCalibrated } from '../../services/trainingApi';
+import { estimateMm3PeakMb, estimateMm3PrefixMb, mm3FlashVramCalibrated, type Mm3PresetName } from '../../services/trainingApi';
 import type { Mm3TrainLmRequest } from '../../services/trainingApi';
 import { useTrainingStore } from '../../stores/trainingStore';
 import { JobProgress } from './JobProgress';
@@ -81,7 +81,6 @@ interface FormState {
   prefixN: number;
   /** '' = auto-pick (server-side ladder — see mm3Preview.ts). */
   previewSongId: string;
-  sharedCaption: string;
   gradAccum: number;
   seed: number;
   trigger: string;
@@ -211,7 +210,6 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
     artistTokenLr: status.defaults.artistTokenLr ?? 0.005,
     prefixN: status.defaults.prefixN ?? 0,
     previewSongId: '',
-    sharedCaption: status.sharedCaption ?? '',
     gradAccum: status.defaults.gradAccum ?? 1,
     seed: status.defaults.seed ?? 42,
     trigger: trigger ?? '',
@@ -324,12 +322,15 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
       const body: Mm3TrainLmRequest = {
         steps: form.steps, saveEvery: form.saveEvery, rank: form.rank, alpha: form.alpha,
         lr: form.lr, maxFrames: form.maxFrames, cropMode: form.cropMode,
+        // Informational: the fields above already carry the recipe. The
+        // route lays a named preset UNDER them, so this changes nothing here
+        // and only tells a log reader which recipe the user started from.
+        preset: activePreset === 'custom' ? undefined : activePreset,
         cropStartFrac: form.cropStartFrac, cropEndFrac: form.cropEndFrac,
         cropStartTiles: form.cropStartTiles,
         depthLossWeight: form.depthLossWeight, depthLossFrames: form.depthLossFrames,
         optimizer: form.optimizer, muonLrScale: form.muonLrScale,
         adapterType: form.adapterType, lokrFactor: form.lokrFactor,
-        sharedCaption: form.sharedCaption,
         gradAccum: form.gradAccum, seed: form.seed,
         basePrecision: form.basePrecision, holdout: form.holdout, evalEvery: form.evalEvery,
         cropAnchor: form.cropAnchor,
@@ -423,6 +424,28 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) =>
     setEdits(e => ({ ...e, [k]: v }));
 
+  // Presets are DERIVED from the fields, never stored: the row highlights
+  // whichever preset the four governing fields currently equal, and shows
+  // Custom otherwise. Editing a field therefore leaves the preset row honest
+  // without a second piece of state that could disagree with the form.
+  const PRESET_ORDER: Mm3PresetName[] = ['balanced', 'thorough', 'fast'];   // default first; Fast is experimental
+  const presets = status?.presets;
+  const activePreset: Mm3PresetName | 'custom' = (() => {
+    if (!presets || !form) return 'custom';
+    const hit = PRESET_ORDER.find(p => {
+      const q = presets[p];
+      return q && form.steps === q.steps && form.lr === q.lr
+          && form.maxFrames === q.maxFrames && form.prefixFrames === q.prefixFrames;
+    });
+    return hit ?? 'custom';
+  })();
+  const applyPreset = (p: Mm3PresetName) => {
+    const q = presets?.[p];
+    if (!q) return;
+    setEdits(e => ({ ...e, steps: q.steps, lr: q.lr, maxFrames: q.maxFrames, prefixFrames: q.prefixFrames,
+                     stopMode: 'steps' }));
+  };
+
   const hasCodes = (status?.codes ?? 0) > 0;
   const hasLaundered = (status?.codesLaundered ?? 0) > 0;
   const trainBlocked = (status?.missingForTrain.length ?? 0) > 0;
@@ -497,6 +520,36 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                     { n: status?.codesLaundered ?? 0 })}
                 </span>
               </label>
+            )}
+            {/* -- Presets (2026-09-07) -----------------------------------
+                Three recipes that tied blind; they trade minutes, not
+                audible quality. The row reflects the fields, so a hand edit
+                shows as Custom rather than misreporting a preset. */}
+            {presets && (
+              <div className="mb-3">
+                <div className="text-[11px] font-medium text-zinc-500 uppercase tracking-wider mb-1">
+                  {t('trainingStudio.mm3.preset', 'Recipe')}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {PRESET_ORDER.map(p => (
+                    <button key={p} type="button" onClick={() => applyPreset(p)} disabled={busy}
+                      className={BTN_SM + (activePreset === p
+                        ? ' !border-amber-500 !text-amber-600 dark:!text-amber-400 !bg-amber-500/10' : '')}>
+                      {t(`trainingStudio.mm3.preset.${p}`, p)}
+                    </button>
+                  ))}
+                  {activePreset === 'custom' && (
+                    <span className={BTN_SM + ' !border-amber-500 !text-amber-600 dark:!text-amber-400 !bg-amber-500/10 cursor-default'}>
+                      {t('trainingStudio.mm3.preset.custom', 'Custom')}
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] text-zinc-500 mt-1">
+                  {activePreset === 'custom'
+                    ? t('trainingStudio.mm3.preset.customInfo', 'Steps, learning rate, crop or history differ from every preset.')
+                    : t(`trainingStudio.mm3.preset.${activePreset}Info`, '')}
+                </p>
+              </div>
             )}
             {/* -- Stopping strategy ---------------------------------------
                 Two ways to answer "when is this run done": a step count, or a
@@ -843,26 +896,9 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                   <NumField label={t('trainingStudio.mm3.seed', 'Seed')} value={form.seed}
                     onChange={v => set('seed', v)} />
                 </div>
-                <label className="flex flex-col gap-1">
-                  <span className="text-[11px] font-medium text-zinc-500 uppercase tracking-wider">
-                    {t('trainingStudio.mm3.sharedCaption', 'Dataset-wide caption (fallback)')}
-                  </span>
-                  <textarea className={INPUT} rows={4} value={form.sharedCaption}
-                    placeholder={'artist name, album name, genre, guitar character, vocal character, '
-                      + 'rhythm section, production character, tempo, structure'}
-                    onChange={e => set('sharedCaption', e.target.value)} />
-                  <span className="text-[10px] text-zinc-500 leading-snug">
-                    {t('trainingStudio.mm3.sharedCaptionHint',
-                      'LEAVE BLANK to train on the per-track .mm3.txt captions generated in the '
-                      + 'Enhance panel with MOSS or Gemini, which is the intended input. Fill this in '
-                      + 'only as a fallback for a dataset without them: ONE caption then replaces '
-                      + 'every track\'s caption, so the adapter has nowhere to put the style except '
-                      + 'into itself and the caption becomes the handle that summons the album. '
-                      + 'Start with the artist name so it doubles as the trigger. Aim for 60-80 '
-                      + 'tokens of comma-separated descriptors. Saved to _shared-caption.txt beside '
-                      + 'the dataset.')}
-                  </span>
-                </label>
+                {/* The dataset-wide caption box lived here until 2026-09-09. One caption for
+                    every track replaced the per-track .mm3.txt captions the renders use, and
+                    adapters trained that way did not end songs (Green Day 0/6 vs 4/6). Removed. */}
                 {/* ── Method row (2026-09-05) ───────────────────────────────
                     Same shape as TrainDitForm's DitMethod / TrainLmForm's
                     LmMethod: LoKr is its own type, DoRA/HiRA/LoHa/HRA are the

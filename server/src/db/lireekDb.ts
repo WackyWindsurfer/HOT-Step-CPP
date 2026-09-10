@@ -153,6 +153,12 @@ export function getLyricsSet(id: number): Record<string, any> | null {
   return row;
 }
 
+/** Update a set's stored songs only (the MM3 caption refresh; see
+ *  services/lireek/mm3CaptionSync.ts). Album and image untouched. */
+export function updateLyricsSetSongs(lyricsSetId: number, songs: Record<string, any>[]): void {
+  getDb().prepare('UPDATE lyrics_sets SET songs = ? WHERE id = ?').run(JSON.stringify(songs), lyricsSetId);
+}
+
 export function deleteLyricsSet(id: number): boolean {
   return getDb().prepare('DELETE FROM lyrics_sets WHERE id = ?').run(id).changes > 0;
 }

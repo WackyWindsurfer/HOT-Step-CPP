@@ -1,0 +1,16 @@
+Global Metadata
+Basic Attributes: bpm is 104. key is B, and scale is minor. Post-Punk.
+Global Emotional Progression: The piece opens tense and withheld, the verses carrying a coiled, private discomfort as the narrator replays a small social failure. The chorus states the anxiety plainly without releasing it, the second verse deepens the unease rather than resolving it, and the outro settles into a flat, repeated line that never lifts into relief, ending on unresolved tension.
+Application Scenarios & Imagery: Ideal for a late-night drive scene, a quiet moment of post-social-event regret, or any montage built around awkward silence and replayed conversation.
+Sonics & Production Profile: The production is crisp and contemporary, with electric guitars panned wide and a tight, controlled low end that never fully opens up. Dynamics stay restrained through the verses and lift only slightly for the choruses, keeping the overall dynamic range narrow and claustrophobic, true to the song's unresolved emotional register.
+Vocal Details
+Vocal Gender & Timbre: Singer A (Male). A mid-range, slightly strained tone with a tight, held-back quality, sitting close and dry rather than open or resonant.
+Vocal Style: The performance begins quiet and clipped through the verses, almost muttered, then tightens into a flat, insistent delivery on the chorus hook without ever raising into a shout. The outro repeats the same line with diminishing inflection, trailing toward a deadpan close.
+Harmony/Backing Vocals: A low, murmured backing phrase answers the lead underneath the chorus, functioning as a second, doubting voice, and drops away entirely for the verses before returning thin and distant behind the outro repetitions.
+Vocal FX: The lead vocal stays dry and close-mic'd through the verses with minimal processing, gaining light plate reverb and subtle doubling only on the chorus hook. The outro carries a short, decaying delay on the repeated line, fading it slightly with each pass.
+Arrangement
+Instrument Lifecycle Description (Primary/Secondary Layering):
+Primary: A palm-muted electric guitar riff, taut and minor-keyed, opens the track alone before drums and bass enter with the first verse, thickening into full distorted chords for the chorus.
+Secondary: A melodic bassline locks in under the verse and pushes harder through the chorus; a second guitar layers in on the second verse for added tension, while a subdued keyboard pad shades the final chorus before pulling back for the outro.
+Groove & Foundation Progression: The rhythm section holds a restrained, mid-tempo pulse through the first verse, kick and snare kept sparse with closed hi-hats. The chorus opens into a fuller eighth-note bass pattern and driving snare backbeat, the second verse pulls back again to the restrained pattern, the final chorus returns at full force, and the outro strips down to a bare kick pulse under the repeated vocal line.
+Embellishments, Textures & Spatial FX: Short guitar fills mark the turns between verse and chorus, with a single held guitar note bridging into each new section. The outro carries a slow-decaying delay tail on the vocal as the instruments thin out beneath it, closing the track on a quiet, unresolved fade.

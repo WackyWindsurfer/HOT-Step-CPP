@@ -107,7 +107,13 @@ export const MetadataSection: React.FC<MetadataSectionProps> = ({
           {bpm === 0 && <span className="text-[10px] text-zinc-600">{t('metadataSection.auto')}</span>}
         </div>
 
-        {/* Duration */}
+        {/* Duration — hidden in MM3 mode.
+            MiniMax-Music3 has no length input: the number becomes a frame cap
+            and nothing else, so the only thing it can do is cut the song off
+            before the planner's own ending. Every MM3 render is auto, enforced
+            server-side (backends/minimax/generate.ts), and a control whose
+            single setting is "Auto" is a control worth removing. */}
+        {!mm3Mode && (
         <div>
           {durationAuto ? (
             isAutoDuration ? (
@@ -134,6 +140,7 @@ export const MetadataSection: React.FC<MetadataSectionProps> = ({
             </>
           )}
         </div>
+        )}
 
         {/* Key */}
         <div>
