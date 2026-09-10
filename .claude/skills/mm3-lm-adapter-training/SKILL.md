@@ -230,6 +230,10 @@ the 32 GB card at crop 750 + prefix 4096.
 
 ### Endings, honest status (2026-09-10)
 
+Tool: `tools/vocal-end/vocal_end.py` (SuperSep vocal stem + energy trace + whisper hint) tells you where singing
+starts and stops in any render or dataset track; use it before believing an LRC timestamp or guessing at a tail.
+
+
 Per-track captions are necessary (the shared caption gave 0/6) but not sufficient: the same recipe's per-plan
 natural-ending rate is 0.2-0.5, varies with the caption x lyrics pair and with the training draw (the trainer is
 deterministic per seed; two draws gave 2/6 and 3/6 with equal likeness), and Rob's in-app test on three fresh albums

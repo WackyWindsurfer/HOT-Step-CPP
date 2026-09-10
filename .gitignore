@@ -79,6 +79,8 @@ tools/mcp-lyricstudio/node_modules/
 !tools/lm-attr-probe/
 !tools/mm3-reg-corpus/
 !tools/mm3-trim-silence/
+!tools/vocal-end/
+tools/vocal-end/out/
 tools/discord-claude/node_modules/
 tools/discord-claude/.env
 tools/discord-claude/sessions.json
@@ -178,3 +180,4 @@ agentcoordination.md
 
 # tools/essentia/ is the Essentia BUILD RECIPE (scripts), not a binary drop like Essentia/
 !tools/essentia/
+tools/vocal-end/out/

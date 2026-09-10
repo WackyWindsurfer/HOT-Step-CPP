@@ -902,6 +902,13 @@ sweeping violence_level 2.0 → 0.0 changes nothing. A plain monotonic DTW over
 the head-averaged matrix, grouped on newline tokens, is what works — see
 `mm3-align.h`. `lrc_align()` stays untouched for ACE.
 
+## Analysis tool: where the vocals sit (2026-09-10)
+
+`tools/vocal-end/vocal_end.py <audio...>`: SuperSep (engine, level 4) vocal stem -> energy-based vocal activity
+(first/last vocal, tail, share, gaps; the reliable signal) + whisper-cli per-word on the stem (hallucinates on stems;
+lyric-repeat hint only). Needs the engine up. The MM3 LRC is a forced alignment and cannot answer "did the singing
+stop"; this can. README in the folder.
+
 ## Runtime LM adapters (SHIPPED 2026-08-20 — engine + server + UI)
 
 `engine/src/minimax/mm3-lm-adapter.h` loads PEFT LM LoRAs (SimpleTuner
