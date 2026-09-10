@@ -10,7 +10,7 @@ param(
   [int]$MaxDuration = 150,
   [int]$Steps = 8,
   [string]$Only = '',
-  [string]$Slugs = '',        # comma-separated subset, e.g. "nas_illmatic,kinks_somethingelse"
+  [string]$Slugs = '',        # comma-separated subset, e.g. "<slug>,<slug>"
   [string]$SynthModel = '',   # pin the base DiT by engine name; empty = engine default
   [int]$Limit = 0,
   [switch]$SkipRender,

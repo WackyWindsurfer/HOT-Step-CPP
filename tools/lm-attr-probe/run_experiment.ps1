@@ -28,7 +28,7 @@
 #   powershell -File tools/lm-attr-probe/run_experiment.ps1 [-Slugs "a,b,c"] [-Samples 8]
 #       [-MaxDuration 150] [-Steps 8] [-SynthModel <name>] [-DryRun]
 param(
-  [string]$Slugs = 'kinks_somethingelse,inxs_kick,nas_illmatic',
+  [string]$Slugs = ''   # required: comma-separated dataset slugs,
   [int]$Samples = 8,
   [int]$MaxDuration = 150,
   [int]$Steps = 8,

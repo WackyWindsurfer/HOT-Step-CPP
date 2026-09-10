@@ -7,7 +7,7 @@
 //   Rob's blind-ish A/B, 2026-08-15, same track / lyrics / 5 seeds, Basic
 //   Attributes forced identical in both arms so prose was the only variable:
 //     restructured-from-Gemini -> "more plain rock, not particularly punk/emo"
-//     MOSS-from-audio          -> "sounds like alkaline trio already, that's
+//     MOSS-from-audio          -> "sounds like the album-A artist already, that's
 //                                  crazy ... MOSS is WAY better"
 //   Two of five seeds hit the target artist with NO ADAPTER LOADED.
 //

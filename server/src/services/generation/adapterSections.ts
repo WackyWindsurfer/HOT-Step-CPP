@@ -2,8 +2,8 @@
 //
 // Parses inline per-section adapter-influence directives from the lyrics, e.g.
 //
-//   [Intro]{greenday_idiot=1; blink_selftitled=0}
-//   [Verse 1]{greenday_idiot=0.5; blink_selftitled=0.5}
+//   [Intro]{albumB2=1; albumN=0}
+//   [Verse 1]{albumB2=0.5; albumN=0.5}
 //   ...lines...
 //   [Chorus]{#1=0; #2=1}   (positional #N / bare N also accepted)
 //

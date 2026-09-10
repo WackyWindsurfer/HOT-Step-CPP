@@ -125,12 +125,12 @@ struct DitTrainArgs {
     float       target_loss = 0.4f;
     std::string order       = "shuffle";
 
-    // crop_max 800 (2026-09-03): three clean ear A/Bs (nirvana 438 vs 1544,
+    // crop_max 800 (2026-09-03): three clean ear A/Bs (album I 438 vs 1544,
     // mika 552 vs 1516 on its own track and on a foreign track) all preferred
     // the short-crop adapter. Long crops reach low loss 2-3x faster and export
     // deep memorisers of 60 s windows (coarse/bitty); short crops memorise
     // quiet windows too faithfully (fuzz in quiet passages). 800 is the middle
-    // Rob's best-liked adapter came from (fightstar, 824). Explicit --crop-max
+    // Rob's best-liked adapter came from (album D, 824). Explicit --crop-max
     // still wins in both directions.
     int   crop = 0, crop_min = 375, crop_max = 800;
     // Set by the CLI parser when --crop-max was given explicitly. Only the

@@ -193,10 +193,10 @@ For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual 
 | Attention VRAM per site at S=3000 | 487 MB fused vs 4.9 GB manual |
 | Parity worst rel err | f32 3.5e-6 (bar 1e-4); tf32 4.7e-4 (bar 5e-3, floor 1e-5) |
 | Flash vs exact drift, 200 same-seed epochs | smaller than `--bwd mm` |
-| Done-gate auto-fit, production LoKR, unpinned | nwa 1498 (enc_S 1877), fightstar 1616 (enc_S 640); LoRA r16 ~3400 |
+| Done-gate auto-fit, production LoKR, unpinned | albumJ 1498 (enc_S 1877), album D 1616 (enc_S 640); LoRA r16 ~3400 |
 | LoKR apply reorder | −10% step, LoKR:LoRA 1.35→1.21; the two copies are unavoidable, ~7% of step |
 | 12 GB emulated card, flash+bf16+LoRA r16 | full 32-layer depth, crop 410, 4 segments |
-| **LM, 4B low-VRAM, flash vs shipped (`exact --attn-head-block 8`)** | **5.5% faster/micro-step, 3.8% lower peak VRAM** (paired, interleaved, kinks_somethingelse substitute) |
+| **LM, 4B low-VRAM, flash vs shipped (`exact --attn-head-block 8`)** | **5.5% faster/micro-step, 3.8% lower peak VRAM** (paired, interleaved, albumF substitute) |
 | LM, 4B low-VRAM, flash vs equal-shape (`exact --attn-head-block 0`) | 1.2% faster — the head-block copies are almost the whole DiT-vs-LM difference |
 | LM attention-only bound (`fattn-train-test --bench-lm` vs blocked) | 0.74×/0.79×/0.80× at S=1024/2113/3500 |
 | LM naive auto-fit `maxLen` lift, flash vs exact | 0.6B ~2.0× (3136→6208 tok); 1.7B ~1.27× (2624→3328 tok) |
@@ -215,10 +215,10 @@ For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual 
   (−11.9% to −12.9% measured, same class as the DiT's exact-mode item above); the flash branch's
   `naive_nonattn_scale` corrects around it but the exact-mode fix itself is owed and needs its
   own gate, since it would move every shipped run's `estMb`/auto-fit `maxLen`.
-- LM G5/G6 ran on `kinks_somethingelse`, not nirvana — the box has no `nirvana*` tensor dir, and
-  the plan's ear pair (G7) is specified on nirvana/E3 lineage. Nirvana codes need Preprocess +
+- LM G5/G6 ran on `albumF`, not album I — the box has no `albumI*` tensor dir, and
+  the plan's ear pair (G7) is specified on album I/E3 lineage. album I codes need Preprocess +
   Extract via the Training Studio batch pipeline before G7 can run as written.
-- LM G7 ear test (twin nirvana adapters, staged in `_experiments/_LISTENING`) — not run, needs
+- LM G7 ear test (twin album I adapters, staged in `_experiments/_LISTENING`) — not run, needs
   Rob; the flash checkbox stays off until it lands.
 - Pre-existing bugs surfaced while porting R2, neither fixed (both reproduce on a pre-flash
   binary): `mm3-lm-train` crashes at export with a `ggml-backend.cpp` tensor-write-out-of-bounds

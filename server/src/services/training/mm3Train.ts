@@ -494,8 +494,8 @@ export function mm3RunName(slug: string): string {
 export const MM3_LM_DEFAULTS = {
   // ── bghira's published SimpleTuner recipe (adopted 2026-08-23) ───────────
   //
-  // Sources, both with full configs: the SOAD tournament
-  // (RareConcepts/soad-mm3-vanilla-20260822, simpletuner_config.json in every
+  // Sources, both with full configs: the album C tournament
+  // (RareConcepts/<his public MM3 dataset>, simpletuner_config.json in every
   // checkpoint) and terminusresearch/minimax-music3-lm-lora-fiona-crapple.
   //
   // What we ran before: r256/alpha256, lr 8e-5, Muon @ lr_scale 64, random
@@ -565,8 +565,8 @@ export const MM3_LM_DEFAULTS = {
    *  Measured trajectories at the shipped recipe (trailing-25 mean):
    *
    *      step        25     100     250     500
-   *      fightstar   3.14   2.50    1.43    0.59
-   *      johnnycash  3.28   2.23    0.92    0.31
+   *      album D   3.14   2.50    1.43    0.59
+   *      albumE  3.28   2.23    0.92    0.31
    *      limbizkit   3.62   2.72    2.03      -
    *
    *  So 0.1 binds on the albums that converge fast, somewhere past 500, and
@@ -574,7 +574,7 @@ export const MM3_LM_DEFAULTS = {
    *  It sits just above the ~0.05 mark where runs had demonstrably memorised
    *  their songs, and for an ALBUM CLONE that is the intended end of the range.
    *
-   *  1.0 since 2026-09-05 (Rob), from a blind depth ladder on alk3_crimson:
+   *  1.0 since 2026-09-05 (Rob), from a blind depth ladder on albumA:
    *  the step-250 checkpoint (5-epoch mean ~1.06) beat the step-500 one
    *  (0.25 at the save, 0.08 at the best step) on every one of three songs,
    *  and the step-500 checkpoint emitted an empty plan (EOS at once) on one
@@ -724,7 +724,7 @@ export const MM3_LM_DEFAULTS = {
    *
    *  What Prodigy buys, when the budget is not the binding constraint: it sets
    *  its own step size, so `lr` becomes a schedule multiplier only and the
-   *  trainer forces it to 1.0. On Green Day it converged to an effective 8.19e-5
+   *  trainer forces it to 1.0. On album B it converged to an effective 8.19e-5
    *  against the 8e-5 tuned by hand — within 2.4%, from d0 = 1e-6 and no
    *  guidance.
    *
@@ -738,11 +738,11 @@ export const MM3_LM_DEFAULTS = {
   /** Prodigy again (Rob, 2026-08-25). It was demoted to AdamW only to buy
    *  crop VRAM at 4272 frames; at crop 750 there is >12 GB of headroom and its
    *  ~2.7 GB of extra buffers stop mattering. It sets its own step size (on
-   *  Green Day it converged within 2.4% of the hand-tuned 8e-5), resumes as of
+   *  album B it converged within 2.4% of the hand-tuned 8e-5), resumes as of
    *  format v2 so checkpoint-cadence previews work, and `lr` becomes a
    *  schedule multiplier the trainer forces to 1.0. */
   /** adamw since 2026-09-06 (Rob): in the blind HOT-PiZZA recipe test on
-   *  alk3_crimson, AdamW at lr 8e-5 tied Prodigy by ear (69.5 vs 72 of 90,
+   *  albumA, AdamW at lr 8e-5 tied Prodigy by ear (69.5 vs 72 of 90,
    *  inside the noise floor) and saved 2.3 GB of optimizer state. The stacked
    *  recipe (prefix 2048 + flash + AdamW + f16 factors) was rated "fantastic"
    *  sighted and is the shipped default. Prodigy stays selectable. */
@@ -792,7 +792,7 @@ export const MM3_LM_DEFAULTS = {
    *  and rank 128.
    *
    *  LoKr was the default until 2026-09-06. In the blind method test on
-   *  alk3_crimson (nine arms, three songs, everything locked but the method)
+   *  albumA (nine arms, three songs, everything locked but the method)
    *  it came last of the arms that rendered all three songs, with one drone
    *  failure, at 1.5x LoRA's step time. Plain LoRA is next in line after
    *  HOT-PiZZA below; LoKr stays selectable. */
@@ -806,7 +806,7 @@ export const MM3_LM_DEFAULTS = {
    *  where every crop was labelled as if it were the song's opening. That was a
    *  straight train/inference mismatch — generation always begins at frame 0,
    *  so the positions a mid-song crop occupied during training are the ones
-   *  that mean "the first two seconds" at render time. bghira's SOAD campaign
+   *  that mean "the first two seconds" at render time. bghira's album C campaign
    *  independently reports the two symptoms this predicts (sound arriving
    *  instantly at 0:00, tempo drifting mid-track) and that position-labelled
    *  windowed crops fix the pacing. `zero` is kept only to reproduce an older
@@ -934,7 +934,7 @@ export const MM3_LM_DEFAULTS = {
    *  random `rankDropout` share of the base's own top-128 subspace is deleted
    *  and the rest scaled 1/keep while the album is fitted. Found as a masking
    *  bug on 2026-09-05; kept on purpose because its adapter beat every
-   *  correctly-masked method by ear on alk3_crimson, twice (66.5-68/90 vs
+   *  correctly-masked method by ear on albumA, twice (66.5-68/90 vs
    *  LoRA 60-64, DoRA 63, LoKr 41.5; corrected PiSSA 39.5 with drone plans).
    *  One album so far. The export is an ordinary rank-2r LoRA; loaders need
    *  nothing. Train loss reads high under it — stop on steps. `hotPizza`
@@ -973,13 +973,13 @@ export const MM3_LM_DEFAULTS = {
  *   balanced  THE DEFAULT: crop 750, a 2048-frame history prefilled in
  *             256-token chunks, 500 steps at 8e-5, per-track captions, no
  *             prior. ~36 min per album. On 2026-09-09 this exact recipe
- *             (GOODCAPS) gave Green Day 4/6 natural endings with likeness,
+ *             (GOODCAPS) gave album B 4/6 natural endings with likeness,
  *             intelligibility and style Rob rated perfect; the same recipe
  *             under the old dataset-wide caption ended 0/6.
  *   fast      Balanced's geometry (crop 750, history 2048) over 300 steps,
  *             with the history prefilled in 1024-token chunks: ~22 min. The
  *             2026-09-07 Fast (crop 500, history 1024, 2x LR) broke vocals on
- *             greenday_warning; each of those three ingredients is gone here
+ *             albumB; each of those three ingredients is gone here
  *             and the chunk size was cleared as a lever in that bisect. The
  *             300-step depth is the one thing not re-heard since.
  *   thorough  crop 750 and a 4096-frame history over 1000 steps, prefilled
@@ -1303,7 +1303,7 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
   if (o.trigger) {
     args.push('--trigger', o.trigger);
     // Without this the word is recorded and never trained — the failure the
-    // first SOAD run shipped with.
+    // first album C run shipped with.
     if (o.triggerPrepend) args.push('--trigger-prepend');
   }
   if (o.datasetName) args.push('--dataset-name', o.datasetName);

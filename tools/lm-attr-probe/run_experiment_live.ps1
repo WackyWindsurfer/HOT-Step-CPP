@@ -7,7 +7,7 @@
 #   pplive   = { regEvery: 3, regTeacher: "live" }                         (live-teacher prior preservation)
 #   bothlive = { regEvery: 3, regTeacher: "live", captionDropout: 0.3 }    (pplive + caption dropout)
 param(
-  [string]$Slugs = 'kinks_somethingelse,inxs_kick,nas_illmatic',
+  [string]$Slugs = ''   # required: comma-separated dataset slugs,
   [string]$ArmList = 'flash,pplive,bothlive',   # subset of the arms below, comma-separated
   [int]$Samples = 8,
   [int]$MaxDuration = 150,
@@ -80,7 +80,7 @@ function Get-LedgerRunDir([string]$slug, [string]$arm) {
 }
 
 # Wait for any ace-train.exe to be gone before starting a build/GPU run (the stray
-# nirvana-exact job on kinks must not be cancelled -- just wait it out).
+# album I-exact job on kinks must not be cancelled -- just wait it out).
 function Wait-ForNoAceTrain {
   $waited = $false
   while (Get-Process -Name 'ace-train' -ErrorAction SilentlyContinue) {

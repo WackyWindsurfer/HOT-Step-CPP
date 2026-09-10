@@ -119,7 +119,7 @@ struct QwLoraPair {
     // own top-r subspace is stochastically deleted (and the rest scaled
     // 1/keep) every micro-step. Found by accident as a masking bug on
     // 2026-09-05; the adapter it produced beat every correctly-masked method
-    // by ear on alk3_crimson twice, so it is kept on purpose behind this flag
+    // by ear on albumA twice, so it is kept on purpose behind this flag
     // (train/lm-graph.h says exactly what the forward is). Trainer-only.
     bool                 hot_pizza = false;
 };

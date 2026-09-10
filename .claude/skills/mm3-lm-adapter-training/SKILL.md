@@ -10,10 +10,10 @@ could be another track off that record. Memorisation is acceptable and in fact
 desirable; style bleed is acceptable. This is NOT tuned for a surgical trigger
 LoRA that leaves the base model otherwise untouched.
 
-Established over a 6-album, 30,000-step sweep on 2026-08-23/24 (Green Day,
-System Of A Down, Lagwagon, White Stripes, Outkast, Alkaline Trio), each album
+Established over a 6-album, 30,000-step sweep on 2026-08-23/24 (album B,
+the album-C artist, album K, album M, album L, the album-A artist), each album
 laddered by ear across 20 checkpoints. Working log: `docs/plans/
-2026-08-23-mm3-soad-style-adapter-findings.md` *(gitignored, local only)*.
+2026-08-23-mm3-albumC-style-adapter-findings.md` *(gitignored, local only)*.
 
 ## THE CURRENT BEST RECIPE
 
@@ -44,13 +44,13 @@ rendered on q8_0 at MLP 1.0 — the same dials generation uses.
 
 **Rob, 2026-09-06, on the stacked HOT-PiZZA recipe above (blind-hotpissa-recipe
 letter F): "sounds fantastic, this should be the default in-app."** Cost on
-alk3_crimson: 4.7 s/step, 39 min for 500 steps, peak 25.9 GB — against the
+albumA: 4.7 s/step, 39 min for 500 steps, peak 25.9 GB — against the
 2026-09-05 LoKr/Prodigy/exact/4096 line's 5.9 s, 49 min, 30.4 GB. Every
 lever was first tied individually in a blind set, then stacked and heard.
 The earlier LoKr line stays in the git history of this file.
 
 **2026-09-07, the safe stack.** An overnight one-lever-at-a-time speed trial
-(`overnight-speed/COSTS.md` + `blind-speed/RESULTS.md` in the alk3 hub) found
+(`overnight-speed/COSTS.md` + `blind-speed/RESULTS.md` in the album A hub) found
 prefix 1024 (69 of 90) and crop 500 (67.5) tie the reference (68), while the
 prefill chunk 256 → 1024 cuts 17% off the step with an identical step-1 loss.
 Combined and heard blind (`blind-confirm/RESULTS.md`): safe stack 67 vs the
@@ -68,7 +68,7 @@ fields, so `{preset:'thorough'}` alone trains Thorough):**
 
 | preset | steps | lr | crop | history | min/album (5090) | record |
 |---|---|---|---|---|---|---|
-| Fast (EXPERIMENTAL) | 300 | 1.6e-4 | 500 | 1024 | 15 | tied blind on 90 s previews, then 5/5 full-album runs on greenday_warning had Simlish / missing vocals / an out-of-tune organ; lr and chunk cleared as sole causes |
+| Fast (EXPERIMENTAL) | 300 | 1.6e-4 | 500 | 1024 | 15 | tied blind on 90 s previews, then 5/5 full-album runs on albumB had Simlish / missing vocals / an out-of-tune organ; lr and chunk cleared as sole causes |
 | **Balanced** (default) | 500 | 8e-5 | 750 | 2048 (chunk 256) | 35 | the rock-10 recipe; retrained on the same binary it reproduced the morning's adapter and Rob heard intelligible vocals |
 | Thorough | 1000 | 8e-5 | 750 | 4096 | ~80 | crop/history of the top scores (72, 70.5) at the top-scoring depth (1000 = 72 vs 68 at 500, inside noise); Rob's call over my 500 |
 
@@ -99,7 +99,7 @@ crop.
 
 ### The crop is the axis that decides whether it sounds like a song
 
-Found 2026-08-24 after every checkpoint of an ADTR run rendered a track that
+Found 2026-08-24 after every checkpoint of an album Q run rendered a track that
 began part-way through a song and faded out mid-render without resolving.
 
 The crop was **128 frames — 5.12 seconds — against a 204 s median track.** Two
@@ -216,10 +216,10 @@ Render on q8_0 as always.
 principal component itself, so every micro-step a random `--rank-dropout`
 share of the base's top-128 subspace is deleted while the adapter fits the
 album. Found as a masking bug on 2026-09-05 (lm-graph.h masked one branch of
-the PiSSA fold), kept on purpose: blind on alk3_crimson it beat every other
+the PiSSA fold), kept on purpose: blind on albumA it beat every other
 method twice (68 and 66.5 of 90; LoRA 60–64, DoRA 63, LoKr 41.5 with a drone
 failure; the CORRECTED PiSSA was worst at 39.5 with drone plans in half its
-renders). Tables: `_experiments/_LISTENING/2026-09-06-mm3-method-ab/alk3_crimson/`.
+renders). Tables: `_experiments/_LISTENING/2026-09-06-mm3-method-ab/albumA/`.
 Consequences for the recipe block above: `--adapter-type lora --rank 128
 --alpha 128 --hot-pizza` replaces the LoKr line; **stop on steps (500 heard;
 250/350 ladder pending), never on loss** — the perturbed forward keeps the
@@ -530,12 +530,12 @@ early and then rises for the rest of the run — but the checkpoint that actuall
 
 | album | held-out min | ear pick | MLP |
 |---|---|---|---|
-| lagwagon_hoss | 750 | 750 | 1.00 |
-| outkast_stankonia | 250 | 750 | 1.00 |
-| alk3_thisaddiction | 500 | 2000 | 1.00 |
-| whitestripes_elephant | 250 | 1250 | 0.50 |
-| soad_toxicity | 250 | 1750 | 0.50 |
-| greenday_warning | 250 | 2000 | 1.00 |
+| albumK | 750 | 750 | 1.00 |
+| albumL | 250 | 750 | 1.00 |
+| albumA3 | 500 | 2000 | 1.00 |
+| albumM | 250 | 1250 | 0.50 |
+| albumC | 250 | 1750 | 0.50 |
+| albumB | 250 | 2000 | 1.00 |
 
 **Never pick a checkpoint by held-out loss.** It measures generalisation to
 *unseen* songs by the artist; the goal is a clone of the seen ones. Keep the
@@ -555,7 +555,7 @@ the Training Studio exposes it as **Train until: Target loss**. `--steps` stays
 the hard cap in that mode, so a target that never arrives still ends the run.
 
 **Defaults as of 2026-09-05: target loss 1.0 on the training metric, cap 1000
-steps.** It was 0.1 from 2026-08-27 until a blind depth ladder on alk3_crimson
+steps.** It was 0.1 from 2026-08-27 until a blind depth ladder on albumA
 (3 songs, base + checkpoints 100/250/500) showed the step-250 checkpoint
 (5-epoch mean ~1.06) beating step 500 (0.25 saved, 0.08 best) on every song,
 with the step-500 checkpoint emitting an empty plan on one of them. Below ~1
@@ -565,8 +565,8 @@ exactly as the AS1.5 planner does. Measured trajectories at the shipped recipe
 
 | step | 25 | 100 | 250 | 500 |
 |---|---|---|---|---|
-| fightstar_grandunification | 3.14 | 2.50 | 1.43 | 0.59 |
-| johnnycash_american4 | 3.28 | 2.23 | 0.92 | 0.31 |
+| albumD | 3.14 | 2.50 | 1.43 | 0.59 |
+| albumE | 3.28 | 2.23 | 0.92 | 0.31 |
 | limbizkit_starfish | 3.62 | 2.72 | 2.03 | - |
 
 So 0.1 binds past step 500 on albums that converge fast and never arrives on the
@@ -691,10 +691,10 @@ keep 250-granularity checkpoints rather than assuming 2500 transfers.
 
 ## Album-specific behaviour — do not apply a blanket rule
 
-- **White Stripes had a severe rhythm defect at ck500** ("not 4/4"), on both
+- **album M had a severe rhythm defect at ck500** ("not 4/4"), on both
   seeds, gone by ck1250. That album needed MORE training. A blanket "stop early"
   rule would have shipped the broken one.
-- **Outkast was the weakest clone** — likeness immediately, poor coherence at
+- **album L was the weakest clone** — likeness immediately, poor coherence at
   every rung. It is also the only album with ~2032-token prompts (4x the others,
   dense rap lyrics) and the most eclectic track list. Treat dense-lyric or
   stylistically scattered albums as harder, not as training failures.
@@ -707,7 +707,7 @@ keep 250-granularity checkpoints rather than assuming 2500 transfers.
 **The shared caption was the endings bug.** From 2026-08-24 the route
 auto-picked an existing `_shared-caption.txt` and the trainer replaced every
 per-track caption with it, while renders used the per-track captions. On
-Green Day the identical recipe went 0/6 natural endings (shared) to 4/6
+album B the identical recipe went 0/6 natural endings (shared) to 4/6
 (per-track) with likeness Rob called perfect. Rob: "if shared captions break
 endings, we should not offer it as a feature at all." The box, the route
 fallback and the status field are gone (fdc4a970); five datasets carried the
@@ -759,9 +759,9 @@ shape the trainer used: `<trigger>, ` at the front of the caption's FIRST line,
 which on a Structured Caption is the `Global Metadata` line.
 
 ```
-first caption line, as trained  : alk3_damnesia, Global Metadata
+first caption line, as trained  : albumA2, Global Metadata
 first caption line, as you type :                Global Metadata
-first caption line, as LM sees  : alk3_damnesia, Global Metadata
+first caption line, as LM sees  : albumA2, Global Metadata
 ```
 
 It is IDEMPOTENT, case-insensitively (`applyMm3Trigger`), so a caption that
@@ -780,13 +780,13 @@ Two things gate it:
   from the adapter's safetensors `__metadata__` (`hot_step_trigger`) and
   `translateParams.ts` applies it WITHOUT `skipPresent`, so on ACE a caption
   that already opens with the artist name really does come out as
-  `green day, green day, warning album, ...`. There, start your caption at the
+  `album b, album b, album b title, ...`. There, start your caption at the
   second item:
 
 ```
-training caption : green day, warning album, pop punk, bright major-key ...
+training caption : album b, album b title, pop punk, bright major-key ...
 what you type    :            warning album, pop punk, bright major-key ...
-what the LM sees : green day, warning album, pop punk, bright major-key ...
+what the LM sees : album b, album b title, pop punk, bright major-key ...
 ```
 
 Passing `{skipPresent: true}` at the translateParams call site would make this
@@ -841,7 +841,7 @@ POST /mm3/select-model {"lm": "q8_0"}      # BEFORE any /mm3/synth
 
 ### Training base is a QUALITY lever, not just a compatibility one
 
-Training on f16 and rendering on q8_0 produced the best Green Day adapter of the
+Training on f16 and rendering on q8_0 produced the best album B adapter of the
 whole sweep — **at 750 steps, beating the 2000-step q8_0-trained one by ear.**
 Unverified beyond one album and one listen, but if it holds it is worth the
 extra VRAM: f16 training measured 26.7 GB against q8_0's 17.5 GB at rank 128,
@@ -884,7 +884,7 @@ loss curve, no Prodigy `d` and no warning left to read. Check these FIRST.
 
 ## The acoustic loss (2026-08-25): WHY adapters wrecked vocal timbre, and the fix
 
-> **NOT SUFFICIENT — re-opened 2026-08-25 evening.** Both Fightstar adapters
+> **NOT SUFFICIENT — re-opened 2026-08-25 evening.** Both album D adapters
 > trained post-fix with `acoustic loss: ON — weight 1, 128 frames/step`
 > (train-console.log verified) still render Charlie Simpson chipmunked at 1.0×,
 > correct at ~0.9188×. The mechanism below is still the best-supported theory
@@ -898,7 +898,7 @@ generates every acoustic codebook — the timbre — conditioned on the LM's
 `last_hidden_state` (mm3-ar-loop.h: `depth_decode(last_hidden, sampled)`).
 Semantic-only training leaves that hidden state unconstrained; the frozen depth
 decoder then decodes states it never saw, and vocals come out formant-shifted.
-Direction is unconstrained drift — ADTR came out chipmunk, Fightstar goblin,
+Direction is unconstrained drift — album Q came out chipmunk, album D goblin,
 base model always clean. The ear-validated "MLP 0.5" render dial was this fault
 being managed empirically. It affects EVERY planner-only MM3 adapter, including
 bghira's SimpleTuner recipe (worth reporting to the working group).
@@ -952,7 +952,7 @@ separate the axes. Use the replay recipe above before ever re-opening this.
 
 ## Structured crops v3: the CONTENT MIX decides whether songs open like songs
 
-Found 2026-08-25 on the best-ever fightstar run (crop 750): renders jumped in
+Found 2026-08-25 on the best-ever album D run (crop 750): renders jumped in
 "like a cut" — no intro — despite `--crop-anchor song` and 40% of steps
 anchored at frame 0. Mechanism, confirmed by Rob's render-MLP A/B (lowering
 MLP restores intros and spends identity):

@@ -695,7 +695,7 @@ static int mm3_train_dit_run(const MM3TrainArgs & a) {
         }
     };
 
-    // MEASURED, not derived. --sign-check on alk3_crimson, sigma 0.9, adapter at
+    // MEASURED, not derived. --sign-check on albumA, sigma 0.9, adapter at
     // zero, 6 crops:
     //
     //     target = (noise - x0)   mean loss 11.167

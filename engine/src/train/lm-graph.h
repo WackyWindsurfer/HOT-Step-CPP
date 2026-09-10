@@ -1162,7 +1162,7 @@ static ggml_tensor * lm_linear(ggml_context * ctx, ggml_tensor * w, const QwLora
                 // HOT-PiZZA keeps exactly that forward ON PURPOSE: the mask
                 // stays off this branch, so training is W + s(M B A - B0 A0)
                 // — the principal subspace regularised by stochastic deletion
-                // while the album is fitted. Blind, twice, on alk3_crimson it
+                // while the album is fitted. Blind, twice, on albumA it
                 // beat plain PiSSA (which broke plans), LoRA, DoRA, rsLoRA,
                 // LoRA+ and LoKr. The export is the same rank-2r LoRA either
                 // way; nothing at load time can tell the two apart.

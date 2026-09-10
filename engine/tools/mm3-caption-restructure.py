@@ -12,8 +12,8 @@ Attributes so the only variable was the prose:
 
     this script  "all rock, all starting with a very similar distorted guitar
                   riff, but more plain rock, not particularly punk/emo"
-    MOSS         "7 sounds like alkaline trio already, that's crazy... 42 also
-                  sounds like alkaline trio. MOSS is WAY better."
+    MOSS         "7 sounds like the album-A artist already, that's crazy... 42 also
+                  sounds like the album-A artist. MOSS is WAY better."
 
 Two of five MOSS seeds sounded like the target artist with NO ADAPTER LOADED.
 The ceiling this file has is exactly the one predicted in its own notes below:
@@ -37,7 +37,7 @@ corpus must be restructured before it can condition MM3, whether for generation
 or for building a training conditioning cache.
 
 WHAT IT ASSUMES. Training Studio's Gemini captions follow a fixed 9-sentence
-schema (verified 13/13 on alk3_crimson):
+schema (verified 13/13 on albumA):
 
   0 overall genre/tempo/feel   3 harmony/instruments + vocals   6 intro
   1 drums                      4 timbre                         7 chorus/mid

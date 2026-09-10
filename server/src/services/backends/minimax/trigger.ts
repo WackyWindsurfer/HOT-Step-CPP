@@ -5,7 +5,7 @@
 // caption's first line (engine/src/train/mm3-lm-train-run.h, the
 // `trigger_prefix` block). On a Structured Caption that first line is
 // `Global Metadata`, so a correctly triggered caption opens
-// `alk3_damnesia, Global Metadata`. A trigger on its own line above the caption
+// `albumA2, Global Metadata`. A trigger on its own line above the caption
 // is a different sequence and dilutes to nothing.
 //
 // Two consumers, so they can never drift apart: the mid-run training previews
@@ -43,7 +43,7 @@ export interface Mm3TriggerInfo {
    * therefore learned at all.
    *
    * The sidecar records `trigger` either way — `--trigger-prepend` is a
-   * separate flag, and an early SOAD run wrote `soad_toxicity` into its sidecar
+   * separate flag, and an early album C run wrote `albumC` into its sidecar
    * without ever training it (mm3-lm-train-run.h:239). Pasting an untrained
    * trigger in front of a caption is an unseen token sequence, so a sidecar
    * that says `triggerPrepend: false` must NOT be auto-applied.

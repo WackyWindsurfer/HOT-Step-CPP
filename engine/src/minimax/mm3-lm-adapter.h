@@ -9,7 +9,7 @@
 // scales are live per generation with no reload.
 //
 // Why runtime deltas and not a load-time merge: the whole point (validated by
-// the 2026-08-20 ablation grid on the alk3 r256 adapter) is DIALING groups at
+// the 2026-08-20 ablation grid on the album A r256 adapter) is DIALING groups at
 // render time — attention carries the plan/genre, the MLPs carry vocal
 // identity AND the fidelity damage, and attention 1.0 / MLP 0.5 was the ear
 // winner. A merge would freeze one setting into 17 GB of resident weights.

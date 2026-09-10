@@ -146,7 +146,7 @@ const CAPTION_EXAMPLE_MAX_CHARS = 2000;
 // real vocal songs it already prices in intros, solos and outros.
 //
 // CRITICAL: pacing is an ARTIST property, not a universal constant. Per-artist
-// medians run 0.51 w/s (Muse) to 3.29 (Eminem) — 6.5x — so always prefer the
+// medians run 0.51 w/s (Muse) to 3.29 (a fast rapper) — 6.5x — so always prefer the
 // artist's own measured rate (AlbumEnrichment.wordsPerSec) and use this global
 // median only when no measured rate exists.
 export const GLOBAL_WORDS_PER_SECOND = 1.20;
@@ -169,7 +169,7 @@ export const GLOBAL_WORDS_PER_SECOND = 1.20;
 // 0.95 was still 25% below the model's real singing rate, and that 25% is
 // exactly the aimless tail Rob heard. The model sings at ~1.25 regardless of
 // the artist's TOTAL-duration rate; artists measured faster than 1.25
-// (rap: Eminem 3.29) carry their density in the lyrics themselves, which is
+// (rap: a fast rapper 3.29) carry their density in the lyrics themselves, which is
 // why the floor is max(), not a constant.
 export const VOCAL_FLOOR_WORDS_PER_SECOND = 1.25;
 
@@ -404,7 +404,7 @@ export interface AlbumEnrichment {
   /** This artist's measured vocal pacing: median words-per-second over songs
    *  carrying both lyrics and a real duration. 0 = unknown (fall back to
    *  GLOBAL_WORDS_PER_SECOND). Per-artist medians span 0.51 (Muse) to 3.29
-   *  (Eminem) — a 6.5x spread — so a global constant misprices most artists. */
+   *  (a fast rapper) — a 6.5x spread — so a global constant misprices most artists. */
   wordsPerSec: number;
   /** How many songs the pacing median was computed over. */
   pacedSongs: number;
@@ -1878,7 +1878,7 @@ export function buildGenerationPrompt(
     // failure — one cause, two appearances.
     // THIS ARTIST'S measured pacing first, global median only as fallback —
     // per-artist medians span 0.51 to 3.29 w/s, so the global constant
-    // misprices most artists (a third of the words Eminem needs, nearly double
+    // misprices most artists (a third of the words a fast rapper needs, nearly double
     // what Pink Floyd sings). The rate is words over TOTAL duration, so it
     // already prices in intros, instrumental breaks and outros — never apply
     // it to a transitions-deducted figure, that discounts the same time twice.
@@ -1899,7 +1899,7 @@ export function buildGenerationPrompt(
     // music if the writer DECLARES it as sections — undeclared, the model
     // improvises into it and the duration wall cuts whatever it invented.
     // Only artists BELOW the sing rate have instrumental time to declare —
-    // a denser artist (Rancid 1.69, Eminem 3.29) carries their density in the
+    // a denser artist (a dense punk vocalist 1.69, a fast rapper 3.29) carries their density in the
     // lyrics and sings faster than the floor, so their song is sung end to end.
     const sungSeconds = Math.min(targetDuration,
       Math.round(targetDuration * (wordsPerSecond / VOCAL_FLOOR_WORDS_PER_SECOND)));

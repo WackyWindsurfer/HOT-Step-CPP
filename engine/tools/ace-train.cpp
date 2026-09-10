@@ -2186,7 +2186,7 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
 // cross-entropy of the frozen base over the semantic codebook. That number is
 // independently known. The encoder scoreboard (docs/plans/2026-08-18-encoder-
 // training-plan.md) measures the same quantity from the python side with the
-// same frozen LM, and for the adopted 53k-pooled encoder on alk3 it is
+// same frozen LM, and for the adopted 53k-pooled encoder on album A it is
 // **~6.9 nats**. Uniform over 16384 codes would be ln(16384) = 9.70. So:
 //
 //   ~6.5-7.5  -> the whole input path is right

@@ -2157,7 +2157,7 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
     // Per-track `<stem>.mm3.txt` captions (Enhance panel: MOSS or Gemini) are
     // the ONLY caption source. There used to be a dataset-wide fallback
     // (`_shared-caption.txt`, auto-picked whenever the file existed): every
-    // row then trained on one caption the renders never use, and on Green Day
+    // row then trained on one caption the renders never use, and on album B
     // that alone took natural endings from 4/6 to 0/6 (2026-09-09, GOODCAPS vs
     // OLD). Removed as a feature; a stray file beside a dataset is ignored,
     // and a request that still carries one is refused rather than honoured.
@@ -2711,8 +2711,8 @@ router.post('/datasets/:id/train-lm', async (req: Request, res: Response) => {
     // 2.0 → 1.5 ladder first, one full ace-train leg per rung with
     // --init-adapter chaining between them. Resetting the optimizer state and
     // LR schedule at each rung is what prevents the straight-dive loop
-    // attractor (gojira: 95.7% plan loops straight vs 4% chained, same data,
-    // same final CE) and measurably improves songwriting (nirvana E3 > D by
+    // attractor (album O: 95.7% plan loops straight vs 4% chained, same data,
+    // same final CE) and measurably improves songwriting (album I E3 > D by
     // ear). Rungs at or below the final target are dropped, so an explicit
     // high target (e.g. 2.0) degenerates to the legacy single leg. A caller
     // that genuinely wants one straight leg sends targetLossStages: [final].

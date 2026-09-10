@@ -78,8 +78,8 @@ export interface Mm3TrainLmRequest {
    *
    *  It used to be impossible: `trigger` was recorded in the adapter sidecar and
    *  nothing put it in the prompt, so unless the captions already contained it
-   *  the word was never learned. The first SOAD run shipped that way — 14 MOSS
-   *  captions, none containing `soad_toxicity` — and rendering with the trigger
+   *  the word was never learned. The first album C run shipped that way — 14 MOSS
+   *  captions, none containing `albumC` — and rendering with the trigger
    *  then bolted an UNSEEN token sequence onto an in-distribution prompt. It
    *  measurably hurt: the same checkpoint sounded better with the trigger
    *  removed, and tolerated full adapter strength instead of half.

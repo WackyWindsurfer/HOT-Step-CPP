@@ -550,7 +550,7 @@ export function readMm3Run(dir: string): Mm3RunSummary | null {
  *
  *  Attribution is by MANIFEST first and by the `<slug>-<timestamp>` directory
  *  name second. The name alone is not enough: two datasets whose slugs share a
- *  prefix ("greenday" and "greenday-live") would collect each other's runs, and
+ *  prefix ("albumB" and "albumB-live") would collect each other's runs, and
  *  a run started before the manifest existed has nothing else to go on. */
 export function listMm3Runs(datasetId: string, slug: string): Mm3RunSummary[] {
   const root = mm3AdapterRoot();

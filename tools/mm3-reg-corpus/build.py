@@ -11,7 +11,7 @@ fits a K-frame crop: the trainer then marks at_end and supervises EOS on the end
 Output folder holds dataset.json, <id>.mm3.txt captions and codes/<id>.codes; pass it as
 regularisation: { corpusDir } to POST /api/training/datasets/:id/mm3-train-lm.
 
-Usage: python build.py <out dir> [--n 12] [--k 500] [--exclude "green day,system of a down"] [--seed 1000]
+Usage: python build.py <out dir> [--n 12] [--k 500] [--exclude "artist one,artist two"] [--seed 1000]
        [--history H --out2 <dir>]   also write a twin corpus (same plans, same ids) whose END excerpts carry H
                                     frames of history before the K-frame window: a trainer from 2026-09-07 on
                                     windows the last K frames and rehearses them behind its frozen KV prefix
@@ -51,7 +51,7 @@ def write_codes(path, rows):
         for r in rows: f.write(struct.pack('<8i', *r))
 
 def main():
-    out_dir = sys.argv[1]; n = arg('--n', 12); K = arg('--k', 500); exclude = arg('--exclude', 'green day'); seed0 = arg('--seed', 1000)
+    out_dir = sys.argv[1]; n = arg('--n', 12); K = arg('--k', 500); exclude = arg('--exclude', ''); seed0 = arg('--seed', 1000)
     H = arg('--history', 0); out2 = arg('--out2', '')
     outs = [(out_dir, 0)] + ([(out2, H)] if H > 0 and out2 else [])
     for d, _ in outs: os.makedirs(os.path.join(d, 'codes'), exist_ok=True)

@@ -199,8 +199,8 @@ quantised LM; q8_0/NVFP4/MXFP4 degrade exactly the stage being measured.
 
 ## The format is MANDATORY, not preferred (ear-verified 2026-08-14)
 
-A controlled A/B settled this for training data. One track (Alkaline Trio,
-`alk3_crimson`), 30 s, identical lyrics, 5 seeds per arm, f16/f16, no adapter:
+A controlled A/B settled this for training data. One track (the album-A artist,
+`albumA`), 30 s, identical lyrics, 5 seeds per arm, f16/f16, no adapter:
 
 - **Arm A** — a good ACE-style caption verbatim: 219 words of Gemini descriptive
   prose already covering groove, per-instrument detail, timbre, mix AND
@@ -250,7 +250,7 @@ the prose:
 | arm | verdict |
 |---|---|
 | `mm3-caption-restructure.py` | "all rock… more plain rock, not particularly punk/emo" |
-| **`ace-caption --mode mm3`** | **"WAY better"; 2 of 5 seeds "sounds like alkaline trio already"** |
+| **`ace-caption --mode mm3`** | **"WAY better"; 2 of 5 seeds "sounds like the album-A artist already"** |
 
 **Two of five seeds landed on the target artist with NO ADAPTER LOADED**, from
 the caption alone. Caption quality is that dominant.
@@ -275,7 +275,7 @@ Two things to carry forward:
 
 Follow-up to the above: `engine/tools/mm3-caption-restructure.py` converts the
 existing Gemini caption corpus into the format mechanically. Five ear-judged
-rounds on `alk3_crimson`, 5 seeds each, same track/lyrics/model:
+rounds on `albumA`, 5 seeds each, same track/lyrics/model:
 
 | caption | on-genre |
 |---|---|
@@ -368,7 +368,7 @@ caption call per song, not restructure.
 
 ## Captions decide whether an adapter's song ENDS (2026-09-09)
 
-Measured on a Green Day adapter (GOODCAPS: quality recipe, per-track captions),
+Measured on a album B adapter (GOODCAPS: quality recipe, per-track captions),
 plan-only, same six seeds, candidates off:
 
 | lyrics | caption (a training track's own, verbatim) | natural endings |
@@ -385,7 +385,7 @@ plan-only, same six seeds, candidates off:
   banned word: the 1000 official templates say 'fade' in 377 and 'outro' in 723.
 - A training caption with new lyrics is a style prompt, not a lookup key: no run
   of four semantic codes is shared with the training track; Rob's ear: unique
-  Green Day songs. That is what the Automatic caption source (nearest-tempo
+  album B songs. That is what the Automatic caption source (nearest-tempo
   dataset track) in Lyric Studio / Create relies on.
 - The shared dataset-wide caption (a comma list with no arc) took the same
   recipe to 0/6 and was removed as a feature.

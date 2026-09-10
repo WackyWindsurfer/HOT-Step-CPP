@@ -15,10 +15,10 @@
  * ARE the recipe under test, and setting them here would just be a second
  * copy of MM3_LM_DEFAULTS that could drift from it.
  *
- *   npx tsx scripts/mm3-crop-ab.ts --phase plan  --dataset alk3_crimson
- *   npx tsx scripts/mm3-crop-ab.ts --phase train --dataset alk3_crimson
- *   npx tsx scripts/mm3-crop-ab.ts --phase blind --dataset alk3_crimson --songs 3
- *   npx tsx scripts/mm3-crop-ab.ts --phase all   --dataset alk3_crimson
+ *   npx tsx scripts/mm3-crop-ab.ts --phase plan  --dataset albumA
+ *   npx tsx scripts/mm3-crop-ab.ts --phase train --dataset albumA
+ *   npx tsx scripts/mm3-crop-ab.ts --phase blind --dataset albumA --songs 3
+ *   npx tsx scripts/mm3-crop-ab.ts --phase all   --dataset albumA
  *
  * plan: resolves the dataset, the two logical run names, whatever already
  *   exists on disk for them, the chosen prompts, and the render requests it
@@ -174,7 +174,7 @@ async function computeWholeTrackFrames(ds: DatasetInfo): Promise<number> {
     .map(s => s.duration);
   if (!durations.length) {
     // The dataset API reports duration 0 for tracks that were never probed
-    // (alk3_crimson does, 2026-09-05). The engine caps the crop at the longest
+    // (albumA does, 2026-09-05). The engine caps the crop at the longest
     // track anyway, so the route's ceiling is a safe stand-in for "whole track".
     log(`${ds.slug}: the dataset API reports no track durations — using the route ceiling of 9000 frames; ` +
       'mm3-lm-train clamps the crop to the longest track itself');

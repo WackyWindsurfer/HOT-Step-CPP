@@ -272,7 +272,7 @@ export function translateParams(params: any): AceRequest {
   if (triggerSpecs.length && adapterPaths.length) {
     // skipPresent: the caption a user writes for an album adapter usually already
     // opens with the artist name, and without this they get it twice —
-    // "green day, green day, warning album, ..." — which was never trained.
+    // "album b, album b, album b title, ..." — which was never trained.
     req.caption = applyTriggers(req.caption || '', triggerSpecs, { skipPresent: true }).caption;
   }
 

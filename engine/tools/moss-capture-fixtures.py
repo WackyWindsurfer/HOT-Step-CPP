@@ -43,8 +43,8 @@ PROMPT = (
 )
 
 TRACKS = [
-    "daftpunk_discovery__01 One More Time",
-    "johnnycash_american4__01 - Johnny Cash - The Man Comes Around",
+    "albumX__01 <track>",
+    "albumE__01 - <track>",
 ]
 
 

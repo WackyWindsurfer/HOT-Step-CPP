@@ -12,8 +12,8 @@
 // prediction, and the frozen depth decoder then decodes states it was never
 // trained on. The audible result is formant-shifted vocals — "chipmunk" on
 // one run, "goblin" on another, direction unconstrained — while the adapter
-// itself measures perfectly healthy. Diagnosed 2026-08-25 on the ADTR and
-// Fightstar runs; the ear-validated "MLP 0.5" render dial was this fault
+// itself measures perfectly healthy. Diagnosed 2026-08-25 on the album Q and
+// album D runs; the ear-validated "MLP 0.5" render dial was this fault
 // being managed empirically.
 //
 // THE FIX

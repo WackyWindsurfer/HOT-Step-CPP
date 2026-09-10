@@ -137,7 +137,7 @@ export const AuditionCard: React.FC<AuditionCardProps> = ({ milestoneRequest }) 
   // newer run lands. The old seed-once (`prev ? prev : trainedDir`) captured
   // whatever run dir the status held at first render — after a failed run that
   // still wrote weights, the audition stayed pinned to the FAILED run even once
-  // a later run completed (observed live, alk3_infirmary 2026-07-29). Only an
+  // a later run completed (observed live, albumA4 2026-07-29). Only an
   // EXPLICIT user pick (picker or milestone badge) stops the auto-follow, and a
   // dataset switch re-arms it.
   const trainedDir = trainLmStatus?.adapterDir ?? '';

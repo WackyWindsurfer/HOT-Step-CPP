@@ -53,7 +53,7 @@ internals, cache-key construction, cross-arch research history) lives in
 ## Per-section (regional) adapter masking — shipped, P1+P2
 
 Different adapters active in different song sections, driven by lyric directives like
-`[Chorus]{greenday_idiot=1; blink_selftitled=0}` (keys = adapter filename stem, or positional `#2`/`2`, 1-based).
+`[Chorus]{albumB2=1; albumN=0}` (keys = adapter filename stem, or positional `#2`/`2`, 1-based).
 
 - **Gate**: activates only with directives in lyrics AND ≥2 stacked adapters (`translateParams.ts:104`). Forces `adapter_mode=runtime` (server :114; engine double-checks, `hot-step-server.cpp:1157-1159`). When the gate is unmet, directives are still **stripped** from lyrics (`stripAdapterDirectives`) so they never reach the LM/encoder as garbage tokens. The UI stack controls sit behind Advanced mode (`advancedAdapters` in `ui/src/stores/globalParamsStore.ts`).
 - **Parser** (`server/src/services/generation/adapterSections.ts`): Sum/Blend applied per section (blend budget default 0.75); directive-less sections use stack default scales; `{…}` with no `key=val` pair is treated as lyric text and left alone; all-typo keys warn and fall back to defaults; weights clamp ≥ 0.

@@ -54,7 +54,7 @@ for (const r of db.prepare('SELECT id, songs FROM lyrics_sets').all() as any[]) 
   const rate = computeAlbumEnrichment(songs)?.wordsPerSec || 0;
   // Envelope from the MEDIAN album duration, not min/max: real albums carry
   // 30s skits and 8-minute epics that make a min/max envelope accept a 106s
-  // Eminem fragment or a 484s Pendulum. The median is what a typical song by
+  // a fast rapper fragment or a 484s Pendulum. The median is what a typical song by
   // this artist runs; ±(40%..50%) around it is generous but sane.
   const durs = songs.map(s => Number(s?.duration)).filter(d => Number.isFinite(d) && d > 30).sort((a, b) => a - b);
   const med = durs.length ? durs[Math.floor(durs.length / 2)] : 0;

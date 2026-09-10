@@ -1,7 +1,7 @@
 """Stage a numbered listening set from the render harness into the _LISTENING hub (copies, never moves).
 
     python tools/lm-attr-probe/stage_listening.py --out "D:\\...\\_LISTENING\\<date>_<name>" \
-        --slugs kinks_somethingelse,nas_illmatic --sides gt,base,ctrl,pp --songs 2 [--originals] [--note "..."]
+        --slugs <slug>,<slug> --sides gt,base,ctrl,pp --songs 2 [--originals] [--note "..."]
 
 Sides are manifest side labels in <variant>/lm-attr/renders/renders.json ('adapter' = the shipped
 final adapter). Files: NN_<slug>_<songstem>_<side>.wav, originals as NNa_..._ORIGINAL.<ext>.

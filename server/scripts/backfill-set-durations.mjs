@@ -6,7 +6,7 @@
  *
  * Why: the lyric duration budget and post-generation reconciliation both need
  * the ARTIST's pacing — per-artist medians span 0.51 w/s (Muse) to 3.29
- * (Eminem), a 6.5x spread, so the global 1.20 fallback misprices most artists.
+ * (a fast rapper), a 6.5x spread, so the global 1.20 fallback misprices most artists.
  * Durations exist in the dataset sidecars but were dropped by the Lyric Studio
  * export until today.
  *
@@ -116,7 +116,7 @@ function datasetDurations(stem) {
 
 /**
  * Fallback for filename conventions the candidate parser doesn't know
- * ("01.Lycanthrope", "02-blink-182-dont_leave_me"): after norm() flattens
+ * ("01.Lycanthrope", "02-artist-song_title"): after norm() flattens
  * every separator to spaces, the true title survives as the SUFFIX of the
  * stem. Accepted only when exactly ONE file matches — ambiguity ("Home" vs
  * "Coming Home") skips rather than guesses — and never for very short titles.

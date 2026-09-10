@@ -12,7 +12,7 @@
 //                                     dataset, recommended scales, run params
 //
 // The default *recommended* scales come from the 2026-08-20 ablation grid on
-// the alk3 r256 adapter: attention 1.0 / MLP 0.5 ("mlp-half", the ear
+// the album A r256 adapter: attention 1.0 / MLP 0.5 ("mlp-half", the ear
 // winner). Sidecars may override per adapter; the UI prefills from here.
 
 import fs from 'fs';

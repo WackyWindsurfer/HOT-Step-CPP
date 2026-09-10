@@ -913,7 +913,7 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                 </div>
                 {/* The dataset-wide caption box lived here until 2026-09-09. One caption for
                     every track replaced the per-track .mm3.txt captions the renders use, and
-                    adapters trained that way did not end songs (Green Day 0/6 vs 4/6). Removed. */}
+                    adapters trained that way did not end songs (album B 0/6 vs 4/6). Removed. */}
                 {/* ── Method row (2026-09-05) ───────────────────────────────
                     Same shape as TrainDitForm's DitMethod / TrainLmForm's
                     LmMethod: LoKr is its own type, DoRA/HiRA/LoHa/HRA are the
@@ -998,7 +998,7 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                     <span className="text-[10px] text-zinc-500 leading-snug">
                       {t('trainingStudio.mm3.optimizerHint',
                         'Prodigy estimates its own step size, so the learning rate below becomes a '
-                        + 'schedule multiplier only. On Green Day it converged to 8.19e-5 against the '
+                        + 'schedule multiplier only. On album B it converged to 8.19e-5 against the '
                         + '8e-5 tuned by hand. It costs two extra state buffers (about +2.7 GB at rank '
                         + '128) and CANNOT resume, so it is unavailable when mid-training previews are '
                         + 'on. AdamW matches the published SimpleTuner recipe. Muon is NOT recommended: '

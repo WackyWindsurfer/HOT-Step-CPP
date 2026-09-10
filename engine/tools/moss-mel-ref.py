@@ -137,7 +137,7 @@ def main():
         #   log_spec = maximum(log_spec, log_spec.max() - 8.0)
         # the floor is derived from the GLOBAL maximum, so a 1-ULP difference in a single
         # loud bin moves the floor for every quiet bin at once. Tracks with lots of near-
-        # silence (Johnny Cash opens on sparse spoken word) therefore show a few ULP of
+        # silence (the album-E artist opens on sparse spoken word) therefore show a few ULP of
         # spread while still correlating at 0.999998.
         #
         # PORTING CONSEQUENCE, and this one bites: the C++ must compute that maximum over

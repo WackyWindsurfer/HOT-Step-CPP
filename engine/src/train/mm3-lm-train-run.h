@@ -118,10 +118,10 @@ static std::string json_escape(const std::string & s);
 // bghira trains the same component with SimpleTuner and gets better results, and
 // he publishes the configs. Two references:
 //   * terminusresearch/minimax-music3-lm-lora-fiona-crapple  (9 tracks)
-//   * RareConcepts/soad-mm3-vanilla-20260822 + the training-tournament card
+//   * RareConcepts/<his public MM3 dataset> + the training-tournament card
 //     (45 tracks, 1000 steps, simpletuner_config.json in every checkpoint)
 //
-// The SOAD config, verbatim, is what the numbers below now mirror:
+// The album C config, verbatim, is what the numbers below now mirror:
 //
 //     lora_rank 64            lora_alpha = rank        lora_dropout 0.1
 //     learning_rate 5e-5      lr_scheduler cosine      lr_warmup_steps 50
@@ -258,9 +258,9 @@ struct MM3LmTrainArgs {
     /** Prepend `<trigger>, ` to every training caption at prompt assembly.
      *
      *  WITHOUT THIS THE TRIGGER IS NOT TRAINED AT ALL, and that is not a
-     *  hypothetical: the first SOAD run recorded `soad_toxicity` in the sidecar,
+     *  hypothetical: the first album C run recorded `albumC` in the sidecar,
      *  none of the 14 MOSS-written captions contained it, and rendering with
-     *  `soad_toxicity, <caption>` therefore bolted an unseen token sequence onto
+     *  `albumC, <caption>` therefore bolted an unseen token sequence onto
      *  an otherwise in-distribution prompt. It measurably HURT — the same
      *  checkpoint sounded better with the trigger removed, and supported full
      *  adapter strength instead of half.
@@ -284,7 +284,7 @@ struct MM3LmTrainArgs {
      *
      *  Deliberately not 1.0-by-another-name: training on trigger-only rows
      *  EXCLUSIVELY would leave the descriptor path untrained, so the adapter
-     *  could produce the album but never be steered ("soad_toxicity, 140 BPM,
+     *  could produce the album but never be steered ("albumC, 140 BPM,
      *  acoustic" would mean nothing to it). Mixing keeps both.
      *
      *  This is SimpleTuner's caption_dropout_probability in spirit, but it drops
@@ -529,7 +529,7 @@ struct MM3LmTrainArgs {
     // generation always starts at frame 0, so position P+5 at inference means
     // 0.2 s into the song, while under "zero" the trainer used those same
     // positions to teach material from 60 s in. The model learns that a song
-    // can begin anywhere. bghira's 2026-08-22 SOAD campaign reports the two
+    // can begin anywhere. bghira's 2026-08-22 album C campaign reports the two
     // symptoms this predicts — an instant-sound-at-0:00 artifact and tempo
     // drift mid-track — and reports that position-labelled windowed crops fix
     // the pacing. Kept switchable because it changes the recipe: a run trained
@@ -939,7 +939,7 @@ static bool mm3_lm_load_samples_from(const std::string & manifest, const std::st
                 std::string body = lead == std::string::npos ? caption : caption.substr(lead);
                 // IDEMPOTENT. A shared caption written for a style adapter will
                 // usually open with the trigger already, and prepending a second
-                // copy trains "system of a down, system of a down, ..." — a token
+                // copy trains "the album-C artist, the album-C artist, ..." — a token
                 // sequence no render will ever reproduce.
                 std::string lb = body.substr(0, trigger_prefix.size()), lp = trigger_prefix;
                 for (auto & ch : lb) ch = (char) tolower((unsigned char) ch);
@@ -4278,7 +4278,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     if (best_eval >= 0.0) {
         // The point of the holdout: which checkpoint to reach for FIRST, decided
         // by a number rather than in hindsight by ear. Not a claim that the
-        // others are useless — the alk3 ladder taught us the ear can prefer a
+        // others are useless — the album A ladder taught us the ear can prefer a
         // more-degraded checkpoint that carries more identity.
         jl("{\"type\":\"best\",\"step\":%d,\"loss\":%.6f}", best_eval_step, best_eval);
         fprintf(stderr, "[mm3-lm-train] best held-out loss %.4f at step %d — start the ear test there\n",

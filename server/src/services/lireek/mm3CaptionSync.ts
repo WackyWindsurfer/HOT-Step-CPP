@@ -9,7 +9,7 @@
  * can offer come from the lyrics set's stored songs, and those were copied
  * from `<stem>.mm3.txt` ONCE, at export time. Every set exported before that
  * copy existed (August) holds none, and every set exported before a dataset
- * was re-captioned holds the old text. The Weezer set showed "No source track
+ * was re-captioned holds the old text. The album R set showed "No source track
  * on this album has an MM3 caption" while fourteen Gemini captions sat on
  * disk beside the audio.
  *
