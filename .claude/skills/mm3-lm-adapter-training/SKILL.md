@@ -228,6 +228,16 @@ next in line; LoKr stays selectable. One album so far: the second-artist run
 is the outstanding validation. Cost is LoRA's: ~5.9 s/step, peak 30.4 GB on
 the 32 GB card at crop 750 + prefix 4096.
 
+### Endings, honest status (2026-09-10)
+
+Per-track captions are necessary (the shared caption gave 0/6) but not sufficient: the same recipe's per-plan
+natural-ending rate is 0.2-0.5, varies with the caption x lyrics pair and with the training draw (the trainer is
+deterministic per seed; two draws gave 2/6 and 3/6 with equal likeness), and Rob's in-app test on three fresh albums
+was 2 of 9. No training-side lever has raised it without losing likeness (score-last ends everything and sounds like
+nothing). The natural-ending candidates feature (3 takes, up to 4 rounds) is what makes a render end. The full ledger
+and the ordered list of what is left to try: `docs/plans/mm3-endings-checklist.md`. Pitch/tempo drift in adapter
+renders (every arm with the acoustic loss; DL0 clean) has its own file: `docs/plans/mm3-pitch-tempo-drift.md`.
+
 ### Adapter files: the residual + delta form (2026-09-09)
 
 A HOT-PiZZA / PiSSA export used to be a rank-2r F32 PEFT LoRA: 2.79 GB per
