@@ -81,6 +81,9 @@ tools/mcp-lyricstudio/node_modules/
 !tools/mm3-trim-silence/
 !tools/vocal-end/
 tools/vocal-end/out/
+!tools/mm3-runtime-probes/
+!tools/mm3-runtime-probes/sglang/
+!tools/mm3-runtime-probes/sglang/**
 tools/discord-claude/node_modules/
 tools/discord-claude/.env
 tools/discord-claude/sessions.json

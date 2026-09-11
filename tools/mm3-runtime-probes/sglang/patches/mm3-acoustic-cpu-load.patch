@@ -1,0 +1,56 @@
+diff --git a/sglang_omni/models/minimax_music3/acoustic.py b/sglang_omni/models/minimax_music3/acoustic.py
+index 3d056a7b..1855be59 100644
+--- a/sglang_omni/models/minimax_music3/acoustic.py
++++ b/sglang_omni/models/minimax_music3/acoustic.py
+@@ -192,6 +192,18 @@ class MiniMaxMusic3AcousticDecoder:
+             cache_dit_max_continuous_cached_steps=cache_dit_max_continuous_cached_steps,
+         )
+         removed_weight_norms = self._build_dav(paths.dav_path)
++        torch.cuda.synchronize(self.device)
++        logger.info(
++            "MM3 probe acoustic memory before trim: allocated=%.3f GiB reserved=%.3f GiB",
++            torch.cuda.memory_allocated(self.device) / 2**30,
++            torch.cuda.memory_reserved(self.device) / 2**30,
++        )
++        torch.cuda.empty_cache()
++        logger.info(
++            "MM3 probe acoustic memory after trim: allocated=%.3f GiB reserved=%.3f GiB",
++            torch.cuda.memory_allocated(self.device) / 2**30,
++            torch.cuda.memory_reserved(self.device) / 2**30,
++        )
+         logger.info(
+             f"MiniMax Music 3 PyTorch DIT/DAV loaded device={self.device} dtype={self.dtype} dit_parameters={sum((parameter.numel() for parameter in self.dit.parameters()))} dav_parameters={sum((parameter.numel() for parameter in self.dav.parameters()))} folded_weight_norms={removed_weight_norms} elapsed={time.perf_counter() - load_started:.1f}s"
+         )
+@@ -212,7 +224,7 @@ class MiniMaxMusic3AcousticDecoder:
+         logger.info(
+             f"Loading MiniMax Music 3 PyTorch DIT from {dit_path} on device={self.device} dtype={self.dtype}"
+         )
+-        state = load_torch_state(dit_path, device=self.device)
++        state = load_torch_state(dit_path, device=torch.device("cpu"))
+         logger.info(
+             f"MiniMax Music 3 DIT checkpoint variant=FM8/ELMo condition_hidden=32768 state_keys={len(state)}"
+         )
+@@ -223,7 +235,7 @@ class MiniMaxMusic3AcousticDecoder:
+             )
+         self.dit.load_state_dict(state, strict=True, assign=True)
+         del state
+-        self.dit = self.dit.to(dtype=self.dtype).eval()
++        self.dit = self.dit.to(device=self.device, dtype=self.dtype).eval()
+         window = self.dit.aligned_mel_length(AR_CHUNK_FRAMES)
+         if self.compile_acoustic and not (
+             self.cache_dit or self.breakable_cuda_graph_requested
+@@ -250,12 +262,12 @@ class MiniMaxMusic3AcousticDecoder:
+     def _build_dav(self, dav_path: str) -> int:
+         """Load the DAV decoder and return how many weight norms were folded."""
+         logger.info(f"Loading MiniMax Music 3 DAV from {dav_path}")
+-        state = load_torch_state(dav_path, device=self.device)
++        state = load_torch_state(dav_path, device=torch.device("cpu"))
+         with torch.device("meta"):
+             self.dav = MiniMaxMusic3DAV()
+         self.dav.load_state_dict(select_decoder_state(state), strict=True, assign=True)
+         del state
+-        self.dav = self.dav.to(dtype=self.dtype).eval()
++        self.dav = self.dav.to(device=self.device, dtype=self.dtype).eval()
+         removed_weight_norms = remove_weight_norm(self.dav)
+         if self.compile_acoustic:
+             window = self.dit.aligned_mel_length(AR_CHUNK_FRAMES)

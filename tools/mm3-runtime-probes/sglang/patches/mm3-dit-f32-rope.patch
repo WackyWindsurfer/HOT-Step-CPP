@@ -1,0 +1,37 @@
+diff --git a/sglang_omni/models/minimax_music3/dit.py b/sglang_omni/models/minimax_music3/dit.py
+index 47a3e84e..02a2dd8a 100644
+--- a/sglang_omni/models/minimax_music3/dit.py
++++ b/sglang_omni/models/minimax_music3/dit.py
+@@ -73,12 +73,20 @@ class LayerNorm(nn.Module):
+ class RotaryEmbedding(nn.Module):
+     def __init__(self, dim: int, base: float = 10000.0) -> None:
+         super().__init__()
++        self.dim = dim
++        self.base = base
+         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+         self.register_buffer("inv_freq", inv_freq)
+ 
+     def forward_from_seq_len(self, seq_len: int) -> tuple[Tensor, float]:
+         t = torch.arange(seq_len, device=self.inv_freq.device, dtype=torch.float32)
+-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
++        # Recreate the analytic frequencies in FP32, as the reference does.
++        # Module-wide BF16 casting also rounds buffers, so .float() on the
++        # stored inv_freq cannot recover the original frequencies.
++        inv_freq = 1.0 / (
++            self.base ** (torch.arange(0, self.dim, 2, device=t.device, dtype=torch.float32) / self.dim)
++        )
++        freqs = torch.einsum("i,j->ij", t, inv_freq)
+         return torch.cat((freqs, freqs), dim=-1), 1.0
+ 
+ 
+@@ -229,8 +237,8 @@ class ContinuousTransformer(nn.Module):
+         cached = self._rotary_cache.get(key)
+         if cached is None:
+             freqs = self.rotary_pos_emb.forward_from_seq_len(seq_len)[0]
+-            freqs = freqs.to(dtype=dtype, device=device)
+-            cached = (freqs.cos(), freqs.sin())
++            freqs = freqs.to(dtype=torch.float32, device=device)
++            cached = (freqs.cos().to(dtype), freqs.sin().to(dtype))
+             self._rotary_cache[key] = cached
+         return cached
+ 
