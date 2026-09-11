@@ -989,8 +989,12 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
             if (!cached) {
                 mm3_lm_adapter_drop();
                 std::string aerr;
+                const auto adapter_load_start = std::chrono::steady_clock::now();
                 g_mm3_lm_adapter = mm3_lm_adapter_load(req.lm_adapter.c_str(), &aerr,
                                                        g_mm3.lm_file.found ? g_mm3.lm_file.path.c_str() : nullptr);
+                fprintf(stderr, "[MM3-Job] %s: LM adapter load %.0f ms (%s)\n", job->id.c_str(),
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - adapter_load_start).count(),
+                        g_mm3_lm_adapter ? "success" : "failed");
                 if (!g_mm3_lm_adapter) {
                     fail(2, "lm_adapter", aerr);  // fail() handles transient release
                     return;

@@ -58,6 +58,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -88,6 +91,36 @@ static ggml_tensor * mm3_lm_merge_target(const MM3Model & m, int layer, int modu
 // Fold scale·B·A into every adapted module of the resident LM. On success the
 // caller records mm3_lm_merge_make_tag(...) in m->lm_merge_tag; on failure it
 // must drop LM residency (see the failure contract above).
+static size_t mm3_lm_merge_quantize(ggml_type type, const float * src, void * dst, int64_t rows,
+                                    int64_t cols, int threads) {
+    // Each worker owns complete rows and uses the same reference quantizer.
+    // No shared reductions or altered rounding: bytes must match serial use.
+    const int workers = (int) std::min<int64_t>(threads, std::max<int64_t>(1, rows / 64));
+    if (workers <= 1) {
+        return ggml_quantize_chunk(type, src, dst, 0, rows, cols, nullptr);
+    }
+    ggml_quantize_init(type);
+    std::vector<std::future<size_t>> jobs;
+    try {
+        for (int i = 0; i < workers; i++) {
+            const int64_t first = rows * i / workers, last = rows * (i + 1) / workers;
+            jobs.emplace_back(std::async(std::launch::async, [=]() {
+                return ggml_quantize_chunk(type, src, dst, first * cols, last - first, cols, nullptr);
+            }));
+        }
+        size_t written = 0;
+        for (auto & job : jobs) {
+            written += job.get();
+        }
+        return written;
+    } catch (const std::exception & e) {
+        // Futures join before returning; the caller drops partially merged
+        // residency on a size mismatch, just as for other merge failures.
+        fprintf(stderr, "[MM3] LM merge quantization worker failed: %s\n", e.what());
+        return 0;
+    }
+}
+
 static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3LmAdapterScales & sc,
                                std::string * err) {
     if (!m->lm_resident) {
@@ -119,6 +152,28 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
     int                  n_merged  = 0;
     size_t               moved     = 0;
     bool                 ok        = true;
+    // Experimental until byte parity is measured on the merged F32 tensors.
+    // 'verify' computes both paths but writes the CPU reference weights.
+    const char * device_env = std::getenv("MM3_MERGE_DEVICE");
+    const bool verify_device = device_env && std::strcmp(device_env, "verify") == 0;
+    const bool want_device = verify_device || (device_env && std::strcmp(device_env, "1") == 0);
+    int n_device = 0, n_verified = 0;
+    size_t mismatched_bytes = 0;
+    std::vector<uint8_t> device_bytes;
+    const char * threads_env = std::getenv("MM3_MERGE_THREADS");
+    const int quant_threads = std::max(1, std::min(32, threads_env ? std::atoi(threads_env) : backend_cpu_n_threads()));
+    const bool verify_cpu = std::getenv("MM3_MERGE_VERIFY_CPU") != nullptr;
+    int n_cpu_verified = 0;
+    std::vector<uint8_t> serial_bytes;
+    // Host-clock phase totals. graph_compute synchronizes the scheduler;
+    // downloads/uploads include their staging-vector allocation costs.
+    double phases[7] = {};
+    auto tick = std::chrono::steady_clock::now();
+    auto mark = [&](int phase) {
+        const auto now = std::chrono::steady_clock::now();
+        phases[phase] += std::chrono::duration<double, std::milli>(now - tick).count();
+        tick = now;
+    };
 
     for (int l = 0; l < MM3_LM_ADAPTER_LAYERS && ok; l++) {
         for (int mod = 0; mod < MM3_LM_ADAPTER_MODULES && ok; mod++) {
@@ -160,6 +215,7 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
 
             // Small per-module graph: merged_f32 = cast(W) + s * (Aáµ€ · B),
             // with three variations that all keep that shape.
+            tick = std::chrono::steady_clock::now();
             const size_t         need = ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(96, false);
             std::vector<uint8_t> gvec(need);
             ggml_init_params     ip  = { need, gvec.data(), /*no_alloc*/ true };
@@ -202,13 +258,33 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
                 merged           = ggml_mul(ctx, merged, ggml_div(ctx, mv, nr));
             }
             ggml_tensor * outt   = w->type == GGML_TYPE_F16 ? ggml_cast(ctx, merged, GGML_TYPE_F16) : merged;
+            bool device_write = false;
+            if (want_device && bp.has_gpu && w->buffer && !ggml_backend_buffer_is_host(w->buffer) &&
+                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer)) == ggml_backend_get_device(bp.backend) &&
+                (w->type == GGML_TYPE_Q8_0 || w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32)) {
+                ggml_tensor * candidate = w->type == GGML_TYPE_F32 ? merged : ggml_cast(ctx, merged, w->type);
+                if (ggml_backend_supports_op(bp.backend, candidate)) {
+                    outt = candidate;
+                    device_write = true;
+                    if (verify_device && quantized) {
+                        ggml_set_output(merged);  // preserve the exact pre-quantization input for comparison
+                    }
+                }
+            }
             ggml_set_output(outt);
 
             ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
             ggml_build_forward_expand(gf, outt);
+            mark(0);
             ggml_backend_sched_reset(sched);
-            if (!ggml_backend_sched_alloc_graph(sched, gf) ||
-                ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+            if (device_write) {
+                ggml_backend_sched_set_tensor_backend(sched, outt, bp.backend);
+            }
+            const bool allocated = ggml_backend_sched_alloc_graph(sched, gf);
+            mark(1);
+            const bool computed = allocated && ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+            mark(2);
+            if (!computed) {
                 if (err) {
                     *err = "merge graph compute failed at layer " + std::to_string(l) + " (out of VRAM?)";
                 }
@@ -218,19 +294,29 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
             }
 
             const int64_t ne0 = w->ne[0], ne1 = w->ne[1];
-            if (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32) {
+            if (device_write && !verify_device) {
+                // Separate output storage keeps the base intact until the
+                // entire graph has consumed it. This copy is synchronous.
+                ggml_backend_tensor_copy(outt, w);
+                mark(5);
+                n_device++;
+            } else if (w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32) {
                 // Same type as the graph output: read back and write straight in.
                 const size_t bytes = ggml_nbytes(w);
                 qbuf.resize(bytes);
                 ggml_backend_tensor_get(outt, qbuf.data(), 0, bytes);
+                mark(3);
                 ggml_backend_tensor_set(w, qbuf.data(), 0, bytes);
+                mark(5);
                 moved += bytes * 2;
             } else {
                 // Quantized base: f32 down, requantize on the host, raw blocks up.
                 f32.resize((size_t) (ne0 * ne1));
-                ggml_backend_tensor_get(outt, f32.data(), 0, f32.size() * sizeof(float));
+                ggml_backend_tensor_get(merged, f32.data(), 0, f32.size() * sizeof(float));
+                mark(3);
                 qbuf.resize(ggml_nbytes(w));
-                const size_t written = ggml_quantize_chunk(w->type, f32.data(), qbuf.data(), 0, ne1, ne0, nullptr);
+                const size_t written = mm3_lm_merge_quantize(w->type, f32.data(), qbuf.data(), ne1, ne0, quant_threads);
+                mark(4);
                 if (written != ggml_nbytes(w)) {
                     if (err) {
                         *err = "requantize size mismatch at layer " + std::to_string(l) + " (" +
@@ -241,10 +327,37 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
                     ok = false;
                     break;
                 }
+                if (verify_cpu) {
+                    serial_bytes.resize(qbuf.size());
+                    ggml_quantize_chunk(w->type, f32.data(), serial_bytes.data(), 0, ne1, ne0, nullptr);
+                    if (std::memcmp(qbuf.data(), serial_bytes.data(), qbuf.size()) != 0) {
+                        if (err) *err = "parallel merge quantization differs from the serial reference";
+                        ggml_free(ctx);
+                        ok = false;
+                        break;
+                    }
+                    n_cpu_verified++;
+                    mark(4);
+                }
+                if (device_write && verify_device) {
+                    device_bytes.resize(qbuf.size());
+                    ggml_backend_tensor_get(outt, device_bytes.data(), 0, device_bytes.size());
+                    if (std::memcmp(qbuf.data(), device_bytes.data(), qbuf.size()) == 0) {
+                        n_verified++;
+                    } else {
+                        for (size_t i = 0; i < qbuf.size(); i++) {
+                            mismatched_bytes += qbuf[i] != device_bytes[i];
+                        }
+                    }
+                    n_device++;
+                    mark(4);
+                }
                 ggml_backend_tensor_set(w, qbuf.data(), 0, qbuf.size());
+                mark(5);
                 moved += f32.size() * sizeof(float) + qbuf.size();
             }
             ggml_free(ctx);
+            mark(6);
             n_merged++;
         }
     }
@@ -257,6 +370,16 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
         fprintf(stderr, "[MM3] LM adapter MERGED: %d modules into %s base, %.1f GB moved, %.0f ms\n", n_merged,
                 ggml_type_name(m->lm.blk[0].attn_q ? m->lm.blk[0].attn_q->type : GGML_TYPE_F16),
                 (double) moved / 1073741824.0, ms);
+        fprintf(stderr, "[MM3] LM merge phases: graph %.0f, allocate %.0f, compute %.0f, download %.0f, "
+                        "CPU quantize %.0f, upload %.0f, cleanup %.0f ms\n",
+                phases[0], phases[1], phases[2], phases[3], phases[4], phases[5], phases[6]);
+        if (want_device) {
+            fprintf(stderr, "[MM3] LM merge device: %d modules, verify=%s, %d byte-identical, %llu differing bytes\n",
+                    n_device, verify_device ? "yes (CPU weights written)" : "no", n_verified,
+                    (unsigned long long) mismatched_bytes);
+        }
+        fprintf(stderr, "[MM3] LM merge CPU quantizer: %d threads, %d modules verified against serial\n",
+                quant_threads, n_cpu_verified);
     }
     return ok;
 }
