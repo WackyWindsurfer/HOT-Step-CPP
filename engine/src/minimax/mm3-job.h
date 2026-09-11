@@ -429,7 +429,8 @@ static void mm3_arbitrate_vram(const MM3Model & m, int64_t n_ctx_needed, MM3JobS
 // in-memory slot cannot outlive the process, so a model swap already drops it.
 // A file can, and a mismatched file has exactly the right SHAPE, which is the
 // one thing a naive reader would have checked.
-static void mm3_ar_key_add_models(std::string & k, const MM3Model & m, const MM3SynthRequest & req) {
+static void mm3_ar_key_add_models(std::string & k, const MM3Model & m, const MM3SynthRequest & req,
+                                   const std::string & merge_backend) {
     auto add_s = [&](const char * n, const std::string & v) { k += n; k += '='; k += v; k += '\n'; };
     auto add_i = [&](const char * n, long long v) { k += n; k += '='; k += std::to_string(v); k += '\n'; };
     auto add_u = [&](const char * n, unsigned long long v) { k += n; k += '='; k += std::to_string(v); k += '\n'; };
@@ -452,7 +453,14 @@ static void mm3_ar_key_add_models(std::string & k, const MM3Model & m, const MM3
         add_s("ad_mode", req.lm_adapter_mode);
         // GPU requantization changes rounding. A saved hidden block or a
         // resident merge must not cross that numerical policy boundary.
-        add_i("ad_device", req.lm_adapter_mode == "merge" && mm3_lm_merge_device_enabled(req.lm_adapter_merge_gpu) ? 1 : 0);
+        const bool device_merge = req.lm_adapter_mode == "merge" && mm3_lm_merge_device_enabled(req.lm_adapter_merge_gpu);
+        add_i("ad_device", device_merge ? 1 : 0);
+        // The policy is a preference: CPU-only and unsupported GPU paths can
+        // fall back to host rounding. Never replay their saved plans across
+        // a backend/device change under the same GPU-preferred flag.
+        if (device_merge) {
+            add_s("ad_merge_backend", merge_backend);
+        }
         add_i("ad_soft_off", req.lm_soft_off ? 1 : 0);  // a token-off plan is not a token-on plan
         const MM3LmAdapterScales & s = req.lm_adapter_scales;
         add_f("ad_g", s.global); add_f("ad_a", s.attn);  add_f("ad_m", s.mlp);
@@ -475,13 +483,15 @@ static void mm3_ar_key_add_models(std::string & k, const MM3Model & m, const MM3
 }
 
 /** The model half alone — what a `.mm3hiddens` file must match to be usable. */
-static std::string mm3_ar_model_key(const MM3Model & m, const MM3SynthRequest & req) {
+static std::string mm3_ar_model_key(const MM3Model & m, const MM3SynthRequest & req,
+                                    const std::string & merge_backend) {
     std::string k = "v=1\n";
-    mm3_ar_key_add_models(k, m, req);
+    mm3_ar_key_add_models(k, m, req, merge_backend);
     return k;
 }
 
-static std::string mm3_ar_cache_key(const MM3Model & m, const MM3SynthRequest & req) {
+static std::string mm3_ar_cache_key(const MM3Model & m, const MM3SynthRequest & req,
+                                    const std::string & merge_backend) {
     std::string k;
     k.reserve(req.prompt.size() + 1024);
 
@@ -527,7 +537,7 @@ static std::string mm3_ar_cache_key(const MM3Model & m, const MM3SynthRequest & 
     }
 
     // The models and the adapter — the half a saved file is checked against.
-    mm3_ar_key_add_models(k, m, req);
+    mm3_ar_key_add_models(k, m, req, merge_backend);
     return k;
 }
 
@@ -665,7 +675,9 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     // Decided BEFORE arbitration and loading, because a hit changes both: no
     // LM weights, no KV cache, and the flow stack comes in up front instead of
     // through the mid-run handover.
-    const std::string ar_key = mm3_ar_cache_key(g_mm3, req);
+    const std::string merge_backend = !req.lm_adapter.empty() && req.lm_adapter_mode == "merge" &&
+        mm3_lm_merge_device_enabled(req.lm_adapter_merge_gpu) ? mm3_lm_merge_backend_identity() : "";
+    const std::string ar_key = mm3_ar_cache_key(g_mm3, req, merge_backend);
 
     // ── AR cache, primed from disk ──────────────────────────────────────────
     //
@@ -700,7 +712,7 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
                         job->id.c_str(), req.forced_frame_hiddens_file.c_str(), (long long) fh.frames,
                         (long long) fh.num_codebooks, (long long) fh.embedding_len,
                         (long long) g_mm3.lm_cfg.num_codebooks, (long long) g_mm3.lm_cfg.embedding_length);
-            } else if (fh.model_key != mm3_ar_model_key(g_mm3, req) && fh.model_key != "external") {
+            } else if (fh.model_key != mm3_ar_model_key(g_mm3, req, merge_backend) && fh.model_key != "external") {
                 // THE refusal that makes this feature safe to expose. A block
                 // made under a different LM quant, or with a different adapter
                 // merged, has exactly the right shape and is meaningless. See
@@ -1270,7 +1282,7 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
             fh.frames        = g_mm3_ar_cache.frames;
             fh.num_codebooks = (int64_t) g_mm3.lm_cfg.num_codebooks;
             fh.embedding_len = (int64_t) g_mm3.lm_cfg.embedding_length;
-            fh.model_key     = mm3_ar_model_key(g_mm3, req);
+            fh.model_key     = mm3_ar_model_key(g_mm3, req, merge_backend);
             fh.full_key      = g_mm3_ar_cache.key;
             fh.semantic_all  = g_mm3_ar_cache.semantic_all;
             fh.acoustic_all  = g_mm3_ar_cache.acoustic_all;

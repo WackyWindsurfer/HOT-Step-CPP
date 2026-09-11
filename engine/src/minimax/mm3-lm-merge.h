@@ -74,6 +74,24 @@ static bool mm3_lm_merge_device_enabled(bool requested_gpu = true) {
     return requested_gpu && (!value || (std::strcmp(value, "0") != 0 && std::strcmp(value, "verify") != 0));
 }
 
+// GPU preference can resolve to host requantization on another backend.
+// Resolve the device even before model loading so cold saved-plan lookup and
+// the later save use the same identity. This temporary reference owns no
+// model allocations and is released before returning.
+static std::string mm3_lm_merge_backend_identity() {
+    BackendPair bp = backend_init("MM3-Merge-Key");
+    const ggml_backend_dev_t dev = ggml_backend_get_device(bp.backend);
+    std::string identity = ggml_backend_name(bp.backend);
+    if (dev) {
+        identity += "|";
+        identity += ggml_backend_dev_name(dev);
+        identity += "|";
+        identity += ggml_backend_dev_description(dev);
+    }
+    backend_release(bp.backend, bp.cpu_backend);
+    return identity;
+}
+
 static std::string mm3_lm_merge_make_tag(const std::string & path, int64_t mtime, const MM3LmAdapterScales & s,
                                        bool requested_gpu) {
     char buf[128];
