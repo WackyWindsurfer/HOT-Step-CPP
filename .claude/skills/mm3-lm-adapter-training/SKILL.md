@@ -21,16 +21,32 @@ Keep this block up to date — it is the thing the in-app trainer should
 eventually be dialled to, and `docs/plans/` is gitignored so nothing there
 survives a fresh clone.
 
+**WHOLE-SONG since 2026-09-11.** The crop-750 / history-2048 recipe below
+this block's history taught adapters that lost the song's arc: one sung
+passage, minutes of looped instrumental, no ending (vocal share 0.16 on album
+P against the album's 0.68). Nothing in a 30 s window ever scores more than
+30 s at once. On the 2026-09-10 overnight those adapters ended 12 of 72
+renders across six fresh albums while the pristine base ended 36 of 36 on the
+same prompts, with no dependence on album length or genre. Training every
+track as ONE sequence (`--max-frames 9000`, no prefix, flash) ended 7/12 on
+albums B and S and 6/12 on album P at the 360 s ceiling, and lifted album P's
+vocal share to 0.42. Cost on an RTX 5090: 6-12 s/step, 29 GB peak at rank 128
+(the engine clamps its buffers to the album's longest track since 2026-09-11,
+so short albums cost less). Whole-song ending times follow the LYRIC SHEET's
+length more than the album's. Not yet re-heard for likeness at the time of
+writing; the ledger `docs/plans/mm3-endings-checklist.md` has the tables.
+
 ```
 --lm mm3-lm-q8_0.gguf
 --rank 128 --alpha 128 --adapter-type lora --hot-pizza          # HOT-PiZZA: PiSSA with principal-subspace dropout (2026-09-06)
 --pissa-frozen-f16 --pissa-cache-dir <adapters>/mm3-lm-adapters/_pissa-init-cache
 --optimizer adamw --lr 8e-5 --lr-end-frac 0.005 --warmup 25    # AdamW tied Prodigy by ear, 2.3 GB lighter (2x LR broke vocals)
---attn flash --prefix-frames 2048 --prefix-chunk 256           # Balanced (2026-09-09): the GOODCAPS recipe, 4/6 endings + full likeness
---max-frames 750 --crop-mode structured --crop-start-frac 0.2 --crop-end-frac 0.15   # Fast = 300 steps, chunk 1024; Thorough = 1000 steps, prefix 4096
+--attn flash                                                   # no --prefix-frames: under the whole-song window the track is its own history
+--max-frames 9000 --drop-over-frames 9000                      # WHOLE SONG (2026-09-11, Rob): every track as one sequence; tracks over 360 s left out
+--crop-mode structured --crop-start-frac 0.2 --crop-end-frac 0.15   # only matters for a track longer than the window (none, with the drop)
 --crop-start-tiles 3 --crop-anchor song
 --rank-dropout 0.1                                             # the mask IS the method under --hot-pizza; never 0
---steps 500 --save-every 100                                   # stop on STEPS: train loss reads 2.7-5 under HOT-PiZZA (Balanced; Fast = 300); 100 since 2026-09-09
+--steps 600 --save-every 100                                   # Balanced = 600, Fast = 300, Thorough = 900 (2026-09-11); stop on STEPS
 --depth-loss-weight 1.0 --depth-loss-frames 128
 # captions: per-track <stem>.mm3.txt from MOSS/Gemini, and ONLY those. No --caption-file:
 # the shared caption killed endings (0/6 vs 4/6) and was removed on 2026-09-09.
@@ -66,18 +82,20 @@ stopping signal.
 the Training Studio card; the route lays `preset` under the request's own
 fields, so `{preset:'thorough'}` alone trains Thorough):**
 
-| preset | steps | lr | crop | history | min/album (5090) | record |
+| preset | steps | lr | window | history | min/album (5090) | record |
 |---|---|---|---|---|---|---|
-| Fast (EXPERIMENTAL) | 300 | 1.6e-4 | 500 | 1024 | 15 | tied blind on 90 s previews, then 5/5 full-album runs on albumB had Simlish / missing vocals / an out-of-tune organ; lr and chunk cleared as sole causes |
-| **Balanced** (default) | 500 | 8e-5 | 750 | 2048 (chunk 256) | 35 | the rock-10 recipe; retrained on the same binary it reproduced the morning's adapter and Rob heard intelligible vocals |
-| Thorough | 1000 | 8e-5 | 750 | 4096 | ~80 | crop/history of the top scores (72, 70.5) at the top-scoring depth (1000 = 72 vs 68 at 500, inside noise); Rob's call over my 500 |
+| Fast | 300 | 8e-5 | whole song (9000) | none | 30-60 | the 2026-09-10 overnight arm: album B 7/12, album S 7/12, album P 3/12 at 300 s and 6/12 at 360 s |
+| **Balanced** (default) | 600 | 8e-5 | whole song (9000) | none | 60-120 | Fast at twice the depth; Rob's pick for the default (2026-09-11), not yet heard |
+| Thorough | 900 | 8e-5 | whole song (9000) | none | 90-180 | three times Fast's depth; not yet heard |
 
-All three share flash, AdamW, HOT-PiZZA r128, f16 factors, structured crops
-and the acoustic loss. `MM3_LM_DEFAULTS` carries the Balanced values, so an
-empty API body trains Balanced. Since 2026-09-07 the route also turns on prior
-preservation against base-model endings by default (corpus under
-`<training>/mm3-reg-corpus/base-endings-k500`, every 3rd step, steps grown by
-half so the artist keeps 500 updates); `regularisation: null` disables it.
+(Superseded 2026-09-11: Fast 300 / Balanced 500 / Thorough 1000 at crop 750
+with a 2048- or 4096-frame history. That regime's record — Fast's Simlish
+vocals of 2026-09-07, Balanced's 4/6 on album B — is in this file's git
+history.) All three share flash, AdamW, HOT-PiZZA r128, f16 factors and the
+acoustic loss; tracks longer than the window are left out (`longTracks:
+'exclude'`, engine `--drop-over-frames`). `MM3_LM_DEFAULTS` carries the
+Balanced values, so an empty API body trains Balanced. Prior preservation is
+OFF unless the request names a corpus (since 2026-09-09).
 
 **Rob, 2026-08-25, on the LoKr configuration this replaced: "the closest we've ever gotten to
 artist replication."** Crop 750 = 30 s = ~3 s/step; he set it by ear after

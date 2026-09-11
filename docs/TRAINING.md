@@ -126,15 +126,28 @@ every 2x-LR arm scored a few points under, and one such run planned a song
 with no vocals. Turning the acoustic loss off was the lowest-scored arm.
 
 The Training Studio offers three recipes (Recipe row on the MM3 card;
-`preset` on the API): **Balanced** (default: 500 steps at `--lr 8e-5`, crop
-750, history 2048 prefilled in 256-token chunks, about 35 min per album; the
-recipe behind every adapter that has passed a listening test here),
-**Thorough** (1000 steps, crop 750, history 4096, about 80 min) and **Fast**
-(experimental: 300 steps at `1.6e-4`, crop 500, history 1024, about 15 min).
-Fast tied the others blind on 90 s previews of one album, then produced
-unintelligible or missing vocals on a full album in five runs out of five
-(2026-09-07); the learning rate and the prefill chunk were each cleared as
-the sole cause, so it stays selectable only for the bisect.
+`preset` on the API). Since 2026-09-11 all three train **every track as one
+whole sequence** (`--max-frames 9000`, the engine's 360 s ceiling, no history
+prefix, flash attention) and differ only in depth: **Fast** (300 steps),
+**Balanced** (default, 600 steps) and **Thorough** (900 steps), all at
+`--lr 8e-5`. Tracks longer than the window are left out of the run by default
+(`longTracks: "exclude"`, the engine's `--drop-over-frames`; the log names
+them) and the route refuses a request that exclusion would gut; `"crop"`
+trains them in window-sized crops instead. The engine clamps its sequence
+buffers to the album's longest track, so an album of three-minute songs
+reserves memory for three-minute songs, not for the ceiling.
+
+Why: the earlier 30-second-crop recipes (crop 750, 82 s of history) produced
+adapters that lost the song's shape — one sung passage surrounded by minutes
+of looped instrumental, and no ending. On the 2026-09-10 overnight those
+adapters ended 12 of 72 renders across six albums while the base model ended
+36 of 36 on the same prompts, regardless of album length or genre.
+Whole-song training on the same albums ended about half of its renders and
+restored most of the vocal share. Cost on an RTX 5090 at rank 128: 6 to 12 s
+per step and a 29 GB peak (measured: 25.4 GB at 2000 frames, 26.8 at 4000,
+29.1 at 9000, linear in the sequence length), so it is a 32 GB recipe as
+shipped; rank 64 or the acoustic loss off would be the levers for a 24 GB
+card and neither has been heard under this regime.
 
 Since 2026-09-07 the default recipe also runs **prior preservation against
 base-model endings**: every 3rd step scores a 20 s excerpt of a base-model

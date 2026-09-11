@@ -196,6 +196,13 @@ struct MM3LmTrainArgs {
      *  supervised audio came from a minute in. --crop-anchor at least tells the
      *  model WHERE it is now; start-truncation removes the mismatch instead. */
     int64_t     max_frames = 4096;
+    /** --drop-over-frames N: leave out every style track longer than N frames
+     *  at load (0 = keep all). The whole-song recipe (2026-09-11) asks for the
+     *  engine's 9000-frame ceiling so that every track trains as one sequence;
+     *  a track that does not fit could only be trained in pieces, at positions
+     *  past the base's 10240-token range, so the presets drop it instead and
+     *  the log names what was dropped. Reg corpora are never filtered. */
+    int64_t     drop_over_frames = 0;
     std::string crop_mode = "beginning";  // random | beginning | structured
     /** `structured` only. The share of training steps whose crop is pinned to
      *  frame 0, and the share pinned flush to the track's end.
@@ -833,9 +840,11 @@ static bool mm3_lm_load_samples_from(const std::string & manifest, const std::st
                                      const std::string & caption_override,
                                      bool trim_trailing,
                                      const MM3TrainLm & t,
-                                     std::vector<MM3LmSample> * out, std::string * err) {
+                                     std::vector<MM3LmSample> * out, std::string * err,
+                                     int64_t drop_over_frames = 0) {
     struct { std::string manifest, captions_dir, codes_dir, lm_path; } a {
         manifest, captions_dir, codes_dir, lm_path };
+    int n_dropped_long = 0;
     // Stage A: per-track keep_frames from <codes_dir>/trim.json, applied below.
     std::map<std::string, int64_t> trim;
     if (trim_trailing) {
@@ -929,6 +938,14 @@ static bool mm3_lm_load_samples_from(const std::string & manifest, const std::st
                     sm.codes.resize((size_t) (sm.n_frames * 8));
                 }
             }
+            if (drop_over_frames > 0 && sm.n_frames > drop_over_frames) {
+                // --drop-over-frames: the whole-song recipe. See MM3LmTrainArgs.
+                fprintf(stderr, "[mm3-lm-train] DROP %s: %lld frames (%.0f s) exceeds the %lld-frame window (%.0f s)\n",
+                        id.c_str(), (long long) sm.n_frames, (double) sm.n_frames / 25.0,
+                        (long long) drop_over_frames, (double) drop_over_frames / 25.0);
+                n_dropped_long++;
+                continue;
+            }
             {
                 yyjson_val * ov = yyjson_obj_get(s, "frame_offset");
                 if (ov && yyjson_is_num(ov)) sm.frame_offset = (int64_t) yyjson_get_num(ov);
@@ -971,6 +988,10 @@ static bool mm3_lm_load_samples_from(const std::string & manifest, const std::st
             samples.push_back(std::move(sm));
         }
         yyjson_doc_free(doc);
+    if (n_dropped_long > 0) {
+        fprintf(stderr, "[mm3-lm-train] %d track(s) longer than %lld frames left out (--drop-over-frames); %zu remain\n",
+                n_dropped_long, (long long) drop_over_frames, samples.size());
+    }
     return true;
 }
 
@@ -987,7 +1008,7 @@ static bool mm3_lm_load_samples(const MM3LmTrainArgs & a, const MM3TrainLm & t,
     }
     return mm3_lm_load_samples_from(a.manifest, a.captions_dir, a.codes_dir, a.lm_path,
                                     a.trigger_prepend && !a.trigger.empty() ? a.trigger + ", " : "",
-                                    shared, a.trim_trailing_silence, t, out, err);
+                                    shared, a.trim_trailing_silence, t, out, err, a.drop_over_frames);
 }
 
 // ── finite-difference gradient check ────────────────────────────────────────
@@ -2056,8 +2077,19 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
     }
 
     int64_t max_prompt = 0;
+    // The longest track in frames, across everything the run will crop from.
+    // The sequence budget below is clamped to it: a whole-song recipe asks for
+    // the engine's 9000-frame ceiling so that every track trains whole, and
+    // sizing the checkpoints, arena and attention probe off 9000 frames on an
+    // album whose longest track is 4000 frames allocated 29 GB for a run that
+    // needed far less (three albums on 2026-09-10, all 29.0-29.1 GB peak
+    // regardless of track length). No crop can exceed the track it is cut from,
+    // so the clamp changes nothing about what is trained, only what is reserved.
+    int64_t longest_track = 0;
     for (const auto & s : samples) max_prompt = std::max(max_prompt, (int64_t) s.prompt.size());
     for (const auto & s : holdout) max_prompt = std::max(max_prompt, (int64_t) s.prompt.size());
+    for (const auto & s : samples) longest_track = std::max(longest_track, s.n_frames);
+    for (const auto & s : holdout) longest_track = std::max(longest_track, s.n_frames);
     // A regularisation corpus carries its own prompts, and they are not bounded
     // by the style corpus: a Lyric Studio MM3 caption runs ~1,100-1,300 tokens
     // against ~600 for a captioned album track. Sizing the graph off the style
@@ -2074,6 +2106,7 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                                      &reg_probe, &perr)) {
             int64_t reg_max = 0;
             for (const auto & s : reg_probe) reg_max = std::max(reg_max, (int64_t) s.prompt.size());
+            for (const auto & s : reg_probe) longest_track = std::max(longest_track, s.n_frames);
             fprintf(stderr, "[mm3-lm-train] reg corpus: %zu samples, longest prompt %lld tok (style %lld) - graph sized to fit both\n",
                     reg_probe.size(), (long long) reg_max, (long long) max_prompt);
             max_prompt = std::max(max_prompt, reg_max);
@@ -2081,7 +2114,13 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
             fprintf(stderr, "[mm3-lm-train] reg corpus pre-scan failed (%s); sizing off the style corpus only\n", perr.c_str());
         }
     }
-    const int64_t K_max = a.max_frames > 0 ? a.max_frames : 4096;
+    const int64_t K_ask = a.max_frames > 0 ? a.max_frames : 4096;
+    const int64_t K_max = (longest_track > 0 && longest_track < K_ask) ? longest_track : K_ask;
+    if (K_max != K_ask) {
+        fprintf(stderr, "[mm3-lm-train] crop budget %lld frames clamped to the longest track (%lld frames, %.0f s): "
+                        "every track trains whole and the buffers are sized to the album, not the ask\n",
+                (long long) K_ask, (long long) longest_track, (double) longest_track / 25.0);
+    }
     // A crop that reaches the track end uses all K frames as INPUT, and with a
     // prefix the window takes one more in front of them (see `lead`). So the
     // widest input span is K_max + 1, and every buffer sized off the sequence

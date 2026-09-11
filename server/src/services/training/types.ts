@@ -48,6 +48,8 @@ export interface Mm3TrainLmRequest {
    *  its end. Default false: it is deleted on completion and kept only when
    *  the run stops short. */
   keepResumeState?: boolean;
+  /** Tracks longer than the window (maxFrames): exclude (default) or crop. */
+  longTracks?: 'exclude' | 'crop';
   /** Engine --verify-export (round-trip every checkpoint through the runtime loader). */
   verifyExport?: boolean;
   warmup?: number;

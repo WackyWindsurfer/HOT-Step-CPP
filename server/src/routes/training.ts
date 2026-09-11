@@ -2077,7 +2077,7 @@ router.get('/mm3/preview', (req: Request, res: Response) => {
 });
 
 /** POST /datasets/:id/mm3-train-lm */
-router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
+router.post('/datasets/:id/mm3-train-lm', async (req: Request, res: Response) => {
   try {
     const ds = mm3Preflight(req, res);
     if (!ds) return;
@@ -2238,6 +2238,23 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
     // 0 = off. Resolved here (not just inline in the job object below) because
     // the flash-attention coercion right after needs it too.
     const prefixFramesResolved = num('prefixFrames', D.prefixFrames, 0, 9000);
+    // Whole-song recipe (2026-09-11): tracks longer than the window are left
+    // out of the run by default. Refuse a request that exclusion would gut —
+    // a custom crop of 750 frames with the default 'exclude' would otherwise
+    // drop every track and train on nothing; the user meant 'crop'.
+    const longTracksResolved: 'exclude' | 'crop' = b.longTracks === 'crop' ? 'crop' : D.longTracks;
+    const maxFramesResolved = num('maxFrames', D.maxFrames, 64, 9000);
+    if (longTracksResolved === 'exclude') {
+      const known = (await buildSamples(ds)).filter(s => !s.excluded && !s.fileMissing && s.duration > 0);
+      const over  = known.filter(s => s.duration * 25 > maxFramesResolved);
+      if (known.length > 0 && over.length * 2 > known.length) {
+        res.status(400).json({
+          error: `${over.length} of ${known.length} tracks are longer than the ${Math.round(maxFramesResolved / 25)} s window `
+               + 'and would be excluded; set longTracks to "crop" or raise maxFrames',
+        });
+        return;
+      }
+    }
     // The engine REFUSES this pair outright (mm3-lm-train-run.h, 2026-09-05
     // --attn port: "--attn flash cannot be combined with --prefix-frames" is a
     // fatal exit) — a frozen KV prefix makes the attention mask rectangular
@@ -2299,6 +2316,7 @@ router.post('/datasets/:id/mm3-train-lm', (req: Request, res: Response) => {
       scoreLast:    num('scoreLast', 0, 0, 9000),
       scoreLastEndOnly: b.scoreLastEndOnly === true,
       keepResumeState: b.keepResumeState === true,
+      longTracks: longTracksResolved,
       verifyExport: b.verifyExport === true,
       lyricsDropout: num('lyricsDropout', 0, 0, 1),
       trimTrailingSilence: b.trimTrailingSilence === true,

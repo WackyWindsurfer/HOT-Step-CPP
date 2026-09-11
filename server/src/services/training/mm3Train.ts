@@ -248,7 +248,22 @@ export const MM3_VRAM_MODEL = {
    *  halving, and callers should show "flash: estimate pending measurement"
    *  instead of a number they cannot stand behind. Shape mirrors the fields
    *  flash mode would plausibly change; extend it once real anchors exist. */
-  flash: null as null | { perTokenSqMb: number },
+  /** MEASURED 2026-09-11 (RTX 5090, mm3-lm-q8_0, rank 128, AdamW, acoustic
+   *  loss on, no prefix, --attn flash), three anchors on one album:
+   *
+   *      S =  3050 (2000 frames)  ->  25425 MB
+   *      S =  5050 (4000 frames)  ->  26768 MB
+   *      S = 10425 (9000 frames)  ->  29125 MB
+   *
+   *  Linear in S (0.50 MB per token: the 36 f32 layer checkpoints plus the
+   *  arena; no [S, S] scores are retained under flash), on a floor that is
+   *  7.8 GB above what loaded + rank + constMb account for — the fused
+   *  attention's own workspace and the checkpoint segments at their fixed
+   *  size. The fit reproduces the outer anchors to 1 MB and the middle one to
+   *  340 MB. Calibrated at rank 128 / q8_0; an estimate elsewhere. */
+  flash: { perTokenSqMb: 0, perTokenMb: 0.5016, constMb: 7759 } as null | {
+    perTokenSqMb: number; perTokenMb: number; constMb: number;
+  },
 } as const;
 
 /** Whether MM3_VRAM_MODEL.flash carries a real measurement. False today. */
@@ -299,8 +314,12 @@ export function estimateMm3PeakMb(baseBytes: number, rank: number, maxFrames: nu
   // the exact-mode coefficient rather than reporting a saving nobody has
   // proven. mm3FlashVramCalibrated() tells a caller whether the number below
   // actually reflects flash mode or is standing in for it.
-  const perTokenSqMb = (attn === 'flash' && M.flash) ? M.flash.perTokenSqMb : M.perTokenSqMb;
-  return Math.round(loaded + perRank * rank + M.perTokenMb * S + perTokenSqMb * S * S
+  if (attn === 'flash' && M.flash) {
+    // Calibrated flash curve (see M.flash): linear in S on its own floor.
+    return Math.round(loaded + perRank * rank + M.flash.perTokenMb * S + M.flash.perTokenSqMb * S * S
+                      + M.constMb + M.flash.constMb + extraMb + estimateMm3PrefixMb(prefixFrames, maxFrames));
+  }
+  return Math.round(loaded + perRank * rank + M.perTokenMb * S + M.perTokenSqMb * S * S
                     + M.constMb + extraMb + estimateMm3PrefixMb(prefixFrames, maxFrames));
 }
 
@@ -648,7 +667,21 @@ export const MM3_LM_DEFAULTS = {
    *  blind (67.5 vs 68 of 90) and the combined safe stack (crop 500 + prefix
    *  1024 + prefill chunk 1024) tied the crop-750 recipe again (67 vs 70.5,
    *  noise ~6) at 3.1 s/step against 4.5: 26 min per 500 steps instead of 37. */
-  maxFrames: 750,
+  /** 9000 = WHOLE SONG since 2026-09-11 (Rob). The window-recipe adapters
+   *  above (crop 750, history 2048) lost the song's arc — one sung passage,
+   *  minutes of looped instrumental, no ending — because nothing in training
+   *  ever scored more than 30 s at once. At 9000 frames every track under
+   *  six minutes trains as one sequence; the engine clamps its buffers to the
+   *  album's longest track, so a short album costs what it needs and not
+   *  what was asked. Tracks longer than the window are dropped (longTracks). */
+  maxFrames: 9000,
+  /** Tracks longer than maxFrames: `exclude` leaves them out of the run (the
+   *  engine's --drop-over-frames, named in the log); `crop` trains them in
+   *  structured crops of maxFrames, which is the pre-2026-09-11 behaviour and
+   *  puts their tail at positions past the base's 10240-token range. About
+   *  6.5% of the catalogue's tracks exceed 360 s; the route refuses a run that
+   *  exclusion would empty by more than half. */
+  longTracks: 'exclude' as 'exclude' | 'crop',
   /** `structured`: a fixed share of steps pinned to frame 0, a fixed share
    *  flush to the track's end, the rest random.
    *
@@ -846,7 +879,9 @@ export const MM3_LM_DEFAULTS = {
    *  the prefill through every layer, not the attention over it. */
   /** 1024 since 2026-09-07 (Rob): tied 2048 blind (69 vs 68 of 90) and takes
    *  another 12% off the step; part of the safe stack with crop 500. */
-  prefixFrames: 2048,
+  /** 0 since 2026-09-11: under the whole-song window the track IS its own
+   *  history, and a frozen prefix would only add prefill cost. */
+  prefixFrames: 0,
   /** Prefill positions per graph. Trades host graph-build overhead against the
    *  transient attention scores of one chunk; 256 is a middle setting and has
    *  no effect on the result, only on speed and peak. 1024 since 2026-09-07:
@@ -995,9 +1030,17 @@ export const MM3_LM_DEFAULT_PRESET: Mm3PresetName = 'balanced';
 export const MM3_LM_PRESETS: Record<Mm3PresetName, {
   steps: number; lr: number; maxFrames: number; prefixFrames: number; prefixChunk: number;
 }> = {
-  fast:     { steps: 300, lr: 8e-5,   maxFrames: 750, prefixFrames: 2048, prefixChunk: 1024 },
-  balanced: { steps: 500, lr: 8e-5,   maxFrames: 750, prefixFrames: 2048, prefixChunk: 256 },
-  thorough: { steps: 1000, lr: 8e-5,  maxFrames: 750, prefixFrames: 4096, prefixChunk: 256 },
+  // WHOLE-SONG since 2026-09-11 (Rob): every track trains as ONE sequence
+  // (maxFrames = the engine's 9000-frame ceiling, no history prefix — the
+  // song is its own history), and the three recipes differ only in depth.
+  // The 2026-09-10 overnight: crop-750 adapters ended 12 of 72 renders across
+  // six albums while the base ended 36 of 36 on the same prompts; whole-song
+  // adapters ended 7/12 (album S), 7/12 (album B) and 6/12 (album P at the
+  // 360 s ceiling) and brought album P's vocal share from 0.16 to 0.42 (album
+  // 0.68). Cost on an RTX 5090: 6-12 s/step, 29 GB peak at rank 128.
+  fast:     { steps: 300, lr: 8e-5, maxFrames: 9000, prefixFrames: 0, prefixChunk: 256 },
+  balanced: { steps: 600, lr: 8e-5, maxFrames: 9000, prefixFrames: 0, prefixChunk: 256 },
+  thorough: { steps: 900, lr: 8e-5, maxFrames: 9000, prefixFrames: 0, prefixChunk: 256 },
 };
 export function isMm3PresetName(v: unknown): v is Mm3PresetName {
   return v === 'fast' || v === 'balanced' || v === 'thorough';
@@ -1093,6 +1136,9 @@ export interface ResolvedMm3TrainLmOptions {
   scoreLastEndOnly?: boolean;
   /** Server-side only (no engine flag): keep resume-state.bin after completion. */
   keepResumeState?: boolean;
+  /** Tracks longer than maxFrames: exclude (engine --drop-over-frames) or crop.
+   *  See MM3_LM_DEFAULTS.longTracks. Absent = exclude. */
+  longTracks?: 'exclude' | 'crop';
   /** Engine --verify-export: after every checkpoint, load it back through the
    *  RUNTIME loader and compare against the live trainer (mm3-lm-verify-export.h).
    *  Opt-in: it briefly holds a second copy of the adapter on the card. */
@@ -1287,6 +1333,10 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
   // collision (engine exit) before this ever runs — see attnBackendResolved
   // in routes/training.ts.
   if (o.attnBackend && o.attnBackend !== 'exact') args.push('--attn', o.attnBackend);
+  // Whole-song recipe (2026-09-11): tracks that do not fit the window are left
+  // out rather than trained in pieces. Emitted only for 'exclude' so an older
+  // engine never sees the flag for the 'crop' behaviour it already has.
+  if ((o.longTracks ?? 'exclude') === 'exclude') args.push('--drop-over-frames', String(o.maxFrames));
   // Soft prompt. Uses the SAME flag names the parser already accepts
   // (--artist-token/-k/-lr) — this is not a new engine surface, just a
   // previously-unwired one.

@@ -48,6 +48,7 @@ interface FormState {
   targetLossEpochs: number;
   saveEvery: number;
   keepResumeState: boolean;
+  longTracks: 'exclude' | 'crop';
   rank: number;
   alpha: number;
   lr: number;
@@ -176,6 +177,7 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
     targetLossEpochs: status.defaults.targetLossEpochs ?? 5,
     saveEvery: status.defaults.saveEvery ?? 100,
     keepResumeState: status.defaults.keepResumeState ?? false,
+    longTracks: status.defaults.longTracks === 'crop' ? 'crop' : 'exclude',
     // Rank follows the recommendation for the same reason as the base: at the
     // default 256 nothing fits below ~24 GB, so a 16 GB card would open on a
     // red 'will not fit' form with the fix two fields away and unstated.
@@ -323,6 +325,7 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
     try {
       const body: Mm3TrainLmRequest = {
         steps: form.steps, saveEvery: form.saveEvery, keepResumeState: form.keepResumeState,
+        longTracks: form.longTracks,
         rank: form.rank, alpha: form.alpha,
         lr: form.lr, maxFrames: form.maxFrames, cropMode: form.cropMode,
         // Informational: the fields above already carry the recipe. The
@@ -672,6 +675,19 @@ export const Mm3TrainCard: React.FC<{ datasetId: string; trigger?: string }> = (
                     {t('trainingStudio.mm3.keepResumeStateHint',
                       'The optimizer state (about 4 GB) lets a finished run be continued past its step '
                       + 'count. Off: it is deleted once the run ends. A run that stops early keeps it either way.')}
+                  </span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 text-[11px] text-zinc-600 dark:text-zinc-300 col-span-2">
+                <input type="checkbox" className="mt-0.5" checked={form.longTracks === 'exclude'}
+                  onChange={e => set('longTracks', e.target.checked ? 'exclude' : 'crop')} />
+                <span>
+                  {t('trainingStudio.mm3.longTracksExclude', 'Leave out tracks longer than the window')}
+                  <span className="block text-[10px] text-zinc-500">
+                    {t('trainingStudio.mm3.longTracksHint',
+                      'The recipe trains each track as one whole sequence. A track longer than the window '
+                      + '(360 s at 9000 frames) cannot be, so it is left out and named in the log. Unticked: it is '
+                      + 'trained in crops of the window instead, which is the pre-2026-09-11 behaviour.')}
                   </span>
                 </span>
               </label>

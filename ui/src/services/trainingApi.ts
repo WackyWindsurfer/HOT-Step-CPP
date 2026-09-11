@@ -122,7 +122,7 @@ export interface Mm3VramModel {
   /** Flash-attention's own coefficients, once measured. null/absent = not
    *  measured yet — estimateMm3PeakMb then falls back to the exact-mode
    *  quadratic term instead of guessing a saving. See MM3_VRAM_MODEL.flash. */
-  flash?: { perTokenSqMb: number } | null;
+  flash?: { perTokenSqMb: number; perTokenMb?: number; constMb?: number } | null;
 }
 
 /** Whether `m.flash` carries a real measurement. False for any server that
@@ -163,8 +163,13 @@ export function estimateMm3PeakMb(baseBytes: number, rank: number, maxFrames: nu
   const perRank = m.perRankMb + extraBuffers * (m.adamwPerRankMb ?? 0);
   // 'flash' with no calibrated m.flash falls back to the exact-mode term —
   // see MM3_VRAM_MODEL.flash server-side. Never invent a saving.
-  const perTokenSqMb = (attn === 'flash' && m.flash) ? m.flash.perTokenSqMb : (m.perTokenSqMb ?? 0);
-  const sq      = perTokenSqMb * S * S;
+  if (attn === 'flash' && m.flash) {
+    // Calibrated flash curve (2026-09-11): linear in S on its own floor. Mirrors the server.
+    const lin = (m.flash.perTokenMb ?? m.perTokenMb) * S;
+    return Math.round(loaded + perRank * rank + lin + m.flash.perTokenSqMb * S * S + m.constMb
+                      + (m.flash.constMb ?? 0) + estimateMm3PrefixMb(prefixFrames, maxFrames, m, prefixChunk));
+  }
+  const sq      = (m.perTokenSqMb ?? 0) * S * S;
   return Math.round(loaded + perRank * rank + m.perTokenMb * S + sq + m.constMb
                     + estimateMm3PrefixMb(prefixFrames, maxFrames, m, prefixChunk));
 }
@@ -190,6 +195,8 @@ export interface Mm3TrainLmRequest {
   steps?: number;
   saveEvery?: number;
   keepResumeState?: boolean;
+  /** Tracks longer than the window: exclude (default) or crop. */
+  longTracks?: 'exclude' | 'crop';
   warmup?: number;
   gradAccum?: number;
   seed?: number;
