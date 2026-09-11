@@ -1179,6 +1179,16 @@ async function _tryReconnect(item: AudioQueueItem, _token: string): Promise<bool
 
 async function _executeItem(item: AudioQueueItem, token: string): Promise<void> {
   const gen = item.generation;
+  // The preset as it is NOW, not as it was when the item was queued: a
+  // training run that finishes while songs wait in the queue assigns its
+  // adapter to the album preset, and the queued songs should render with it.
+  // The enqueue-time copy stays as the fallback when the lookup fails.
+  if (item.lyricsSetId) {
+    try {
+      const res = await lireekApi.getPreset(item.lyricsSetId);
+      item.preset = res.preset;
+    } catch { /* offline or deleted set: keep the snapshot */ }
+  }
   const preset = item.preset;
 
   // 1) Start with globalParams snapshot — identical to Create page's getGlobalParams().
@@ -1331,6 +1341,18 @@ async function _executeItem(item: AudioQueueItem, token: string): Promise<void> 
     }
   } else {
     delete params.lmAdapter;
+  }
+
+  // 3c) MM3 adapter from album preset (2026-09-11). The preset GOVERNS in MM3
+  // mode: its adapter plans the song, and an album with none gets the base
+  // model — never the global dropdown's last pick. Until this existed the
+  // global value rode along, and a queue of one album's songs rendered with
+  // another album's adapter (two songs on 2026-09-11 08:48). The global is
+  // written to match so the dropdown shows what actually ran.
+  if (backendId === MM3_BACKEND_ID) {
+    const ref = preset?.mm3_adapter_path || '';
+    params.mm3LmAdapter = ref;
+    try { useGlobalParamsStore.getState().setBackendParam('mm3LmAdapter', ref); } catch { /* store not ready */ }
   }
 
   // 4) Mastering reference from album preset (does NOT force-enable — respects global toggle)
