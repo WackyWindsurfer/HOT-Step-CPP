@@ -43,11 +43,38 @@ export interface Mm3PropsFile {
   [k: string]: unknown;
 }
 
+/** GET /mm3/props.dit_runtime — full contract per
+ *  docs/plans/2026-09-11-mm3-trt-dit-shipping.md. Every field beyond the
+ *  original four is optional: an older engine build (pre-TRT-shipping)
+ *  simply omits them, and callers must treat that the same as "unsupported"
+ *  rather than throwing on a missing field. */
 export interface Mm3DitRuntime {
   supported: boolean;
   available: boolean;
   backend: 'ggml' | 'tensorrt' | string;
   reason: string;
+  /** Free VRAM in MB at the time of the probe, if a CUDA device was found. */
+  gpu_mb?: number;
+  /** CUDA compute capability of the active device as MAJOR*10+MINOR (e.g. 120
+   *  for Blackwell consumer / RTX 50-series), 0 if no CUDA device. Matches the
+   *  `sm` tag/field on TensorRT builder-resource registry entries. */
+  sm?: number;
+  /** DLLs loadable from the engine directory — the "runtime" tier. */
+  runtime?: {
+    nvinfer: boolean;
+    parser: boolean;
+    builder_resource: boolean;
+  };
+  /** The ONNX graph + manifest, and whether a base engine already exists for
+   *  this GPU/TRT-version key — the "assets" tier. */
+  assets?: {
+    onnx: boolean;
+    manifest: boolean;
+    engine: boolean;
+  };
+  /** available === true but no cached base engine for this key yet, so the
+   *  first render will build one (one-time, a few minutes). */
+  needs_build?: boolean;
 }
 
 /** One mm3-{lm,synth}-<quant>.gguf found on disk. `quant` is the filename

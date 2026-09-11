@@ -51,7 +51,7 @@ function detectCudaMajorVersion(): number {
 const CUDA_MAJOR = detectCudaMajorVersion();
 
 // IDs of CUDA-only file entries
-const CUDA_ONLY_FILE_PREFIXES = ['cuda-rt-', 'supersep-rt-'];
+const CUDA_ONLY_FILE_PREFIXES = ['cuda-rt-', 'supersep-rt-', 'trt-rt-', 'mm3-dit-trt-'];
 
 /** True for catalogue entries that can only ever run on Windows.
  *
@@ -117,6 +117,9 @@ interface RegistryFile {
   description: string;
   tags: string[];
   companions?: RegistryCompanion[];
+  /** TensorRT builder-resource entries only — see ui/src/types.ts RegistryFile
+   *  for the matching UI-side field. */
+  sm?: number;
 }
 
 // ── Service ─────────────────────────────────────────────────
@@ -270,6 +273,23 @@ class ModelDownloadService extends EventEmitter {
     if (fs.existsSync(sa3Dir)) {
       for (const f of fs.readdirSync(sa3Dir)) {
         if (!f.endsWith('.part')) files.add(f);
+      }
+    }
+
+    // Scan mm3/ for the TensorRT DiT manifest companion (mm3-dit-trt.engine.json)
+    // — the generic subdirectory scan above stops at .gguf/.onnx/.safetensors/.bin
+    // and never matches .json. Deliberately scoped to mm3/ (not a generic
+    // ".json anywhere" rule) so an unrelated stray .json in another subdir
+    // doesn't start reading as "installed". This does NOT reach
+    // mm3/mm3-trt-cache/*.engine — that's a nested sub-subdirectory this loop
+    // never descends into, and .engine isn't a matched extension here or in
+    // deleteFile()'s whitelist below: a built TensorRT engine is GPU- and
+    // TensorRT-version-locked, so it can never be a catalogue download/delete
+    // target, only a same-machine build artifact.
+    const mm3Dir = path.join(dir, 'mm3');
+    if (fs.existsSync(mm3Dir)) {
+      for (const f of fs.readdirSync(mm3Dir)) {
+        if (f.endsWith('.json')) files.add(f);
       }
     }
 

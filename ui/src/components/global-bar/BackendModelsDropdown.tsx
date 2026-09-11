@@ -16,8 +16,12 @@
 import React, { useEffect, useState } from 'react';
 import { Download } from 'lucide-react';
 import { useBackendStore } from '../../stores/backendStore';
+import { useCapabilities } from '../../hooks/useCapabilities';
+import { useGlobalParamsStore } from '../../stores/globalParamsStore';
 import { ModelManagerModal } from '../model-manager/ModelManagerModal';
 import { ModelSelect } from './ModelSelect';
+import type { Mm3DitRuntime } from './Mm3RendererRow';
+import { Mm3RendererRow } from './Mm3RendererRow';
 
 /** Friendly names for the buckets we know about. Unknown buckets fall back to
  *  their raw key rather than being hidden — a backend that grows a bucket
@@ -43,6 +47,14 @@ export const BackendModelsDropdown: React.FC = () => {
   const catalogue = useBackendStore(s => s.models[s.activeBackendId] ?? null);
   const fetchModels = useBackendStore(s => s.fetchModels);
   const selectModels = useBackendStore(s => s.selectModels);
+  // Same path the Generation dropdown's old Renderer hint used to read
+  // dit_runtime off of: the active backend's capability manifest (see the
+  // `core.dit_runtime` passthrough in backends/minimax/index.ts capabilities()).
+  const { capabilities } = useCapabilities();
+  const ditRuntime = (capabilities?.core as { dit_runtime?: Mm3DitRuntime } | undefined)?.dit_runtime;
+  const backendParams = useGlobalParamsStore(s => s.backendParams) as Record<string, unknown> | undefined;
+  const setBackendParam = useGlobalParamsStore(s => s.setBackendParam) as (key: string, v: unknown) => void;
+  const ditBackend = (backendParams?.mm3DitBackend as 'ggml' | 'tensorrt' | undefined) ?? 'ggml';
 
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -129,6 +141,14 @@ export const BackendModelsDropdown: React.FC = () => {
             />
             {meta[current]?.label && (
               <p className="text-[10px] text-zinc-500 mt-1.5 font-mono truncate">{meta[current].label}</p>
+            )}
+            {bucket === 'dit' && (
+              <Mm3RendererRow
+                ditRuntime={ditRuntime}
+                value={ditBackend}
+                onChange={(v) => setBackendParam('mm3DitBackend', v)}
+                onOpenModelManager={() => setShowModelManager(true)}
+              />
             )}
           </div>
         );

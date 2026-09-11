@@ -177,6 +177,34 @@
 #define MM3_LM_MAX_NODES 8192
 // Attention-window quantum (design note C).
 #define MM3_LM_KV_BUCKET 256
+
+// Storage type of the LM KV cache. F16 is the historical default. Q8_0 halves
+// the per-step KV traffic, which at a long context (six rows at 8k positions
+// read about as many bytes per step as the Q8 weights do) is the one term that
+// still grows with song length. The write side is ggml_set_rows (F32 -> Q8_0 on
+// CUDA), the read side is flash attention (Q8_0 K/V are first-class there);
+// the manual F32 path widens the cache first (mm3_lm_attn_f32). Read once per
+// process: MM3_LM_KV_TYPE=f16|q8_0.
+static inline ggml_type mm3_lm_kv_type() {
+    static const ggml_type t = [] {
+        const char * e = std::getenv("MM3_LM_KV_TYPE");
+        if (e && e[0]) {
+            std::string s(e);
+            for (auto & ch : s) {
+                ch = (char) tolower((unsigned char) ch);
+            }
+            if (s == "q8_0" || s == "q8") {
+                return GGML_TYPE_Q8_0;
+            }
+            if (s == "f16") {
+                return GGML_TYPE_F16;
+            }
+            fprintf(stderr, "[MM3-LM] MM3_LM_KV_TYPE=%s not recognised (f16|q8_0); using f16\n", e);
+        }
+        return GGML_TYPE_F16;
+    }();
+    return t;
+}
 // MM3_MAX_BATCH_ROWS (mm3-model.h) is the MAXIMUM — the size every host-side
 // staging buffer is cut to, so a caller's [8, H] hidden / [8, V] logit buffers
 // are always big enough. The number of rows actually computed and read back is
@@ -513,6 +541,14 @@ static bool mm3_lm_head_slice_span(const MM3LmConfig & c, int64_t * lo, int64_t 
 // q [D, T, Nh, B], k/v [D, n_kv, Nkv, B] (strided cache views) -> [D, Nh, T, B].
 static ggml_tensor * mm3_lm_attn_f32(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
                                      ggml_tensor * mask, float scale, ggml_tensor ** out_scores = nullptr) {
+    // A quantized KV cache (mm3_lm_kv_type) can be read by mul_mat but not
+    // transposed in place: ggml_transpose is a view and the Q8_0 -> Q8_0 cont
+    // of a non-contiguous view has no CUDA kernel. Widen to F32 first; the
+    // manual path is the slow diagnostic/replay path, so the copy is cheap.
+    if (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32) {
+        k = ggml_cast(ctx, k, GGML_TYPE_F32);
+        v = ggml_cast(ctx, v, GGML_TYPE_F32);
+    }
     ggml_tensor * scores = ggml_mul_mat(ctx, k, q);                            // [n_kv, T, Nh, B]
     scores               = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
     if (out_scores) {
@@ -1054,12 +1090,13 @@ static bool mm3_lm_prepare(const MM3Model & m, MM3LmGraph * g, int64_t n_ctx_nee
     }
     g->kv_k.assign((size_t) L, nullptr);
     g->kv_v.assign((size_t) L, nullptr);
+    const ggml_type kv_type = mm3_lm_kv_type();
     for (int i = 0; i < L; i++) {
         char nm[64];
-        g->kv_k[(size_t) i] = ggml_new_tensor_4d(g->kv_ctx, GGML_TYPE_F16, D, want, Nkv, g->rows());
+        g->kv_k[(size_t) i] = ggml_new_tensor_4d(g->kv_ctx, kv_type, D, want, Nkv, g->rows());
         snprintf(nm, sizeof(nm), "mm3.lm.kv_k.%d", i);
         ggml_set_name(g->kv_k[(size_t) i], nm);
-        g->kv_v[(size_t) i] = ggml_new_tensor_4d(g->kv_ctx, GGML_TYPE_F16, D, want, Nkv, g->rows());
+        g->kv_v[(size_t) i] = ggml_new_tensor_4d(g->kv_ctx, kv_type, D, want, Nkv, g->rows());
         snprintf(nm, sizeof(nm), "mm3.lm.kv_v.%d", i);
         ggml_set_name(g->kv_v[(size_t) i], nm);
     }
@@ -1085,10 +1122,10 @@ static bool mm3_lm_prepare(const MM3Model & m, MM3LmGraph * g, int64_t n_ctx_nee
 
     const std::string takes_note = g->n_takes > 1 ? " (" + std::to_string(g->n_takes) + " takes)" : std::string();
     fprintf(stderr,
-            "[MM3-LM] KV cache: %lld positions x %d layers x %d row%s%s = %.2f GB (%.0f kB/position), flash=%s\n",
+            "[MM3-LM] KV cache: %lld positions x %d layers x %d row%s%s = %.2f GB (%.0f kB/position), %s, flash=%s\n",
             (long long) want, L, g->rows(), g->rows() == 1 ? "" : "s", takes_note.c_str(),
             (double) g->kv_bytes / (1024.0 * 1024.0 * 1024.0),
-            (double) g->kv_bytes / (double) want / 1024.0, g->use_flash_attn ? "yes" : "no");
+            (double) g->kv_bytes / (double) want / 1024.0, ggml_type_name(kv_type), g->use_flash_attn ? "yes" : "no");
     return true;
 }
 
@@ -1229,7 +1266,11 @@ static int64_t mm3_lm_seed_prefix(const MM3Model & m, MM3LmGraph * g) {
         return 0;
     }
 
-    std::vector<uint16_t> blk((size_t) (n * D));
+    // Staged per head as [n, D] F32 rows, then packed into the cache's own type
+    // (F16 or a quantized row format, mm3_lm_kv_type) so the seed matches what
+    // set_rows would have written.
+    std::vector<float>   stage((size_t) (n * D));
+    std::vector<uint8_t> blk;
     for (int l = ad.pfx_lo; l < ad.pfx_hi && l < (int) g->kv_k.size(); l++) {
         const std::vector<float> & pk = ad.pfx_k[(size_t) l];
         const std::vector<float> & pv = ad.pfx_v[(size_t) l];
@@ -1241,17 +1282,21 @@ static int64_t mm3_lm_seed_prefix(const MM3Model & m, MM3LmGraph * g) {
         for (int which = 0; which < 2; which++) {
             const std::vector<float> & src = which ? pv : pk;
             ggml_tensor *              dst = which ? cv : ck;
+            const size_t               row_bytes = ggml_row_size(dst->type, D);
+            blk.assign((size_t) n * row_bytes, 0);
             for (int64_t h = 0; h < Nkv; h++) {
                 for (int64_t col = 0; col < n; col++) {
-                    const float * s = src.data() + (size_t) (col * row + h * D);
-                    uint16_t *    d = blk.data() + (size_t) (col * D);
-                    for (int64_t i = 0; i < D; i++) {
-                        d[i] = ggml_fp32_to_fp16(s[i]);
-                    }
+                    memcpy(stage.data() + (size_t) (col * D), src.data() + (size_t) (col * row + h * D),
+                           (size_t) D * sizeof(float));
+                }
+                if (dst->type == GGML_TYPE_F16) {
+                    ggml_fp32_to_fp16_row(stage.data(), (ggml_fp16_t *) blk.data(), n * D);
+                } else {
+                    ggml_quantize_chunk(dst->type, stage.data(), blk.data(), 0, n, D, nullptr);
                 }
                 for (int64_t b = 0; b < B; b++) {
                     ggml_backend_tensor_set(dst, blk.data(), (size_t) h * dst->nb[2] + (size_t) b * dst->nb[3],
-                                            blk.size() * sizeof(uint16_t));
+                                            blk.size());
                 }
             }
         }

@@ -4,6 +4,7 @@
 #include "mm3-model.h"
 #include "yyjson.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -14,49 +15,147 @@
 #ifdef HOT_STEP_TRT
 #    include <cuda_runtime_api.h>
 #    include <NvInfer.h>
+#    include <NvOnnxParser.h>
+#    include <atomic>
+#    include <thread>
+#endif
+#include "../trt-runtime-probe.h"
+
+// ── Files ───────────────────────────────────────────────────────────────────
+//
+// What a user downloads (Model Manager, Hugging Face):
+//   <models>/mm3/mm3-dit-trt.onnx          the DiT graph, weightless
+//   <models>/mm3/mm3-dit-trt.engine.json   GGUF-name -> engine-weight manifest
+// What this machine builds once per GPU + TensorRT version:
+//   <models>/mm3/mm3-trt-cache/base-<key>.engine
+// and then refits per selected DiT GGUF + adapter stack:
+//   <models>/mm3/mm3-trt-cache/<hash>.engine
+// A prebuilt engine can still be supplied for development through
+// MM3_DIT_TRT_ENGINE (its manifest is <engine>.json) or by dropping
+// mm3-dit-trt.engine next to the ONNX; those take precedence over building.
+
+static std::filesystem::path mm3_trt_dir(const MM3Model & m) {
+    return std::filesystem::path(m.models_dir) / "mm3";
+}
+
+static std::string mm3_trt_onnx_path(const MM3Model & m) {
+    return (mm3_trt_dir(m) / "mm3-dit-trt.onnx").string();
+}
+
+// A prebuilt engine, if one was supplied. Empty when the engine must be built.
+static std::string mm3_trt_prebuilt_engine_path(const MM3Model & m) {
+    const char * path = std::getenv("MM3_DIT_TRT_ENGINE");
+    if (path && *path) {
+        return path;
+    }
+    std::error_code ec;
+    const auto      legacy = (mm3_trt_dir(m) / "mm3-dit-trt.engine").string();
+    return std::filesystem::is_regular_file(legacy, ec) ? legacy : std::string();
+}
+
+static std::string mm3_trt_manifest_path(const MM3Model & m) {
+    const char * path = std::getenv("MM3_DIT_TRT_ENGINE");
+    if (path && *path) {
+        return std::string(path) + ".json";
+    }
+    return (mm3_trt_dir(m) / "mm3-dit-trt.engine.json").string();
+}
+
+// Everything /mm3/props needs to explain why TensorRT is or is not usable,
+// tier by tier: build -> runtime DLLs -> downloaded assets -> CUDA device.
+struct MM3TrtStatus {
+    bool        supported = false;   // compiled with HOT_STEP_TRT
+    bool        cuda      = false;   // a CUDA device and the CUDA ggml backend
+    int         sm        = 0;       // device compute capability as major*10+minor
+    bool        rt_nvinfer          = false;
+    bool        rt_parser           = false;
+    bool        rt_builder_resource = false;
+    bool        onnx      = false;
+    bool        manifest  = false;
+    bool        engine    = false;   // a usable engine exists (prebuilt or built for this key)
+    bool        available = false;
+    bool        needs_build = false; // available, but the first render builds the engine
+    std::string reason;
+};
+
+#ifdef HOT_STEP_TRT
+static std::filesystem::path mm3_trt_base_engine_path(const MM3Model & m, int device);
 #endif
 
-static std::string mm3_trt_engine_path(const MM3Model & m) {
-    const char * path = std::getenv("MM3_DIT_TRT_ENGINE");
-    return path && *path ? path : (std::filesystem::path(m.models_dir) / "mm3" / "mm3-dit-trt.engine").string();
+static MM3TrtStatus mm3_trt_status(const MM3Model & m) {
+    MM3TrtStatus s;
+#ifdef HOT_STEP_TRT
+    s.supported = true;
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+        s.reason = "TensorRT requires an available NVIDIA CUDA device";
+        return s;
+    }
+    int device = 0;
+    if (m.backend) {
+        const char * backend_name = ggml_backend_name(m.backend);
+        if (!backend_name || sscanf(backend_name, "CUDA%d", &device) != 1) {
+            s.reason = "TensorRT requires the CUDA engine backend";
+            return s;
+        }
+    }
+    cudaDeviceProp properties{};
+    if (cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
+        s.sm = properties.major * 10 + properties.minor;
+    }
+    s.cuda = true;
+    const auto rt = hot_step_trt_runtime_probe(s.sm);
+    s.rt_nvinfer          = rt.nvinfer;
+    s.rt_parser           = rt.parser;
+    s.rt_builder_resource = rt.builder_resource;
+    std::error_code ec;
+    const auto      prebuilt = mm3_trt_prebuilt_engine_path(m);
+    s.onnx     = std::filesystem::is_regular_file(mm3_trt_onnx_path(m), ec);
+    s.manifest = std::filesystem::is_regular_file(mm3_trt_manifest_path(m), ec);
+    s.engine   = !prebuilt.empty();
+    if (!s.rt_nvinfer) {
+        s.reason = "TensorRT runtime (nvinfer_10.dll) is not installed; get it from the Model Manager";
+        return s;
+    }
+    if (!s.manifest) {
+        s.reason = "The MM3 TensorRT weight manifest is not installed; get it from the Model Manager";
+        return s;
+    }
+    if (!s.engine) {
+        // No prebuilt engine: we need the ONNX plus the parser and builder
+        // resources to make one, unless a base engine for this GPU already exists.
+        s.engine = std::filesystem::is_regular_file(mm3_trt_base_engine_path(m, device), ec);
+        if (!s.engine) {
+            if (!s.onnx) {
+                s.reason = "The MM3 TensorRT DiT graph (mm3-dit-trt.onnx) is not installed; get it from the Model Manager";
+                return s;
+            }
+            if (!s.rt_parser) {
+                s.reason = "TensorRT ONNX parser (nvonnxparser_10.dll) is not installed; get it from the Model Manager";
+                return s;
+            }
+            if (!s.rt_builder_resource) {
+                s.reason = "TensorRT builder resources for this GPU (nvinfer_builder_resource_sm" +
+                           std::to_string(s.sm) + "_10.dll) are not installed; get them from the Model Manager";
+                return s;
+            }
+            s.needs_build = true;
+        }
+    }
+    s.available = true;
+#else
+    (void) m;
+    s.reason = "This engine build does not include TensorRT";
+#endif
+    return s;
 }
 
 static bool mm3_trt_available(const MM3Model & m, std::string * reason) {
-#ifdef HOT_STEP_TRT
-    int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
-        if (reason) {
-            *reason = "TensorRT requires an available NVIDIA CUDA device";
-        }
-        return false;
-    }
-    if (m.backend && std::string(ggml_backend_name(m.backend)).rfind("CUDA", 0) != 0) {
-        if (reason) {
-            *reason = "TensorRT requires the CUDA engine backend";
-        }
-        return false;
-    }
-    if (m.role_file[MM3_R_DIT].file_type != 1 && m.role_file[MM3_R_DIT].file_type != 0) {
-        if (reason) {
-            *reason = "Select the F16 DiT model to use TensorRT";
-        }
-        return false;
-    }
-    std::error_code ec;
-    const auto      path = mm3_trt_engine_path(m);
-    if (std::filesystem::is_regular_file(path, ec) && std::filesystem::is_regular_file(path + ".json", ec)) {
-        return true;
-    }
+    const auto s = mm3_trt_status(m);
     if (reason) {
-        *reason = "Prepare a native MM3 TensorRT engine and weight manifest first";
+        *reason = s.reason;
     }
-#else
-    (void) m;
-    if (reason) {
-        *reason = "This engine build does not include TensorRT";
-    }
-#endif
-    return false;
+    return s.available;
 }
 
 #ifdef HOT_STEP_TRT
@@ -113,6 +212,38 @@ static uint16_t bf16(float value) {
     return uint16_t((bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16);
 }
 
+static uint64_t fnv1a(const std::string & text) {
+    uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char byte : text) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+}  // namespace mm3_trt
+
+// The base engine is what the ONNX builds into on this GPU with this TensorRT.
+// Engines are locked to both, so the key is TensorRT version + device model +
+// ONNX identity. Driver version is deliberately left out: TensorRT engines
+// survive driver updates, and rebuilding for one would cost minutes for nothing.
+static std::filesystem::path mm3_trt_base_engine_path(const MM3Model & m, int device) {
+    std::ostringstream identity;
+    identity << "mm3-trt-base-v1\n" << NV_TENSORRT_MAJOR << '.' << NV_TENSORRT_MINOR << '.' << NV_TENSORRT_PATCH << '\n';
+    cudaDeviceProp properties{};
+    if (cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
+        identity << properties.name << ':' << properties.major << ':' << properties.minor << '\n';
+    }
+    std::error_code ec;
+    const auto      onnx = std::filesystem::absolute(mm3_trt_onnx_path(m)).lexically_normal();
+    identity << onnx.string() << '\n' << std::filesystem::file_size(onnx, ec) << '\n'
+             << std::filesystem::last_write_time(onnx, ec).time_since_epoch().count() << '\n';
+    std::ostringstream name;
+    name << "base-" << std::hex << mm3_trt::fnv1a(identity.str()) << ".engine";
+    return mm3_trt_dir(m) / "mm3-trt-cache" / name.str();
+}
+
+namespace mm3_trt {
+
 class Runtime final : public MM3DitRuntime {
     Logger                                       logger;
     int                                          device = 0;
@@ -127,7 +258,7 @@ class Runtime final : public MM3DitRuntime {
     float                                        uploaded_gate  = -1.0f;
     size_t                                       resident_bytes = 0;
 
-    std::filesystem::path cache_path(const MM3Model & m, const std::string & source) {
+    std::filesystem::path cache_path(const MM3Model & m, const std::string & source, const std::string & manifest) {
         // File identity matches the model/adapter cache convention elsewhere in
         // MM3. Sampler, duration, seed and conditioning deliberately stay out.
         std::ostringstream identity;
@@ -145,7 +276,7 @@ class Runtime final : public MM3DitRuntime {
         cuda_check(cudaDriverGetVersion(&driver), "identify driver");
         identity << properties.name << ':' << properties.major << ':' << properties.minor << ':' << driver << '\n';
         add_file(source);
-        add_file(source + ".json");
+        add_file(manifest);
         add_file(m.role_file[MM3_R_DIT].path);
         identity << m.rest_adapter_desc << '\n';
         // Keep the exact requested scale too: rest_adapter_desc is formatted
@@ -181,14 +312,174 @@ class Runtime final : public MM3DitRuntime {
             }
             begin = end + 2;
         }
-        uint64_t hash = 14695981039346656037ULL;
-        for (unsigned char byte : identity.str()) {
-            hash ^= byte;
-            hash *= 1099511628211ULL;
-        }
         std::ostringstream name;
-        name << std::hex << hash << ".engine";
-        return std::filesystem::path(source).parent_path() / "mm3-trt-cache" / name.str();
+        name << std::hex << fnv1a(identity.str()) << ".engine";
+        return mm3_trt_dir(m) / "mm3-trt-cache" / name.str();
+    }
+
+    // Build the base engine from the weightless ONNX. One shared B1..2 profile
+    // over L 3..689 (the largest window the sampler ever asks for), general
+    // kREFIT because the refit source (a GGUF, an adapter stack) differs from
+    // whatever the ONNX carries. A heartbeat keeps the server's stall watchdog
+    // informed: on a slow GPU this is minutes.
+    // The shipped ONNX is weightless: its initializers point at an external
+    // data file that is never downloaded. Every weight is refit from the GGUF
+    // after the build, so the bytes only have to be well-formed BF16 that
+    // TensorRT cannot fold (no zeros) or deduplicate (no two tensors alike).
+    // The pattern is a pure function of the byte offset, the same one
+    // tools/mm3-trt-export/make_placeholder_data.py writes; a weak hash here
+    // would repeat every 256 KB and walk straight into TensorRT's
+    // "weights of same values but of different counts" error.
+    static void write_placeholder_data(const std::filesystem::path & path, uint64_t total_bytes) {
+        check(total_bytes % 2 == 0, "Placeholder data size must be even");
+        check(std::filesystem::space(path.parent_path()).available > total_bytes + 256ULL * 1024 * 1024,
+              "Insufficient disk space to stage the MM3 TensorRT build (" +
+                  std::to_string(total_bytes / (1024 * 1024)) + " MiB needed)");
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        check(bool(out), "Cannot create " + path.string());
+        const size_t          chunk_elems = 32ULL * 1024 * 1024;  // 64 MiB per write
+        std::vector<uint16_t> buf(chunk_elems);
+        for (uint64_t k = 0, total_elems = total_bytes / 2; k < total_elems; k += chunk_elems) {
+            const size_t n = size_t(std::min<uint64_t>(chunk_elems, total_elems - k));
+#    pragma omp parallel for schedule(static)
+            for (int64_t i = 0; i < int64_t(n); ++i) {
+                uint32_t h = uint32_t(k + uint64_t(i));
+                h ^= h >> 16;
+                h *= 0x7FEB352Du;
+                h ^= h >> 15;
+                h *= 0x846CA68Bu;
+                h ^= h >> 16;
+                uint16_t bits = uint16_t(0x3C00u + ((h >> 7) & 0x1FFu));
+                bits |= uint16_t(((h >> 31) & 1u) << 15);
+                buf[size_t(i)] = bits;  // little-endian u16 at byte offset 2k
+            }
+            out.write(reinterpret_cast<const char *>(buf.data()), std::streamsize(n * 2));
+        }
+        out.close();
+        check(bool(out), "Cannot write " + path.string());
+    }
+
+    void build(const std::string & onnx_path, const std::string & manifest_path, const std::filesystem::path & out) {
+        const auto start = std::chrono::steady_clock::now();
+        fprintf(stderr, "[MM3-TRT] Building the MM3 DiT engine for this GPU from %s (one time, a few minutes)\n",
+                onnx_path.c_str());
+        // Stage the external data file the graph names, unless one is already
+        // there (a developer's full export, say). Ours is removed afterwards.
+        std::filesystem::path staged;
+        {
+            yyjson_read_err                                         json_error{};
+            std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc(
+                yyjson_read_file(manifest_path.c_str(), 0, nullptr, &json_error), yyjson_doc_free);
+            check(bool(doc), "Cannot read TensorRT weight manifest");
+            auto data = yyjson_obj_get(yyjson_doc_get_root(doc.get()), "onnx_data");
+            check(yyjson_is_obj(data), "Manifest predates the weightless ONNX (no onnx_data); update it from the Model Manager");
+            const char *   location = yyjson_get_str(yyjson_obj_get(data, "location"));
+            const uint64_t bytes    = yyjson_get_uint(yyjson_obj_get(data, "bytes"));
+            check(location && *location && bytes > 0, "Invalid onnx_data entry in the TensorRT manifest");
+            const auto data_path = std::filesystem::path(onnx_path).parent_path() / location;
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(data_path, ec)) {
+                const auto t0 = std::chrono::steady_clock::now();
+                write_placeholder_data(data_path, bytes);
+                staged = data_path;
+                fprintf(stderr, "[MM3-TRT] Staged %.1f GiB of placeholder weights in %.0f s\n",
+                        double(bytes) / (1024.0 * 1024 * 1024),
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+        }
+        struct Unstage {
+            std::filesystem::path path;
+
+            ~Unstage() {
+                if (!path.empty()) {
+                    std::error_code ec;
+                    std::filesystem::remove(path, ec);
+                }
+            }
+        } unstage{ staged };
+        std::unique_ptr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(logger));
+        check(bool(builder), "Cannot create TensorRT builder");
+        const uint32_t flags = 1U << uint32_t(nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
+        std::unique_ptr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(flags));
+        check(bool(network), "Cannot create TensorRT network");
+        std::unique_ptr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*network, logger));
+        check(bool(parser), "Cannot create TensorRT ONNX parser");
+        check(parser->parseFromFile(onnx_path.c_str(), int(nvinfer1::ILogger::Severity::kWARNING)),
+              "Cannot parse the MM3 DiT ONNX graph");
+        std::unique_ptr<nvinfer1::IBuilderConfig> config(builder->createBuilderConfig());
+        check(bool(config), "Cannot create TensorRT builder config");
+        config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 2ULL << 30);
+        config->setFlag(nvinfer1::BuilderFlag::kTF32);
+        config->setFlag(nvinfer1::BuilderFlag::kREFIT);
+        auto * profile = builder->createOptimizationProfile();
+        check(profile != nullptr, "Cannot create TensorRT profile");
+        using Sel = nvinfer1::OptProfileSelector;
+        check(profile->setDimensions("x", Sel::kMIN, nvinfer1::Dims3(1, 128, 3)) &&
+                  profile->setDimensions("x", Sel::kOPT, nvinfer1::Dims3(2, 128, 689)) &&
+                  profile->setDimensions("x", Sel::kMAX, nvinfer1::Dims3(2, 128, 689)) &&
+                  profile->setDimensions("cond", Sel::kMIN, nvinfer1::Dims3(1, 2048, 3)) &&
+                  profile->setDimensions("cond", Sel::kOPT, nvinfer1::Dims3(2, 2048, 689)) &&
+                  profile->setDimensions("cond", Sel::kMAX, nvinfer1::Dims3(2, 2048, 689)) &&
+                  profile->setDimensions("timestep_fourier", Sel::kMIN, nvinfer1::Dims2(1, 256)) &&
+                  profile->setDimensions("timestep_fourier", Sel::kOPT, nvinfer1::Dims2(2, 256)) &&
+                  profile->setDimensions("timestep_fourier", Sel::kMAX, nvinfer1::Dims2(2, 256)) &&
+                  profile->setDimensions("rope_cos", Sel::kMIN, nvinfer1::Dims2(4, 32)) &&
+                  profile->setDimensions("rope_cos", Sel::kOPT, nvinfer1::Dims2(690, 32)) &&
+                  profile->setDimensions("rope_cos", Sel::kMAX, nvinfer1::Dims2(690, 32)) &&
+                  profile->setDimensions("rope_sin", Sel::kMIN, nvinfer1::Dims2(4, 32)) &&
+                  profile->setDimensions("rope_sin", Sel::kOPT, nvinfer1::Dims2(690, 32)) &&
+                  profile->setDimensions("rope_sin", Sel::kMAX, nvinfer1::Dims2(690, 32)),
+              "Cannot set the TensorRT profile");
+        check(config->addOptimizationProfile(profile) >= 0, "Cannot add the TensorRT profile");
+
+        std::atomic<bool> done{ false };
+        std::thread       heartbeat([&] {
+            int tick = 0;
+            while (!done.load()) {
+                for (int i = 0; i < 30 && !done.load(); i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+                if (done.load()) {
+                    break;
+                }
+                const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                fprintf(stderr, "[MM3-TRT] Engine build in progress (%.0f s elapsed)\n", elapsed);
+                fflush(stderr);
+                (void) ++tick;
+            }
+        });
+        std::unique_ptr<nvinfer1::IHostMemory> plan;
+        try {
+            plan.reset(builder->buildSerializedNetwork(*network, *config));
+        } catch (...) {
+            done.store(true);
+            heartbeat.join();
+            throw;
+        }
+        done.store(true);
+        heartbeat.join();
+        check(bool(plan) && plan->size() > 0, "TensorRT engine build failed");
+
+        std::filesystem::create_directories(out.parent_path());
+        check(std::filesystem::space(out.parent_path()).available > plan->size() + 256ULL * 1024 * 1024,
+              "Insufficient disk space for the MM3 TensorRT engine");
+        const auto temporary =
+            out.string() + ".tmp." + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            output.write(static_cast<const char *>(plan->data()), std::streamsize(plan->size()));
+            output.close();
+            check(bool(output), "Cannot write the MM3 TensorRT engine");
+        }
+        std::error_code ec;
+        if (!std::filesystem::exists(out)) {
+            std::filesystem::rename(temporary, out, ec);
+            check(!ec, "Cannot place the MM3 TensorRT engine: " + ec.message());
+        } else {
+            std::filesystem::remove(temporary, ec);
+        }
+        fprintf(stderr, "[MM3-TRT] Built %s (%zu bytes) in %.0f s\n", out.string().c_str(), size_t(plan->size()),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
     }
 
     bool deserialize(const std::filesystem::path & path) {
@@ -238,10 +529,10 @@ class Runtime final : public MM3DitRuntime {
         }
     }
 
-    void refit(const MM3Model & m, const std::string & path) {
+    void refit(const MM3Model & m, const std::string & manifest_path) {
         yyjson_read_err                                         json_error{};
         std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc(
-            yyjson_read_file((path + ".json").c_str(), 0, nullptr, &json_error), yyjson_doc_free);
+            yyjson_read_file(manifest_path.c_str(), 0, nullptr, &json_error), yyjson_doc_free);
         check(bool(doc), "Cannot read TensorRT weight manifest");
         auto root = yyjson_doc_get_root(doc.get());
         check(yyjson_get_int(yyjson_obj_get(root, "version")) == 1, "Unsupported TensorRT manifest version");
@@ -264,8 +555,6 @@ class Runtime final : public MM3DitRuntime {
             check(seen_gguf.insert(source).second && seen_engine.insert(target).second, "Duplicate weight mapping");
             auto tensor = ggml_get_tensor(m.wctx_dit_cpu.ctx, source);
             check(tensor != nullptr, std::string("Missing DiT tensor: ") + source);
-            check(tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_F32,
-                  "TensorRT requires F16/F32 DiT weights");
             const size_t n         = size_t(ggml_nelements(tensor));
             const auto   prototype = refitter->getWeightsPrototype(target);
             check(prototype.type == nvinfer1::DataType::kBF16 && prototype.count == int64_t(n),
@@ -273,10 +562,27 @@ class Runtime final : public MM3DitRuntime {
             std::vector<float> values(n);
             if (tensor->type == GGML_TYPE_F32) {
                 ggml_backend_tensor_get(tensor, values.data(), 0, n * 4);
-            } else {
+            } else if (tensor->type == GGML_TYPE_F16) {
                 std::vector<ggml_fp16_t> half(n);
                 ggml_backend_tensor_get(tensor, half.data(), 0, n * 2);
                 ggml_fp16_to_fp32_row(half.data(), values.data(), int64_t(n));
+            } else {
+                // A quantized DiT (Q8_0 is the common download) is widened
+                // row by row through ggml's own dequantizer, so the engine
+                // renders exactly the weights the GGML path would have used.
+                const auto * traits = ggml_get_type_traits(tensor->type);
+                check(traits && traits->to_float && ggml_is_contiguous(tensor),
+                      std::string("Cannot dequantize DiT tensor for TensorRT: ") + source);
+                std::vector<uint8_t> raw(ggml_nbytes(tensor));
+                ggml_backend_tensor_get(tensor, raw.data(), 0, raw.size());
+                const int64_t rows     = ggml_nrows(tensor);
+                const int64_t per_row  = tensor->ne[0];
+                const size_t  row_size = ggml_row_size(tensor->type, per_row);
+#    pragma omp parallel for schedule(static)
+                for (int64_t r = 0; r < rows; ++r) {
+                    traits->to_float(raw.data() + size_t(r) * row_size, values.data() + size_t(r) * size_t(per_row),
+                                     per_row);
+                }
             }
             storage.emplace_back(n);
             auto & dest = storage.back();
@@ -348,9 +654,24 @@ class Runtime final : public MM3DitRuntime {
               "Selected GGUF does not match the native MM3 DiT architecture");
         size_t free_before = 0, total = 0;
         cuda_check(cudaMemGetInfo(&free_before, &total), "query GPU memory");
-        const auto    path = mm3_trt_engine_path(m);
+        const auto manifest = mm3_trt_manifest_path(m);
+        check(std::filesystem::is_regular_file(manifest), "Missing MM3 TensorRT weight manifest: " + manifest);
+        // Base engine: a supplied prebuilt one wins; otherwise the one built for
+        // this GPU + TensorRT from the ONNX, building it now if absent.
+        std::string path = mm3_trt_prebuilt_engine_path(m);
+        if (path.empty()) {
+            const auto base = mm3_trt_base_engine_path(m, device);
+            if (!std::filesystem::is_regular_file(base)) {
+                const auto onnx = mm3_trt_onnx_path(m);
+                check(std::filesystem::is_regular_file(onnx), "Missing MM3 TensorRT DiT graph: " + onnx);
+                const auto rt = hot_step_trt_runtime_probe(0);
+                check(rt.parser, "TensorRT ONNX parser (nvonnxparser_10.dll) is not installed");
+                build(onnx, manifest, base);
+            }
+            path = base.string();
+        }
         std::ifstream file(path, std::ios::binary | std::ios::ate);
-        check(bool(file), "Cannot open prepared MM3 TensorRT engine: " + path);
+        check(bool(file), "Cannot open MM3 TensorRT engine: " + path);
         const auto length = file.tellg();
         check(length > 0, "Empty TensorRT engine");
         // Engine weights plus context/input headroom. Never request a WDDM spill.
@@ -358,7 +679,7 @@ class Runtime final : public MM3DitRuntime {
               "Insufficient dedicated GPU memory for MM3 TensorRT");
         runtime.reset(nvinfer1::createInferRuntime(logger));
         check(bool(runtime), "Cannot create TensorRT runtime");
-        const auto prepared  = cache_path(m, path);
+        const auto prepared  = cache_path(m, path, manifest);
         bool       cache_hit = std::filesystem::is_regular_file(prepared) && deserialize(prepared);
         if (!cache_hit) {
             // A rejected file belongs to our derived cache, not the supplied
@@ -375,7 +696,7 @@ class Runtime final : public MM3DitRuntime {
         }
         const auto loaded = std::chrono::steady_clock::now();
         if (!cache_hit) {
-            refit(m, path);
+            refit(m, manifest);
         }
         const auto refitted = std::chrono::steady_clock::now();
         if (!cache_hit) {

@@ -14,6 +14,7 @@
 #include "pipeline-synth-impl.h"
 #include "task-types.h"
 #include "vae-enc.h"
+#include "trt-runtime-probe.h"
 
 #include <charconv>
 #include <chrono>
@@ -1344,6 +1345,12 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
             // Engine path: same directory, same name but .engine extension
             std::string engine_path = onnx_path.substr(0, onnx_path.size() - 5) + ".engine";
 
+            // The TensorRT DLLs are delay-loaded on Windows: refuse cleanly
+            // when they are not installed instead of faulting on first call.
+            if (!hot_step_trt_runtime_probe(0).nvinfer) {
+                fprintf(stderr, "[DiT-Generate] FATAL: TensorRT runtime (nvinfer_10.dll) is not installed; get it from the Model Manager\n");
+                return -1;
+            }
             // Check if engine exists
             FILE * ef = fopen(engine_path.c_str(), "rb");
             if (ef) {
@@ -2305,6 +2312,10 @@ int ops_stream_generate(const AceSynth* ctx, int batch_n, SynthState& s,
         std::string engine_path = stream_onnx_resolved.substr(
             0, stream_onnx_resolved.size() - 5) + "_stream.engine";
 
+        if (!hot_step_trt_runtime_probe(0).nvinfer) {
+            fprintf(stderr, "[Stream] FATAL: TensorRT runtime (nvinfer_10.dll) is not installed; get it from the Model Manager\n");
+            return -1;
+        }
         FILE* ef = fopen(engine_path.c_str(), "rb");
         if (ef) {
             fclose(ef);

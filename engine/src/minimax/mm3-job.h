@@ -675,10 +675,8 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
 
     if (req.dit_backend == "tensorrt") {
         std::string reason;
+        // Any DiT quant works: the loader dequantizes to BF16 for the refit.
         if (!mm3_trt_available(g_mm3, &reason)) { fail(2, "failed", reason); return; }
-        if (g_mm3.role_file[MM3_R_DIT].file_type != 1 && g_mm3.role_file[MM3_R_DIT].file_type != 0) {
-            fail(2, "failed", "TensorRT requires the F16 or F32 DiT model; select it in Models first"); return;
-        }
     }
     if (g_mm3.dit_backend != req.dit_backend) {
         mm3_vocoder_free(&g_mm3_voc);

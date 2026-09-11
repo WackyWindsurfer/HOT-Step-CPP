@@ -312,12 +312,27 @@ static void mm3_handle_props(const httplib::Request &, httplib::Response & res) 
 #else
         yyjson_mut_obj_add_bool(doc, rt, "supported", false);
 #endif
-        std::string reason;
-        const bool available = mm3_trt_available(g_mm3, &reason);
-        yyjson_mut_obj_add_bool(doc, rt, "available", available);
+        // Tiered status (docs/plans/2026-09-11-mm3-trt-dit-shipping.md): the
+        // UI turns `reason` and the booleans into "what to download next".
+        const MM3TrtStatus st = mm3_trt_status(g_mm3);
+        yyjson_mut_obj_add_bool(doc, rt, "available", st.available);
         yyjson_mut_obj_add_strcpy(doc, rt, "backend", g_mm3.dit_backend.c_str());
-        yyjson_mut_obj_add_strcpy(doc, rt, "reason", reason.c_str());
+        yyjson_mut_obj_add_strcpy(doc, rt, "reason", st.reason.c_str());
         yyjson_mut_obj_add_real(doc, rt, "gpu_mb", g_mm3.dit_runtime ? double(g_mm3.dit_runtime->gpu_bytes()) / 1048576 : 0);
+        yyjson_mut_obj_add_int(doc, rt, "sm", st.sm);
+        yyjson_mut_obj_add_bool(doc, rt, "needs_build", st.needs_build);
+        {
+            yyjson_mut_val * r = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_val(doc, rt, "runtime", r);
+            yyjson_mut_obj_add_bool(doc, r, "nvinfer", st.rt_nvinfer);
+            yyjson_mut_obj_add_bool(doc, r, "parser", st.rt_parser);
+            yyjson_mut_obj_add_bool(doc, r, "builder_resource", st.rt_builder_resource);
+            yyjson_mut_val * a = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_val(doc, rt, "assets", a);
+            yyjson_mut_obj_add_bool(doc, a, "onnx", st.onnx);
+            yyjson_mut_obj_add_bool(doc, a, "manifest", st.manifest);
+            yyjson_mut_obj_add_bool(doc, a, "engine", st.engine);
+        }
     }
 
     // synth_ready: every role's GGUF found AND its header parsed clean, i.e.

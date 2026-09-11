@@ -5,6 +5,7 @@ import { ChevronDown, ChevronRight, Download, ExternalLink, Info, KeyRound, Shie
 import { useTranslation } from 'react-i18next';
 import { ModelRow } from './ModelRow';
 import { usePersistedState } from '../../hooks/usePersistedState';
+import { useCapabilities } from '../../hooks/useCapabilities';
 import type { RegistryFile, DownloadJob } from '../../types';
 
 interface Props {
@@ -49,7 +50,11 @@ const ROLE_INFO: Record<string, string> = {
   supersep: 'Stem separation models for Cover Studio. Uses a 4-stage ONNX pipeline: BS-Roformer splits audio into 6 stems, Mel-Band RoFormer separates lead/backing vocals, MDX23C isolates drum components, and HTDemucs refines the "other" stem. All 4 models are required for full separation. Models run via ONNX Runtime GPU — no Python needed.',
   whisper: 'OpenAI Whisper models for transcribing actual sung lyrics with word-level timestamps. Enable Whisper Lyrics in Post-Processing to use.',
   moss: 'MOSS-Music-8B — the only model here that ANALYSES audio rather than generating it. It captions your own tracks locally in the Training Studio, writing what it actually hears instead of rewriting a text analysis, and emits both the ACE-Step caption format and MM3 Structured Captions from a single pass. Pick one LM (Q8_0 recommended) plus the audio tower, which is required and never quantised. Nothing else in the app depends on these — they are only used when you choose MOSS as the caption provider.',
-  mm3: 'MiniMax-Music3 — a separate generation backend with its own LM and synth models (no lm/dit/vae split; exactly two files). Both are required and load together, needing ~24 GB of VRAM. Switch to it via the Backend toggle in the top bar. A LICENSE file is fetched alongside automatically once either GGUF finishes downloading.',
+  mm3: 'MiniMax-Music3 — a separate generation backend with its own models: a language model plus a 5-way split flow stack (depth decoder, condition encoder, DiT, vocoder — the LM and DiT are the two you must pick; the rest default to auto). All required roles load together, needing ~24 GB of VRAM. Switch to it via the Backend toggle in the top bar. A LICENSE file is fetched alongside automatically once a GGUF finishes downloading.',
+  // mm3Trt is NOT here — unlike every other entry in this record, it's new
+  // text (the reviewer flagged it for i18n), so it's translated at its one
+  // call site via t('models.mm3Trt.info') instead of joining this
+  // not-yet-translated table.
 };
 
 // ── Grouping logic ──────────────────────────────────────────
@@ -147,6 +152,131 @@ const CollapsibleGroup: React.FC<{
               onDelete={onDelete}
             />
           ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ── TensorRT (MM3 DiT) group ─────────────────────────────────
+//
+// Not one of the generic role tabs — it's a dedicated group within the mm3
+// tab, since the ONNX graph is role 'mm3' but the runtime DLLs are role
+// 'runtime' (like the SuperSep/cuBLAS runtime entries, which have no catalogue
+// UI of their own at all; this is the first role:'runtime' set that gets one,
+// because unlike those, a TensorRT builder resource comes in several
+// GPU-specific variants a user must choose between, not just "install all").
+
+const Mm3TrtGroup: React.FC<{
+  onnxFile?: RegistryFile;
+  coreFiles: RegistryFile[];
+  builderFiles: RegistryFile[];
+  downloadJobs: DownloadJob[];
+  onDownload: (fileId: string) => void;
+  onCancel: (jobId: string) => void;
+  onResume: (jobId: string) => void;
+  onDelete: (filename: string) => void;
+}> = ({ onnxFile, coreFiles, builderFiles, downloadJobs, onDownload, onCancel, onResume, onDelete }) => {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
+  const { capabilities } = useCapabilities();
+  const ditRuntime = (capabilities?.core as { dit_runtime?: { supported?: boolean; sm?: number } } | undefined)?.dit_runtime;
+  const sm = ditRuntime?.sm;
+
+  // Same rule as cuda-rt-*/supersep-rt-* (modelDownloadService.ts
+  // CUDA_ONLY_FILE_PREFIXES): a Vulkan/CPU build never sees these files at
+  // all, so this would already render empty there. `supported` catches the
+  // narrower CUDA-but-not-built-with-TRT case (no engine/deps/tensorrt SDK at
+  // compile time) that the file-prefix filter can't see.
+  if (ditRuntime?.supported !== true) return null;
+
+  const allFiles = [...(onnxFile ? [onnxFile] : []), ...coreFiles, ...builderFiles];
+  const installed = allFiles.filter(f => f.installed).length;
+
+  // A DLL tagged with `sm` matching the probed device is the one the user
+  // actually needs; everything else in the list is for a different GPU. When
+  // `sm` is unknown (engine down, no CUDA device, older engine build with no
+  // dit_runtime.sm) nothing is marked "required" — a wrong guess is worse
+  // than no guess.
+  const requiredBuilder = builderFiles.filter(f => sm != null && f.sm === sm);
+  const otherBuilder = builderFiles.filter(f => !(sm != null && f.sm === sm));
+
+  const rowProps = { downloadJobs, onDownload, onCancel, onResume, onDelete };
+
+  return (
+    <div className="rounded-xl border border-zinc-200 dark:border-white/5 bg-zinc-50/80 dark:bg-zinc-900/50 overflow-hidden">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center gap-2 px-4 py-3 hover:bg-white/[0.02] transition-colors"
+      >
+        {open ? <ChevronDown size={14} className="text-zinc-500" /> : <ChevronRight size={14} className="text-zinc-500" />}
+        <span className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">{t('models.mm3Trt.title')}</span>
+        <span className="text-[10px] text-zinc-600 font-mono">
+          {t('models.xInstalled', { installed, total: allFiles.length })}
+        </span>
+        <button
+          onClick={(e) => { e.stopPropagation(); setShowInfo(!showInfo); }}
+          className="ml-auto p-1 rounded-lg hover:bg-white/5 text-zinc-600 hover:text-zinc-600 dark:text-zinc-400 transition-colors"
+          title={t('models.aboutCategory')}
+        >
+          <Info size={13} />
+        </button>
+      </button>
+
+      {showInfo && (
+        <div className="px-4 py-2.5 bg-zinc-100/50 dark:bg-zinc-800/50 border-t border-zinc-200 dark:border-white/5 text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
+          {t('models.mm3Trt.info')}
+        </div>
+      )}
+
+      {open && (
+        <div className="px-3 pb-3 space-y-3">
+          {onnxFile && (
+            <div className="space-y-1.5">
+              <h5 className="px-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                {t('models.mm3Trt.graphHeading')}
+              </h5>
+              <ModelRow file={onnxFile} {...rowProps}
+                downloadJob={downloadJobs.find(j => j.fileId === onnxFile.id && j.status !== 'completed' && j.status !== 'cancelled')} />
+            </div>
+          )}
+
+          {coreFiles.length > 0 && (
+            <div className="space-y-1.5">
+              <h5 className="px-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                {t('models.mm3Trt.runtimeHeading')}
+              </h5>
+              {coreFiles.map(f => (
+                <ModelRow key={f.id} file={f} {...rowProps}
+                  downloadJob={downloadJobs.find(j => j.fileId === f.id && j.status !== 'completed' && j.status !== 'cancelled')} />
+              ))}
+            </div>
+          )}
+
+          {requiredBuilder.length > 0 && (
+            <div className="space-y-1.5">
+              <h5 className="px-1 text-[10px] font-semibold uppercase tracking-wider text-emerald-500">
+                {t('models.mm3Trt.requiredGpuHeading', { sm })}
+              </h5>
+              {requiredBuilder.map(f => (
+                <ModelRow key={f.id} file={f} {...rowProps}
+                  downloadJob={downloadJobs.find(j => j.fileId === f.id && j.status !== 'completed' && j.status !== 'cancelled')} />
+              ))}
+            </div>
+          )}
+
+          {otherBuilder.length > 0 && (
+            <div className="space-y-1.5">
+              <h5 className="px-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                {t('models.mm3Trt.otherGpuHeading')}
+              </h5>
+              {otherBuilder.map(f => (
+                <ModelRow key={f.id} file={f} {...rowProps}
+                  downloadJob={downloadJobs.find(j => j.fileId === f.id && j.status !== 'completed' && j.status !== 'cancelled')} />
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -359,7 +489,17 @@ export const ModelCatalogueTab: React.FC<Props> = ({ files, downloadJobs, onDown
   const stablestepFiles = useMemo(() => files.filter(f => f.role === 'stablestep'), [files]);
   const supersepFiles = useMemo(() => files.filter(f => f.role === 'supersep'), [files]);
   const whisperFiles = useMemo(() => files.filter(f => f.role === 'whisper'), [files]);
-  const mm3Files = useMemo(() => files.filter(f => f.role === 'mm3'), [files]);
+  // The TensorRT ONNX graph is role 'mm3' (it lives in models/mm3/ like every
+  // other MM3 weight) but renders in its own group below, not the flat list —
+  // split it out here rather than filtering inline at every use site.
+  const mm3Files = useMemo(() => files.filter(f => f.role === 'mm3' && f.id !== 'mm3-dit-trt-onnx'), [files]);
+  const mm3TrtOnnx = useMemo(() => files.find(f => f.id === 'mm3-dit-trt-onnx'), [files]);
+  const mm3TrtCore = useMemo(
+    () => files.filter(f => f.id === 'trt-rt-nvinfer' || f.id === 'trt-rt-onnxparser'), [files],
+  );
+  const mm3TrtBuilders = useMemo(
+    () => files.filter(f => f.role === 'runtime' && f.id.startsWith('trt-rt-builder-')), [files],
+  );
   const mossFiles = useMemo(() => files.filter(f => f.role === 'moss'), [files]);
 
   const renderSimpleGroup = (roleFiles: RegistryFile[], info?: string) => (
@@ -461,7 +601,21 @@ export const ModelCatalogueTab: React.FC<Props> = ({ files, downloadJobs, onDown
       )}
       {activeTab === 'supersep' && renderSimpleGroup(supersepFiles, ROLE_INFO.supersep)}
       {activeTab === 'whisper' && renderSimpleGroup(whisperFiles, ROLE_INFO.whisper)}
-      {activeTab === 'mm3' && renderSimpleGroup(mm3Files, ROLE_INFO.mm3)}
+      {activeTab === 'mm3' && (
+        <div className="space-y-3">
+          {renderSimpleGroup(mm3Files, ROLE_INFO.mm3)}
+          <Mm3TrtGroup
+            onnxFile={mm3TrtOnnx}
+            coreFiles={mm3TrtCore}
+            builderFiles={mm3TrtBuilders}
+            downloadJobs={downloadJobs}
+            onDownload={onDownload}
+            onCancel={onCancel}
+            onResume={onResume}
+            onDelete={onDelete}
+          />
+        </div>
+      )}
       {activeTab === 'moss' && renderSimpleGroup(mossFiles, ROLE_INFO.moss)}
     </div>
   );

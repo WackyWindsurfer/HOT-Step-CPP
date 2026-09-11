@@ -225,6 +225,12 @@ async function capabilities(): Promise<BackendCapabilities> {
       sampleRate: 44100,
       propsStale: stale,
       modelsMissing,
+      // TensorRT DiT renderer availability (docs/plans/2026-09-11-mm3-trt-dit-shipping.md).
+      // Passed through verbatim so the Renderer row in BackendModelsDropdown —
+      // the same place that used to read this off the (now-removed) Generation
+      // dropdown extension's baked-in hint text — can render the structured
+      // fields (available/reason/sm/needs_build) instead of parsing prose.
+      dit_runtime: props?.dit_runtime,
     },
     // Everything except `models` is false. This is the honest v1 manifest:
     // none of these subsystems exist for MM3 — they are not "coming soon"
@@ -294,22 +300,20 @@ async function capabilities(): Promise<BackendCapabilities> {
     // wall time on a full-length track, and `steps` is a direct linear dial on
     // it — the single most useful speed/quality control MM3 has. Rendered
     // generically by the existing PluginControls schema renderer.
+    //
+    // NOTE on the Renderer knob (params.mm3DitBackend / request field
+    // dit_backend): it used to be declared here as a 'generation' extension,
+    // which put a GGML/TensorRT select in the Generation dropdown. Per
+    // docs/plans/2026-09-11-mm3-trt-dit-shipping.md it now lives ONLY in
+    // BackendModelsDropdown's Flow DiT bucket, next to the DiT quant picker it
+    // actually pairs with. That move needed no plumbing change: backendParams
+    // is a plain key/value bag (globalParamsStore.getGlobalParams() spreads
+    // ALL of it into the request, not just declared-extension keys — see
+    // BackendExtensionControls.tsx), so BackendModelsDropdown calling the same
+    // gp.setBackendParam('mm3DitBackend', ...) reaches generate.ts exactly the
+    // way the removed control did. mapMinimaxParams() below still reads and
+    // validates params.mm3DitBackend unchanged.
     extensions: [
-      {
-        key: 'mm3DitBackend',
-        type: 'select',
-        label: 'Renderer',
-        hint: props?.dit_runtime?.available === true
-          ? 'GGML is the portable default. TensorRT uses the prepared native CUDA engine.'
-          : `GGML is available. TensorRT is unavailable${props?.dit_runtime?.reason ? `: ${props.dit_runtime.reason}` : ' until a native engine is prepared.'}`,
-        default: 'ggml',
-        options: [
-          { value: 'ggml', label: 'GGML' },
-          ...(props?.dit_runtime?.available === true
-            ? [{ value: 'tensorrt', label: 'TensorRT (native CUDA)' }]
-            : []),
-        ],
-      },
       {
         key: 'mm3Steps',
         type: 'slider',

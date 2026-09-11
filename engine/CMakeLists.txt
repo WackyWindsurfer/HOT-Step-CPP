@@ -406,6 +406,21 @@ if(TRT_ENABLED)
         target_link_directories(acestep-core PUBLIC "${_TRT_LIB_DIR}")
     endif()
     target_link_libraries(acestep-core PUBLIC ${_TRT_NVINFER_LIB} ${_TRT_NVONNXPARSER_LIB})
+    if(WIN32)
+        # nvinfer_10.dll / nvonnxparser_10.dll are hundreds of MB and are never
+        # part of the release archive — the user fetches them through the Model
+        # Manager (see docs/plans/2026-09-11-mm3-trt-dit-shipping.md). A normal
+        # /IMPORT link makes the OS loader resolve these DLLs at process start,
+        # so ace-server.exe (and every other exe linking acestep-core) would
+        # refuse to launch until they're downloaded. /DELAYLOAD defers
+        # resolution to first call, so mm3_trt_available()'s own DLL probe runs
+        # first and the app starts fine without them.
+        target_link_libraries(acestep-core PUBLIC delayimp.lib)
+        target_link_options(acestep-core PUBLIC
+            /DELAYLOAD:nvinfer_10.dll
+            /DELAYLOAD:nvonnxparser_10.dll
+        )
+    endif()
     # TRT headers include cuda_runtime_api.h — on Linux g++ needs the CUDA
     # include path explicitly (nvcc gets it automatically, but acestep-core
     # compiles as plain C++). Windows CUDA Toolkit puts headers on PATH.

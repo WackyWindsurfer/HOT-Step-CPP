@@ -485,6 +485,11 @@ export interface RegistryFile {
   description: string;
   tags: string[];
   installed: boolean;
+  /** TensorRT builder-resource entries only: the CUDA compute capability
+   *  (MAJOR*10+MINOR, e.g. 120 for Blackwell consumer) this DLL builds
+   *  engines for. Matched against dit_runtime.sm to mark the one a user
+   *  actually needs. Absent on every other entry. */
+  sm?: number;
 }
 
 /** Starter pack definition */

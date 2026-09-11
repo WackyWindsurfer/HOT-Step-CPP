@@ -133,6 +133,53 @@ async function checkHuggingFace() {
   }
 }
 
+// ── 1b. TensorRT SDK assets release.yml downloads exist on Hugging Face ─────
+//
+// release.yml's Windows cuda13.1 job fetches a headers zip and two runtime
+// DLLs from a dedicated HF repo at build time (see docs/RELEASING.md
+// "TensorRT SDK for CI"). Nothing else exercises that path before a real
+// release build does, so a stale/renamed file there fails silently until the
+// tag build hits it.
+
+/** Pulls the TRT_* env values out of release.yml's top-level env: block. */
+function trtWorkflowAssets() {
+  if (!fs.existsSync(WORKFLOW)) return null;
+  const wf = fs.readFileSync(WORKFLOW, 'utf-8');
+  const get = (key) => {
+    const m = wf.match(new RegExp(`${key}:\\s*'([^']+)'`));
+    return m ? m[1] : null;
+  };
+  const repo = get('TRT_HF_REPO');
+  const names = {
+    'TRT_SDK_ZIP (headers)': get('TRT_SDK_ZIP'),
+    'TRT_NVINFER_DLL': get('TRT_NVINFER_DLL'),
+    'TRT_NVONNXPARSER_DLL': get('TRT_NVONNXPARSER_DLL'),
+  };
+  if (!repo || Object.values(names).some((v) => !v)) return null;
+  return { repo, names };
+}
+
+async function checkTrtSdk() {
+  const assets = trtWorkflowAssets();
+  if (!assets) {
+    notes.push('release.yml has no TRT_HF_REPO/TRT_SDK_ZIP/TRT_NVINFER_DLL/TRT_NVONNXPARSER_DLL env vars — skipped the TensorRT SDK check');
+    return;
+  }
+  const info = await repoBlobs(assets.repo);
+  if (info.error) {
+    problems.push(`TensorRT SDK repo ${assets.repo} is not reachable (${info.error}) — release.yml's cuda13.1 build downloads from it`);
+    return;
+  }
+  if (info.private) problems.push(`TensorRT SDK repo ${assets.repo} is PRIVATE — the cuda13.1 release build cannot download from it`);
+  for (const [label, repoPath] of Object.entries(assets.names)) {
+    if (!info.map.has(repoPath)) {
+      problems.push(`${label}: ${assets.repo}/${repoPath} does not exist on Hugging Face — release.yml's cuda13.1 build will fail to download it`);
+    } else {
+      console.log(`  ${label}: ${assets.repo}/${repoPath} OK`);
+    }
+  }
+}
+
 // ── 2. Runtime data files are packaged ──────────────────────────────────────
 //
 // Portable mode (a release archive) reads these from server/data/. They are
@@ -247,6 +294,8 @@ if (OFFLINE) {
 } else {
   console.log('\nHugging Face availability');
   await checkHuggingFace();
+  console.log('\nTensorRT SDK (CI download)');
+  await checkTrtSdk();
 }
 
 console.log('');

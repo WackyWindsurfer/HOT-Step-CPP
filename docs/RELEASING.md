@@ -118,6 +118,57 @@ Delete any leftover test tags and their drafts (see section 1).
 - Cache reuse depends on git-restored source mtimes (incl. the **ggml submodule**
   — its `.cu` files live in the submodule's own history, not the superproject).
 
+## TensorRT SDK for CI
+
+The Windows `cuda13.1` variant is the only build that compiles the TensorRT
+DiT renderer (`HOT_STEP_TRT`, MM3's TensorRT DiT path). CMake only enables it
+when `engine/deps/tensorrt/{include,lib}` exist at configure time, and that
+directory is gitignored and never checked out — so `release.yml` fetches it
+itself, for that one matrix entry only.
+
+- **Headers + license zip** (`tensorrt-<version>-headers.zip`, hosted at HF
+  `scragnog/HOT-Step-CPP-TensorRT`) unpacks to `engine/deps/tensorrt/include`.
+  Public TensorRT headers are Apache-2.0, so this zip is small and freely
+  redistributable — built by `tools/tensorrt-sdk/make-sdk-zip.ps1`.
+- **Import libraries** (`nvinfer_10.lib`, `nvonnxparser_10.lib`) are **not**
+  hosted anywhere — NVIDIA's SLA doesn't name the SDK's own `.lib` files as
+  distributable, only the runtime DLLs and headers. `release.yml` instead
+  downloads the (distributable) `nvinfer_10.dll` / `nvonnxparser_10.dll` from
+  the same HF repo and regenerates equivalent import libs from their own
+  export tables at build time, via `tools/tensorrt-sdk/make-import-libs.ps1`
+  (`dumpbin /exports` → a `.def` → `lib.exe /def`). This is purely mechanical
+  — nothing is copied out of NVIDIA's SDK archive.
+- Every filename and sha256 the workflow fetches lives in `release.yml`'s
+  top-level `env:` block (`TRT_HF_REPO`, `TRT_SDK_ZIP`, `TRT_SDK_SHA256`,
+  `TRT_NVINFER_DLL`, `TRT_NVINFER_DLL_SHA256`, `TRT_NVONNXPARSER_DLL`,
+  `TRT_NVONNXPARSER_DLL_SHA256`). The download step verifies each sha256
+  before use and fails the job on a mismatch.
+- The assembled `engine/deps/tensorrt/` is cached (`actions/cache`, keyed on
+  `TRT_SDK_ZIP` + the nvinfer DLL sha256) so a normal release re-run doesn't
+  re-download or re-derive anything.
+- A step right after the CMake configure asserts the configure log contains
+  `[TRT] Found vendored SDK` — if TRT silently failed to enable, the job fails
+  loudly instead of shipping a cuda13.1 build with a stubbed-out renderer.
+- The runtime DLLs themselves are **never** packaged into the release archive
+  — a user gets them through the Model Manager, same as any other large model
+  file (see `docs/plans/2026-09-11-mm3-trt-dit-shipping.md`). CI downloads
+  them only to derive import libs; `check-release-prereqs.mjs` checks that all
+  three files (headers zip + both DLLs) actually exist on HF before a tag.
+
+**Bumping the TensorRT version:**
+
+1. Update the vendored dev copy at `engine/deps/tensorrt/` (used for local
+   builds) to the new SDK.
+2. `./tools/tensorrt-sdk/make-sdk-zip.ps1` — regenerates the headers zip and
+   prints its name, size, and sha256.
+3. Upload the new zip to `scragnog/HOT-Step-CPP-TensorRT` on Hugging Face,
+   alongside the new `nvinfer_10.dll` / `nvonnxparser_10.dll` (get their
+   sha256 with `Get-FileHash`).
+4. Update `release.yml`'s `env:` block: `TRT_SDK_ZIP`, `TRT_SDK_SHA256`, and
+   the DLL sha256 values (the DLL filenames themselves rarely change).
+5. `node server/scripts/check-release-prereqs.mjs` — confirms all three files
+   are reachable on HF before you tag.
+
 ## Gotchas / lessons learned
 
 - **Windows runner is pinned to `windows-2022`.** Do NOT switch to

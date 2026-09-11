@@ -198,6 +198,16 @@
       ]
     },
     {
+      "id": "mm3-tensorrt",
+      "name": "MM3 TensorRT DiT",
+      "description": "The native TensorRT renderer for the MM3 Flow DiT: the ONNX graph plus the two core TensorRT runtime DLLs (nvinfer, ONNX parser). Weights are refit from whichever DiT GGUF you already have selected — this does not replace it. You also need ONE builder resource DLL matching your GPU's compute capability (SM); pick it separately in the TensorRT section of the Model Manager, since it depends on hardware this pack can't know in advance.",
+      "fileIds": [
+        "mm3-dit-trt-onnx",
+        "trt-rt-nvinfer",
+        "trt-rt-onnxparser"
+      ]
+    },
+    {
       "id": "stem-separation",
       "name": "Stem Separation",
       "description": "All 4 models for multi-stem audio separation in Cover Studio. Required for the SuperSep pipeline.",
@@ -3768,6 +3778,196 @@
           "filename": "LICENSE",
           "repoPath": "LICENSE"
         }
+      ]
+    },
+    {
+      "id": "mm3-dit-trt-onnx",
+      "filename": "mm3-dit-trt.onnx",
+      "role": "mm3",
+      "subdir": "mm3",
+      "displayName": "MM3 Flow DiT TensorRT graph",
+      "scale": null,
+      "variant": "dit-trt",
+      "quant": "BF16",
+      "sizeBytes": 2030122,
+      "repo": "scragnog/MiniMax-Music3-GGUF",
+      "description": "The MiniMax-Music3 Flow DiT exported as a TensorRT graph — network structure only, no meaningful weights of its own. On first use per GPU, the engine builds a GPU- and TensorRT-version-specific engine from this graph (one time, a few minutes; cached under models/mm3/mm3-trt-cache/). Every weight is then refit at load time from whichever DiT GGUF quant you already have selected (F16/F32 direct, quantized ones dequantized on the fly), so installing this does not replace your DiT choice. Needs the TensorRT runtime entries below — the core pair plus the ONE builder resource DLL matching your GPU's compute capability (SM); without those TensorRT stays unavailable and generation falls back to the GGML renderer.",
+      "tags": [
+        "pending-upload"
+      ],
+      "companions": [
+        {
+          "filename": "mm3-dit-trt.engine.json"
+        }
+      ]
+    },
+    {
+      "id": "trt-rt-nvinfer",
+      "filename": "nvinfer_10.dll",
+      "role": "runtime",
+      "subdir": "runtime",
+      "displayName": "TensorRT Runtime — Core (nvinfer)",
+      "scale": null,
+      "variant": null,
+      "quant": null,
+      "sizeBytes": 375812208,
+      "repo": "scragnog/HOT-Step-CPP-TensorRT",
+      "description": "NVIDIA TensorRT core inference library. Required for the MM3 TensorRT DiT renderer; ace-server links it with delayed loading, so its absence only disables TensorRT (the GGML renderer keeps working).",
+      "tags": [
+        "runtime",
+        "required"
+      ]
+    },
+    {
+      "id": "trt-rt-onnxparser",
+      "filename": "nvonnxparser_10.dll",
+      "role": "runtime",
+      "subdir": "runtime",
+      "displayName": "TensorRT Runtime — ONNX Parser",
+      "scale": null,
+      "variant": null,
+      "quant": null,
+      "sizeBytes": 3268208,
+      "repo": "scragnog/HOT-Step-CPP-TensorRT",
+      "description": "NVIDIA TensorRT's ONNX parser. Required alongside the core TensorRT runtime to build the MM3 DiT engine from mm3-dit-trt.onnx on first use.",
+      "tags": [
+        "runtime",
+        "required"
+      ]
+    },
+    {
+      "id": "trt-rt-builder-sm75",
+      "filename": "nvinfer_builder_resource_sm75_10.dll",
+      "role": "runtime",
+      "subdir": "runtime",
+      "displayName": "TensorRT Builder Resource — SM 75 (Turing)",
+      "scale": null,
+      "variant": "builder-sm75",
+      "sm": 75,
+      "quant": null,
+      "sizeBytes": 116075120,
+      "repo": "scragnog/HOT-Step-CPP-TensorRT",
+      "description": "TensorRT's engine-builder resource for compute capability 7.5 (Turing — RTX 20-series, GTX 16-series, T4). Needed only on first use per GPU, to build the MM3 DiT TensorRT engine; pick the ONE matching your card, not all of them.",
+      "tags": [
+        "runtime"
+      ]
+    },
+    {
+      "id": "trt-rt-builder-sm80",
+      "filename": "nvinfer_builder_resource_sm80_10.dll",
+      "role": "runtime",
+      "subdir": "runtime",
+      "displayName": "TensorRT Builder Resource — SM 80 (Ampere datacenter)",
+      "scale": null,
+      "variant": "builder-sm80",
+      "sm": 80,
+      "quant": null,
+      "sizeBytes": 186690160,
+      "repo": "scragnog/HOT-Step-CPP-TensorRT",
+      "description": "TensorRT's engine-builder resource for compute capability 8.0 (Ampere datacenter — A100). Needed only on first use per GPU, to build the MM3 DiT TensorRT engine; pick the ONE matching your card, not all of them.",
+      "tags": [
+        "runtime"
+      ]
+    },
+    {
+      "id": "trt-rt-builder-sm86",
+      "filename": "nvinfer_builder_resource_sm86_10.dll",
+      "role": "runtime",
+      "subdir": "runtime",
+      "displayName": "TensorRT Builder Resource — SM 86 (Ampere)",
+      "scale": null,
+      "variant": "builder-sm86",
+      "sm": 86,
+      "quant": null,
+      "sizeBytes": 176011888,
+      "repo": "scragnog/HOT-Step-CPP-TensorRT",
+      "description": "TensorRT's engine-builder resource for compute capability 8.6 (Ampere — RTX 30-series, A40). Needed only on first use per GPU, to build the MM3 DiT TensorRT engine; pick the ONE matching your card, not all of them.",
+      "tags": [
+        "runtime"
+      ]
+    },
+    {
+      "id": "trt-rt-builder-sm89",
+      "filename": "nvinfer_builder_resource_sm89_10.dll",
+      "role": "runtime",
+      "subdir": "runtime",
+      "displayName": "TensorRT Builder Resource — SM 89 (Ada Lovelace)",
+      "scale": null,
+      "variant": "builder-sm89",
+      "sm": 89,
+      "quant": null,
+      "sizeBytes": 185069168,
+      "repo": "scragnog/HOT-Step-CPP-TensorRT",
+      "description": "TensorRT's engine-builder resource for compute capability 8.9 (Ada Lovelace — RTX 40-series, L4/L40). Needed only on first use per GPU, to build the MM3 DiT TensorRT engine; pick the ONE matching your card, not all of them.",
+      "tags": [
+        "runtime"
+      ]
+    },
+    {
+      "id": "trt-rt-builder-sm90",
+      "filename": "nvinfer_builder_resource_sm90_10.dll",
+      "role": "runtime",
+      "subdir": "runtime",
+      "displayName": "TensorRT Builder Resource — SM 90 (Hopper)",
+      "scale": null,
+      "variant": "builder-sm90",
+      "sm": 90,
+      "quant": null,
+      "sizeBytes": 453921904,
+      "repo": "scragnog/HOT-Step-CPP-TensorRT",
+      "description": "TensorRT's engine-builder resource for compute capability 9.0 (Hopper — H100). Needed only on first use per GPU, to build the MM3 DiT TensorRT engine; pick the ONE matching your card, not all of them.",
+      "tags": [
+        "runtime"
+      ]
+    },
+    {
+      "id": "trt-rt-builder-sm100",
+      "filename": "nvinfer_builder_resource_sm100_10.dll",
+      "role": "runtime",
+      "subdir": "runtime",
+      "displayName": "TensorRT Builder Resource — SM 100 (Blackwell datacenter)",
+      "scale": null,
+      "variant": "builder-sm100",
+      "sm": 100,
+      "quant": null,
+      "sizeBytes": 282830960,
+      "repo": "scragnog/HOT-Step-CPP-TensorRT",
+      "description": "TensorRT's engine-builder resource for compute capability 10.0 (Blackwell datacenter — B100/B200). Needed only on first use per GPU, to build the MM3 DiT TensorRT engine; pick the ONE matching your card, not all of them.",
+      "tags": [
+        "runtime"
+      ]
+    },
+    {
+      "id": "trt-rt-builder-sm120",
+      "filename": "nvinfer_builder_resource_sm120_10.dll",
+      "role": "runtime",
+      "subdir": "runtime",
+      "displayName": "TensorRT Builder Resource — SM 120 (Blackwell consumer)",
+      "scale": null,
+      "variant": "builder-sm120",
+      "sm": 120,
+      "quant": null,
+      "sizeBytes": 262017136,
+      "repo": "scragnog/HOT-Step-CPP-TensorRT",
+      "description": "TensorRT's engine-builder resource for compute capability 12.0 (Blackwell consumer — RTX 50-series). Needed only on first use per GPU, to build the MM3 DiT TensorRT engine; pick the ONE matching your card, not all of them.",
+      "tags": [
+        "runtime"
+      ]
+    },
+    {
+      "id": "trt-rt-builder-ptx",
+      "filename": "nvinfer_builder_resource_ptx_10.dll",
+      "role": "runtime",
+      "subdir": "runtime",
+      "displayName": "TensorRT Builder Resource — PTX (JIT fallback)",
+      "scale": null,
+      "variant": "builder-ptx",
+      "quant": null,
+      "sizeBytes": 241134192,
+      "repo": "scragnog/HOT-Step-CPP-TensorRT",
+      "description": "TensorRT's PTX-JIT builder resource — compiles at engine-build time for whatever compute capability the specific SM DLLs above don't cover (a newer GPU than this release shipped for). Slower to build than a matching SM DLL, but works on anything CUDA can target. Use this only if none of the numbered SM entries match your GPU.",
+      "tags": [
+        "runtime"
       ]
     }
   ]
