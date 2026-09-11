@@ -52,9 +52,11 @@ function updateControls() {
   byId('release-research').disabled = sending;
   byId('clear-requests').disabled = sending;
   byId('reveal-positions').disabled = sending || roomStatus !== 'active';
+  for (const id of ['outcome-status', 'outcome-note', 'outcome-commit', 'outcome-save']) byId(id).disabled = sending;
   for (const id of ['create', 'new-room-name', 'new-room-brief', 'new-room-blind', 'new-room-rounds']) byId(id).disabled = sending;
   byId('invite').hidden = !selectedRoom;
   const sealed = roomPhase === 'positions' ? SEALED_INSTRUCTION : '';
+  byId('reconciler-invite-text').value = `Join MCP discussion room "${selectedRoom}" as this chat's agent with reconciler=true and role="reconciler". You sit outside the pair: submit no position and cast no vote. Wait for the sealed positions to be revealed, read both positions and both critiques, then record the merged plan with collab_record_decision, listing in open_items everything the evidence does not settle with an owner. Revise once after the pair's critique. Keep waiting through empty waits; stop when the room closes, pauses for the user's ruling, or the user stops you. Planning only.`;
   const invitation = `Join MCP discussion room "${selectedRoom}" as this chat's agent, passing role="<your role, e.g. engine/logic lead or app/integration lead>". Read the brief and full transcript, paging compact reads until has_more=false. Follow the returned participation instructions.${sealed} Keep waiting through empty waits. When a solid plan is recorded, list every unresolved contradiction in open_items with an owner; each agent including the author must read the plan and use collab_agree_plan for that revision, which is only possible with no open items. Stop when the room closes, pauses for the user's ruling, or the user stops you. Planning only.`;
   if (byId('invite-text').value !== invitation) byId('invite-text').value = invitation;
 }
@@ -81,6 +83,17 @@ function selectRoom(room) {
   updateControls();
 }
 
+byId('copy-reconciler-invite').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(byId('reconciler-invite-text').value);
+    byId('copy-reconciler-invite').textContent = 'Copied';
+    setTimeout(() => { byId('copy-reconciler-invite').textContent = 'Copy reconciler invitation'; }, 2000);
+  } catch {
+    byId('reconciler-invite-text').focus();
+    byId('reconciler-invite-text').select();
+    byId('copy-reconciler-invite').textContent = 'Press Ctrl+C to copy';
+  }
+});
 byId('copy-invite').addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText(byId('invite-text').value);
@@ -158,18 +171,24 @@ byId('end-discussion').addEventListener('click', () => void write('status', 'Use
 byId('release-research').addEventListener('click', () => void write('coordination', 'User released the research hold.', undefined, 'release_research'));
 byId('clear-requests').addEventListener('click', () => void write('coordination', 'User cleared the pending pings.', undefined, 'clear_requests'));
 byId('reveal-positions').addEventListener('click', () => void write('coordination', 'User revealed the sealed positions.', undefined, 'reveal_positions'));
+byId('outcome-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const note = byId('outcome-note').value.trim();
+  if (!note) { byId('outcome-status-line').textContent = 'Write a note: what shipped, where, or why not.'; return; }
+  void write('outcome', note, undefined, undefined, { outcome: byId('outcome-status').value, commit: byId('outcome-commit').value.trim() || undefined });
+});
 
-async function write(endpoint, body, status, action) {
+async function write(endpoint, body, status, action, extra = {}) {
   if (sending || !selectedRoom || !body) return;
   sending = true;
   updateControls();
   const room = selectedRoom;
   const key = `hotstep-pending:${room}:${endpoint}`;
-  const content = { participant_id: identity(room), body, ...(status ? { status } : {}), ...(action ? { action } : {}) };
+  const content = { participant_id: identity(room), body, ...(status ? { status } : {}), ...(action ? { action } : {}), ...extra };
   let pending;
   try { pending = JSON.parse(saved(key) || 'null'); } catch { /* Replace an invalid saved request. */ }
-  if (!pending || pending.body !== body || pending.status !== status || pending.action !== action || pending.participant_id !== content.participant_id) {
-    pending = { ...content, request_id: requestId() };
+  if (!pending || pending.body !== body || pending.status !== status || pending.action !== action || pending.participant_id !== content.participant_id || JSON.stringify(pending.extra || {}) !== JSON.stringify(extra)) {
+    pending = { ...content, request_id: requestId(), extra };
   }
   saved(key, JSON.stringify(pending));
   byId('send-status').textContent = 'Sending...';
@@ -186,7 +205,8 @@ async function write(endpoint, body, status, action) {
     } else if (endpoint === 'status') {
       roomStatus = result.discussion.status;
     }
-    byId('send-status').textContent = endpoint === 'messages' ? 'Posted to the room.' : endpoint === 'coordination' ? 'Room controls updated.' : `Discussion ${roomStatus}.`;
+    if (endpoint === 'outcome') { byId('outcome-note').value = ''; byId('outcome-commit').value = ''; }
+    byId('send-status').textContent = endpoint === 'messages' ? 'Posted to the room.' : endpoint === 'coordination' ? 'Room controls updated.' : endpoint === 'outcome' ? 'Outcome recorded.' : `Discussion ${roomStatus}.`;
     // Keep the read cursor unchanged so concurrent agent posts are not skipped.
     clearTimeout(timer);
     void poll();
@@ -233,10 +253,11 @@ function renderMessage(message) {
   let body = message.body;
   // These event bodies are generated by the collaboration server. Render text
   // only, including ordinary Markdown, so agent content cannot execute HTML.
-  if (message.kind === 'status' || message.kind === 'decision' || message.kind === 'agreement') {
+  if (message.kind === 'status' || message.kind === 'decision' || message.kind === 'agreement' || message.kind === 'outcome') {
     try {
       const value = JSON.parse(body);
-      body = message.kind === 'agreement' ? `Agreed to plan revision ${value.revision}.`
+      body = message.kind === 'outcome' ? `Outcome: ${value.status}${value.commit_ref ? ` (${value.commit_ref})` : ''}. ${value.note}`
+        : message.kind === 'agreement' ? `Agreed to plan revision ${value.revision}.`
         : message.kind === 'status' ? `${value.status}: ${value.reason}`
         : `${value.plan}\n\nOpen items:\n${(value.open_items || []).map(item => `- ${item.issue} (owner: ${item.owner})`).join('\n') || 'None.'}\n\nOpen disagreements:\n${value.disagreements || 'None recorded.'}`;
     } catch { /* Display the original text if an older event has another shape. */ }
@@ -274,7 +295,7 @@ function renderCoordination(value) {
   list.replaceChildren();
   for (const request of requests) {
     const box = node('div', 'pending-request');
-    box.append(node('p', 'hint', `Reply requested from ${request.name} through message #${request.message_id}. ${roomStatus !== 'active' ? 'Room is paused or closed.' : 'Automatic wake is not connected; resume its chat if idle.'}`));
+    box.append(node('p', 'hint', `Reply requested from ${request.name} through message #${request.message_id}. ${roomStatus !== 'active' ? 'Room is paused or closed.' : 'A Claude session started with --channels wakes on its own; otherwise resume its chat.'}`));
     const button = node('button', '', `Copy prompt for ${request.name}`);
     button.type = 'button';
     const prompt = `Resume your participation in MCP room "${selectedRoom}". You were requested at message #${request.message_id}. Read all unread messages and coordination state, respect research holds, then make at most one concise contribution if appropriate. Reuse your participant ID if this chat has one. This requests discussion only.`;
@@ -295,12 +316,12 @@ async function poll() {
     const version = selectionVersion;
     const { discussions } = await get('/api/discussions');
     if (version !== selectionVersion) return;
-    const signature = JSON.stringify(discussions.map(room => [room.id, room.status]));
+    const signature = JSON.stringify(discussions.map(room => [room.id, room.status, room.outcome, room.needs_outcome]));
     if (signature !== roomSignature) {
       roomSignature = signature;
       rooms.replaceChildren();
       if (!discussions.length) rooms.append(new Option('No discussions yet', ''));
-      for (const room of discussions) rooms.append(new Option(`${room.id} (${room.status})`, room.id));
+      for (const room of discussions) rooms.append(new Option(`${room.id} (${room.status}${room.outcome ? `, ${room.outcome}` : room.needs_outcome ? ', outcome?' : ''})`, room.id));
     }
     if (!discussions.some(room => room.id === selectedRoom)) selectRoom(discussions[0]?.id || '');
     rooms.value = selectedRoom;
@@ -328,7 +349,7 @@ async function poll() {
       roomStatus = page.discussion.status;
       updateControls();
       const present = new Map(page.participants.map(p => [p.name.trim().toLowerCase(), p]));
-      byId('participants').textContent = [...present.values()].map(p => p.name === 'You' ? 'You' : `${p.name} (@${p.handle}${p.role ? `, ${p.role}` : ''})`).join(', ') || 'No agents currently monitoring';
+      byId('participants').textContent = [...present.values()].map(p => p.name === 'You' ? 'You' : `${p.name} (@${p.handle}${p.role ? `, ${p.role}` : ''}${p.reconciler && p.role !== 'reconciler' ? ', reconciler' : ''})`).join(', ') || 'No agents currently monitoring';
       renderCoordination(page.coordination);
       const consensus = page.consensus;
       byId('consensus').hidden = !page.decision;
@@ -342,6 +363,7 @@ async function poll() {
       byId('consensus-agents').textContent = (consensus?.agents || [])
         .map(agent => `${agent.name}: ${agent.agreed ? 'Agreed' : 'Not yet agreed'}`).join(' · ');
       byId('decision').hidden = !page.decision;
+      byId('outcome').hidden = !page.decision;
       if (page.decision) {
         byId('export-plan').href = `/api/discussions/${encodeURIComponent(room)}/plan.md`;
         byId('export-plan').download = `${room}-r${page.decision.revision}.md`;
@@ -358,6 +380,9 @@ async function poll() {
         }
         if (!items.children.length) items.append(node('li', 'hint', 'None. Consensus is possible for this revision.'));
         byId('rounds').textContent = `Revision ${page.decision.revision} of at most ${page.discussion.max_rounds} with open items before the room pauses for your ruling.`;
+        byId('outcome-current').textContent = page.outcome
+          ? `${page.outcome.status}${page.outcome.commit_ref ? ` (${page.outcome.commit_ref})` : ''}, recorded by ${page.outcome.recorded_by} on ${new Date(page.outcome.created_at).toLocaleString()}: ${page.outcome.note}`
+          : roomStatus === 'closed' ? 'Not recorded yet. What happened to this plan?' : 'Record after the room closes.';
         byId('disagreements').textContent = page.decision.disagreements || 'None recorded.';
       }
       for (const message of page.messages) renderMessage(message);

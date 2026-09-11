@@ -64,7 +64,8 @@ export function createDiscussionHttp(options: {
         if (!isInitializeRequest(body)) { send(res, 400, 'Initialize an MCP session first.'); return true; }
         if (sessions.size >= 128) { send(res, 503, 'Too many MCP sessions.'); return true; }
         const mcp = new McpServer({ name: 'hotstep-collaboration', version: '1.0.0' });
-        const collaboration = registerCollaborationTools(mcp, options.dbPath);
+        // Streamable HTTP sessions declare no channel capability, so no wake poller either.
+        const collaboration = registerCollaborationTools(mcp, options.dbPath, { wake: false });
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: randomUUID,
           enableJsonResponse: true,

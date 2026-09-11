@@ -39,6 +39,12 @@
         <label for="invite-text">Send this to each agent in VSCode</label>
         <textarea id="invite-text" readonly rows="4"></textarea>
         <button id="copy-invite" type="button">Copy invitation</button>
+        <details>
+          <summary>Reconciler invitation (optional third agent)</summary>
+          <textarea id="reconciler-invite-text" readonly rows="5"></textarea>
+          <button id="copy-reconciler-invite" type="button">Copy reconciler invitation</button>
+          <p class="hint">A reconciler submits no position and does not vote. While present it is the only participant that records plans, so the merged plan is not drafted by one side of the argument.</p>
+        </details>
       </section>
       <section id="details" hidden>
         <div class="section-heading"><h2>Brief</h2><span id="room-status" class="badge"></span></div>
@@ -75,6 +81,25 @@
           <p id="disagreements" class="prose"></p>
           <p><a id="export-transcript" download>Download plan with transcript (.md)</a></p>
         </details>
+        <section id="outcome" hidden>
+          <h2>Outcome</h2>
+          <p id="outcome-current" class="hint"></p>
+          <form id="outcome-form">
+            <label for="outcome-status">What happened to the plan</label>
+            <select id="outcome-status">
+              <option value="shipped">Shipped</option>
+              <option value="partial">Partially shipped</option>
+              <option value="abandoned">Abandoned</option>
+              <option value="superseded">Superseded by another plan</option>
+            </select>
+            <label for="outcome-note">Note</label>
+            <textarea id="outcome-note" rows="2" maxlength="4000" placeholder="What shipped, where, or why not..."></textarea>
+            <label for="outcome-commit">Commit (optional)</label>
+            <input id="outcome-commit" type="text" maxlength="100" placeholder="f1d203a9">
+            <button id="outcome-save" type="submit">Record outcome</button>
+            <p id="outcome-status-line" class="hint" role="status"></p>
+          </form>
+        </section>
       </section>
     </aside>
     <main>

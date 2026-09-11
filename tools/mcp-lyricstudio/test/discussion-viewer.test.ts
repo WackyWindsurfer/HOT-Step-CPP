@@ -197,7 +197,7 @@ test('group chat HTTP and MCP share the transcript without app access', { timeou
       assert.equal(store!.read('review', 0, 1000).coordination.requests.length, 0);
       assert.equal((await write('coordination', { body: 'Missing action' })).status, 400);
       const script = await (await fetch(base + '/viewer.js')).text();
-      assert.match(script, /Automatic wake is not connected/);
+      assert.match(script, /A Claude session started with --channels wakes on its own/);
     });
     await t.test('End Discussion closes through HTTP and releases an MCP waiter', async () => {
       const html = await (await fetch(base + '/')).text();

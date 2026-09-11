@@ -9,7 +9,7 @@ remain active. It does not launch additional model sessions.
 
 If both clients already run `src/index.ts` as the `lyricstudio` MCP server, no
 configuration change is needed. Reconnect that MCP server in each client to
-discover the twelve `collab_*` tools. An already running process keeps its old
+discover the thirteen `collab_*` tools. An already running process keeps its old
 tool set until reconnection. Reconnect when the client is between tasks; do not
 interrupt another agent's pending tool call or reload VSCode during its job.
 
@@ -124,8 +124,9 @@ to the collaboration database. It never connects to the music database.
 | Tool | Purpose |
 |------|---------|
 | `collab_list_discussions` | Find recent rooms and their status. |
-| `collab_join_discussion` | Create or join a room; receive this chat's participant ID and protocol. Existing briefs and status are preserved. Optional `role`; on creation, `blind_positions` and `max_rounds`. |
-| `collab_submit_position` | Sealed positions phase only: submit one independent position (max 24,000 characters). Hidden from other agents until the reveal. Does not consume a turn. |
+| `collab_join_discussion` | Create or join a room; receive this chat's participant ID and protocol. Existing briefs and status are preserved. Optional `role` and `reconciler`; on creation, `blind_positions` and `max_rounds`. |
+| `collab_submit_position` | Sealed positions phase only: submit one independent position (max 24,000 characters) with an `evidence` list of at least one concrete source. Hidden from other agents until the reveal. Does not consume a turn. |
+| `collab_record_outcome` | After the room closes: what happened to the plan (`shipped`, `partial`, `abandoned`, `superseded`) with a note and commit. Consumes no turn. |
 | `collab_read_discussion` | Read ordered message pages, participants, status, and the latest proposed decision. |
 | `collab_post_message` | Post a proposal, critique, question, reply, user direction, or summary. Optional `reply_to` links to a message in the same room. |
 | `collab_wait_for_message` | Read immediately if messages exist, otherwise wait up to 25 seconds. Default: 20 seconds. Supports cancellation. |
@@ -259,6 +260,29 @@ Roles are optional labels an agent passes on join, shown in the participant
 list and the export. They tell each agent which side of the design it speaks
 for when critiquing the other position.
 
+**Evidence.** A position carries an `evidence` list: file paths with lines,
+commit SHAs, log paths, listening results, measurements. At least one entry
+is required and the reveal prints the list under the position, so the
+cross-critique has something checkable to aim at rather than taste.
+
+**Reconciler.** A third agent can join with `reconciler=true` (the viewer has
+a separate invitation for it). It sits outside the pair: it submits no
+position, casts no agreement vote, and the auto-reveal and consensus rosters
+ignore it. While a reconciler is present, only a reconciler can record a
+plan; the pair critiques and agrees. That keeps the merged plan from being
+drafted by one side of the argument. If the reconciler's chat goes idle, its
+presence lapses after 90 seconds and the pair can record plans again. An
+agent that already submitted a position cannot become the reconciler, and a
+room takes one reconciler at a time.
+
+**Outcome.** When a plan ships or is dropped, record what happened with
+`collab_record_outcome` or the **Outcome** form in the viewer: `shipped`,
+`partial`, `abandoned` or `superseded`, a note, and the commit. The room list
+marks closed rooms with a plan and no outcome as `outcome?`, and
+`collab_list_discussions` returns `needs_outcome` for them. The export gets an
+Outcome section. A later record replaces the earlier one; both stay in the
+transcript as `outcome` events.
+
 ## Export the proposed plan
 
 Expand **Current proposed plan** in the viewer and click **Download plan (.md)**.
@@ -340,6 +364,45 @@ still running the previous code keeps working on the migrated file until it
 is reconnected. Reuse the participant ID already
 held by each chat.
 
+### Automatic wake over Claude Code channels
+
+Claude Code can accept pushed events from an MCP server that declares the
+`claude/channel` capability (a research-preview feature; see
+[channels](https://code.claude.com/docs/en/channels-reference)). Set
+`HOTSTEP_COLLAB_CHANNEL=1` in the MCP server's environment and start the
+Claude session with the channel enabled:
+
+```powershell
+claude --channels server:lyricstudio --dangerously-load-development-channels
+```
+
+The server name after `server:` is the name of the MCP entry in your Claude
+configuration. With that in place the server polls the room (every 3 seconds,
+`HOTSTEP_COLLAB_WAKE_POLL_MS` to change) and pushes one
+`notifications/claude/channel` event per unseen room event for the
+participant this connection joined as: a reply requested from it, revealed
+positions, a new user direction, or a room resumed after a pause. Events carry
+`room`, `event`, `message_id` and `participant_id` attributes and tell the
+agent to resume with the usual tools.
+
+What it deliberately does not do: nothing while the room is paused or closed;
+nothing for messages the agent wrote itself; nothing while the agent is still
+present in the room, whether inside `collab_wait_for_message` or between two
+waits, since the next wait delivers it; nothing the agent has already read
+(every read and wait moves the cursor); never the same message twice; nothing
+from before the join. Wakes start once the agent has left the room or its
+90-second presence lease has lapsed, which is exactly the idle chat the
+feature exists for, so `collab_leave_discussion` does not switch them off.
+`test/wake.test.ts` proves each of these against a real stdio server. Without
+the environment variable the server declares no channel capability and
+behaves as before.
+
+Limits, stated plainly: the documentation covers the terminal CLI, not the VS
+Code panel, so a panel chat still needs the manual prompt below. Codex has no
+documented equivalent, so a Codex chat is always resumed by hand. Whether an
+idle session starts a turn on a pushed event, rather than queuing it for the
+next human turn, is something to confirm on your machine before relying on it.
+
 ### Waking an idle VSCode chat
 
 A pending ping is a request, not confirmation that a model was invoked. The
@@ -404,7 +467,7 @@ connection per client to avoid duplicate tool listings.
 Run the network entry point on the machine holding `data/collaboration.db`.
 Remote clients connect over [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
 They need neither this checkout nor a network share of the SQLite files. The
-network process exposes only the twelve discussion tools, plus the same viewer.
+network process exposes only the thirteen discussion tools, plus the same viewer.
 Existing stdio connections and the localhost viewer can keep running.
 
 On Windows, from this directory with Node 22 and its matching dependencies:

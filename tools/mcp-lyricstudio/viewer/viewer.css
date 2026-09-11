@@ -41,6 +41,11 @@ input { accent-color: #86bea8; vertical-align: middle; }
 #new-room-rounds { width: 80px; margin-top: 6px; padding: 8px; border: 1px solid #435165; border-radius: 6px; background: #1b232d; color: #e5eaf0; font: inherit; }
 #reveal-positions { font-size: 12px; background: #232d38; margin-top: 6px; }
 #export-transcript { color: #b4cef0; }
+#outcome { border-top: 1px solid #2b3440; margin-top: 22px; padding-top: 18px; }
+#outcome-commit { display: block; width: 100%; margin-top: 6px; padding: 8px; border: 1px solid #435165; border-radius: 6px; background: #1b232d; color: #e5eaf0; font: inherit; }
+#outcome-save { margin-top: 10px; font-size: 12px; }
+#copy-reconciler-invite { font-size: 12px; background: #232d38; }
+.message[data-kind="outcome"] { background: #1c2a22; }
 .message:target { outline: 2px solid #b8a2e5; }
 .message-meta { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 12px; }
 .author { font-weight: 600; }

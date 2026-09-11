@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 import { DEFAULT_MAX_ROUNDS, DiscussionStore } from '../src/collaboration.js';
 
 const HUMAN = '11111111-1111-4111-8111-111111111111';
+const EVIDENCE = ['docs/plans/dit-crop-depth/RESULTS.md:12', 'commit 7293e339'];
 
 function scratch() {
   const temp = mkdtempSync(join(tmpdir(), 'hotstep-positions-test-'));
@@ -39,9 +40,9 @@ test('sealed positions stay hidden until every present agent has submitted', t =
   assert.throws(() => store.decide(room, a.participant_id, 'd1', 0, 'Crop 800', ''), /Sealed positions phase/);
   store.activity(room, a.participant_id, 'researching', 'Reading the crop study', 60);
   store.activity(room, a.participant_id, 'idle', '', 60);
-  assert.throws(() => store.submitPosition(room, HUMAN, 'h', 'Human position'), /Unknown participant/);
+  assert.throws(() => store.submitPosition(room, HUMAN, 'h', 'Human position', EVIDENCE), /Unknown participant/);
 
-  const first = store.submitPosition(room, a.participant_id, 'pos-1', 'Crop 800, target 0.3. Evidence: blind study 2026-09-05.');
+  const first = store.submitPosition(room, a.participant_id, 'pos-1', 'Crop 800, target 0.3. Evidence: blind study 2026-09-05.', EVIDENCE);
   assert.deepEqual(first, { phase: 'positions', submitted: ['Claude'], awaiting: ['Codex'], revealed: false, submitted_now: true });
   // The peer sees who has submitted but never the body.
   const sealed = store.read(room, 0, 100);
@@ -50,27 +51,28 @@ test('sealed positions stay hidden until every present agent has submitted', t =
   assert.deepEqual(sealed.positions.awaiting, ['Codex']);
   assert.equal(JSON.stringify(sealed).includes('blind study'), false);
   // One position per agent; an identical retry is idempotent.
-  assert.throws(() => store.submitPosition(room, a.participant_id, 'pos-2', 'Changed my mind'), /already submitted/);
-  assert.equal(store.submitPosition(room, a.participant_id, 'pos-1', 'Crop 800, target 0.3. Evidence: blind study 2026-09-05.').submitted_now, true);
-  assert.throws(() => store.submitPosition(room, a.participant_id, 'pos-1', 'Different body'), /different content/);
+  assert.throws(() => store.submitPosition(room, a.participant_id, 'pos-2', 'Changed my mind', EVIDENCE), /already submitted/);
+  assert.equal(store.submitPosition(room, a.participant_id, 'pos-1', 'Crop 800, target 0.3. Evidence: blind study 2026-09-05.', EVIDENCE).submitted_now, true);
+  assert.throws(() => store.submitPosition(room, a.participant_id, 'pos-1', 'Different body', EVIDENCE), /different content/);
   assert.throws(() => store.agreePlan(room, b.participant_id, 'agree', 1, sealed.next_after_id), /Read the current recorded plan/);
 
-  const second = store.submitPosition(room, b.participant_id, 'pos-1', 'Crop 1500 for likeness; accept some bittiness.');
+  const second = store.submitPosition(room, b.participant_id, 'pos-1', 'Crop 1500 for likeness; accept some bittiness.', EVIDENCE);
   assert.equal(second.revealed, true);
   assert.equal(second.phase, 'discussion');
   const revealed = store.read(room, 0, 100);
   assert.equal(revealed.discussion.phase, 'discussion');
   assert.deepEqual(revealed.messages.map(m => [m.kind, m.author]), [['coordination', 'Codex'], ['position', 'Claude'], ['position', 'Codex']]);
   assert.match(revealed.messages[0].body, /Positions revealed \(2: Claude, Codex\) because every present agent has submitted/);
-  assert.equal(revealed.messages[1].body, 'Crop 800, target 0.3. Evidence: blind study 2026-09-05.');
+  assert.equal(revealed.messages[1].body, `Crop 800, target 0.3. Evidence: blind study 2026-09-05.\n\nEvidence:\n- ${EVIDENCE[0]}\n- ${EVIDENCE[1]}`);
+  assert.throws(() => store.submitPosition('blind-2', store.join('blind-2', 'Claude', 'No evidence', { blind_positions: true, base_commit: null }).participant_id, 'pos', 'Trust me', [' ']), /at least one piece of evidence/);
   assert.equal(revealed.positions.revealed, true);
   assert.deepEqual(revealed.participants.map(p => [p.name, p.role]), [['Claude', 'engine/logic lead'], ['Codex', 'app/integration lead']]);
   // Revealed positions do not consume a turn: the last submitter may speak first.
   store.post(room, b.participant_id, 'c1', 'critique', 'Crop 800 loses the album arc; see the 09-03 verdict.');
   assert.throws(() => store.post(room, b.participant_id, 'c2', 'reply', 'And another thing'), /Wait for another/);
-  assert.throws(() => store.submitPosition(room, b.participant_id, 'late', 'Late position'), /no sealed positions phase open/);
+  assert.throws(() => store.submitPosition(room, b.participant_id, 'late', 'Late position', EVIDENCE), /no sealed positions phase open/);
   // Retrying the original submission after the reveal still succeeds without a second copy.
-  assert.equal(store.submitPosition(room, a.participant_id, 'pos-1', 'Crop 800, target 0.3. Evidence: blind study 2026-09-05.').revealed, true);
+  assert.equal(store.submitPosition(room, a.participant_id, 'pos-1', 'Crop 800, target 0.3. Evidence: blind study 2026-09-05.', EVIDENCE).revealed, true);
   assert.equal(store.read(room, 0, 100).messages.filter(m => m.kind === 'position').length, 2);
 });
 
@@ -94,10 +96,10 @@ test('sealed phase closes the side channels and clears holds; a departed agent c
   store.status(room, HUMAN, 'resume', 'active', 'Go on.');
   // A research hold ends with the submission, and no hold survives the reveal.
   store.activity(room, a.participant_id, 'researching', 'Reading the study', 300);
-  store.submitPosition(room, a.participant_id, 'pos', 'Crop 800.');
+  store.submitPosition(room, a.participant_id, 'pos', 'Crop 800.', EVIDENCE);
   assert.equal(store.read(room, 0, 100).coordination.research, null);
   store.activity(room, b.participant_id, 'researching', 'Reading too', 300);
-  store.submitPosition(room, b.participant_id, 'pos', 'Crop 1500.');
+  store.submitPosition(room, b.participant_id, 'pos', 'Crop 1500.', EVIDENCE);
   const revealed = store.read(room, 0, 100);
   assert.equal(revealed.discussion.phase, 'discussion');
   assert.equal(revealed.coordination.research, null);
@@ -107,8 +109,8 @@ test('sealed phase closes the side channels and clears holds; a departed agent c
   const x = store.join('three', 'Claude', 'Three agents.', { blind_positions: true, base_commit: null });
   const y = store.join('three', 'Codex');
   const z = store.join('three', 'Gemini');
-  store.submitPosition('three', x.participant_id, 'pos', 'A');
-  const waiting = store.submitPosition('three', y.participant_id, 'pos', 'B');
+  store.submitPosition('three', x.participant_id, 'pos', 'A', EVIDENCE);
+  const waiting = store.submitPosition('three', y.participant_id, 'pos', 'B', EVIDENCE);
   assert.equal(waiting.revealed, false);
   assert.deepEqual(waiting.awaiting, ['Gemini']);
   store.leave('three', z.participant_id);
@@ -126,7 +128,7 @@ test('the human can reveal early; rooms without the phase reject positions', t =
   store.join('early', 'Codex');
   assert.equal(store.room('early').max_rounds, 3);
   assert.throws(() => store.clearCoordination('early', HUMAN, 'reveal-0', 'reveal_positions'), /No positions have been submitted/);
-  store.submitPosition('early', a.participant_id, 'pos', 'Train whole songs.');
+  store.submitPosition('early', a.participant_id, 'pos', 'Train whole songs.', EVIDENCE);
   assert.throws(() => store.clearCoordination('early', a.participant_id, 'reveal-agent', 'reveal_positions'), /Only the human/);
   const event = store.clearCoordination('early', HUMAN, 'reveal-1', 'reveal_positions');
   assert.match(event.body, /Positions revealed \(1: Claude\) because the user opened them/);
@@ -139,7 +141,7 @@ test('the human can reveal early; rooms without the phase reject positions', t =
   const plain = store.join('plain', 'Claude', 'Ordinary room');
   assert.equal(plain.discussion.phase, 'discussion');
   assert.equal(plain.positions, undefined);
-  assert.throws(() => store.submitPosition('plain', plain.participant_id, 'pos', 'Nope'), /no sealed positions phase open/);
+  assert.throws(() => store.submitPosition('plain', plain.participant_id, 'pos', 'Nope', EVIDENCE), /no sealed positions phase open/);
   assert.throws(() => store.join('bad', 'Claude', 'Bad rounds', { max_rounds: 9 }), /max_rounds/);
 });
 
@@ -200,6 +202,81 @@ test('open items block consensus and the round cap hands the room to the user', 
   assert.match(plan.markdown, /Ship crop 800\./);
   const bare = store.exportPlan('rounds');
   assert.doesNotMatch(bare.markdown, /## Transcript/);
+});
+
+test('a reconciler holds the pen, submits no position, casts no vote; outcomes follow closed rooms', t => {
+  const { db, cleanup } = scratch();
+  const store = new DiscussionStore(db);
+  t.after(() => { store.close(); cleanup(); });
+  const room = 'reconciled';
+  const a = store.join(room, 'Claude', 'Pick the encoder.', { blind_positions: true, base_commit: null, role: 'engine lead' });
+  const b = store.join(room, 'Codex', undefined, { role: 'app lead' });
+  const r = store.join(room, 'Opus', undefined, { reconciler: true, role: 'reconciler' });
+  assert.equal(r.reconciler, true);
+  assert.equal(r.role, 'reconciler');
+  // The flag and the role label are independent: neither overwrites the other.
+  assert.equal(store.join(room, 'Claude', undefined, { reconciler: false }).role, 'engine lead');
+  assert.equal(store.join(room, 'Opus', undefined, {}).reconciler, true);
+  assert.throws(() => store.join(room, 'Gemini', undefined, { reconciler: true }), /Opus is already the reconciler/);
+  assert.match(r.next_step, /You are the reconciler/);
+  assert.throws(() => store.submitPosition(room, r.participant_id, 'pos', 'My take', EVIDENCE), /Reconcilers submit no position/);
+  // The reconciler is not awaited: the pair's two positions reveal the room.
+  store.submitPosition(room, a.participant_id, 'pos', 'States.', EVIDENCE);
+  // The reconciler is never awaited, in the snapshot the pair reads or the viewer's.
+  assert.deepEqual(store.read(room, 0, 100).positions.awaiting, ['Codex']);
+  assert.throws(() => store.join(room, 'Claude', undefined, { reconciler: true }), /already submitted a position/);
+  assert.equal(store.submitPosition(room, b.participant_id, 'pos', 'Codes.', EVIDENCE).revealed, true);
+  let page = store.read(room, 0, 100);
+  assert.deepEqual(page.participants.map(p => [p.name, p.reconciler]), [['Claude', false], ['Codex', false], ['Opus', true]]);
+  assert.deepEqual(page.consensus.agents.map(x => x.name), ['Claude', 'Codex']);
+  // While the reconciler is present, only it records plans.
+  assert.throws(() => store.decide(room, a.participant_id, 'd', 0, 'States it is.', ''), /Opus is the reconciler and records plans/);
+  store.post(room, a.participant_id, 'c1', 'critique', 'Codes lose the timbre; see the rec7 ledger.');
+  store.post(room, b.participant_id, 'c2', 'critique', 'States are fuzzy on drums.');
+  const rec = store.decide(room, r.participant_id, 'd1', 0, 'Ship states; codes stay an experiment.', '', undefined, []);
+  assert.equal(rec.open_items.length, 0);
+  page = store.read(room, 0, 100);
+  assert.throws(() => store.agreePlan(room, r.participant_id, 'agree', 1, page.next_after_id), /Reconcilers do not vote/);
+  store.agreePlan(room, a.participant_id, 'agree', 1, page.next_after_id);
+  page = store.read(room, 0, 100);
+  const closed = store.agreePlan(room, b.participant_id, 'agree', 1, page.next_after_id);
+  assert.equal(closed.discussion.status, 'closed');
+  assert.equal(closed.consensus.reached, true);
+  assert.deepEqual(closed.consensus.agents.map(x => x.name), ['Claude', 'Codex']);
+
+  // Follow-through: the outcome is recorded on the closed room, replaces itself, and shows in the list and export.
+  assert.equal(store.list(10).find(x => x.id === room)?.needs_outcome, true);
+  const first = store.recordOutcome(room, a.participant_id, 'out-1', 'partial', 'States shipped; codes never left the branch.', 'f1d203a9');
+  assert.throws(() => store.recordOutcome('pair-open', store.join('pair-open', 'Claude', 'Still open', { base_commit: null }).participant_id, 'o', 'shipped', 'Too early'), /No plan was recorded/);
+  assert.equal(first.outcome?.status, 'partial');
+  assert.equal(store.recordOutcome(room, a.participant_id, 'out-1', 'partial', 'States shipped; codes never left the branch.', 'f1d203a9').id, first.id);
+  assert.throws(() => store.recordOutcome(room, a.participant_id, 'out-1', 'shipped', 'Changed'), /different content/);
+  store.joinViewer(room, HUMAN);
+  const second = store.recordOutcome(room, HUMAN, 'out-2', 'shipped', 'Codes shipped later after all.');
+  assert.equal(second.outcome?.recorded_by, 'You');
+  assert.equal(store.list(10).find(x => x.id === room)?.outcome, 'shipped');
+  assert.equal(store.list(10).find(x => x.id === room)?.needs_outcome, false);
+  page = store.read(room, 0, 100);
+  assert.deepEqual(page.messages.filter(m => m.kind === 'outcome').length, 2);
+  assert.equal(page.outcome?.status, 'shipped');
+  assert.match(store.exportPlan(room).markdown, /## Outcome\n\nshipped, recorded by You/);
+  assert.throws(() => store.recordOutcome('nowhere', a.participant_id, 'o', 'shipped', 'x'), /Unknown participant/);
+  const bare = store.join('no-plan', 'Claude', 'Never decided', { base_commit: null });
+  assert.throws(() => store.recordOutcome('no-plan', bare.participant_id, 'o', 'abandoned', 'Nothing to report'), /No plan was recorded/);
+  assert.throws(() => store.recordOutcome(room, a.participant_id, 'o-bad', 'shipped', 'Note', '<script>'), /without line breaks/);
+
+  // Once the reconciler's presence lapses, the pair can record plans again.
+  const pair = store.join('pair', 'Claude', 'Reconciler leaves.', { base_commit: null });
+  store.join('pair', 'Codex');
+  const rec2 = store.join('pair', 'Opus', undefined, { reconciler: true });
+  assert.throws(() => store.join('pair', 'Sonnet', undefined, { reconciler: true }), /Opus is already the reconciler/);
+  store.post('pair', pair.participant_id, 'p', 'proposal', 'Plan A');
+  assert.throws(() => store.decide('pair', pair.participant_id, 'd', 0, 'Plan A', ''), /reconciler/);
+  store.leave('pair', rec2.participant_id);
+  const human2 = '33333333-3333-4333-8333-333333333333';
+  store.joinViewer('pair', human2);
+  store.post('pair', human2, 'nudge', 'user_direction', 'Record it yourselves.');
+  assert.equal(store.decide('pair', pair.participant_id, 'd', 0, 'Plan A', '').revision, 1);
 });
 
 test('an older database gains the new columns and reads with defaults', t => {

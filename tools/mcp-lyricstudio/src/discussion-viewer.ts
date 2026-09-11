@@ -27,6 +27,8 @@ const humanWrite = z.object({
   body: z.string().trim().min(1).max(24000),
   status: z.enum(['active', 'paused', 'closed']).optional(),
   action: z.enum(['release_research', 'clear_requests', 'reveal_positions']).optional(),
+  outcome: z.enum(['shipped', 'partial', 'abandoned', 'superseded']).optional(),
+  commit: z.string().trim().max(100).optional(),
 });
 const humanCreate = humanWrite.pick({ participant_id: true, request_id: true }).extend({
   room: z.string().trim().min(1).max(100).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/),
@@ -92,7 +94,7 @@ export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ??
         response.writeHead(200, { 'Content-Type': `${asset.type}; charset=utf-8` });
         response.end(asset.body); return;
       }
-      const roomMatch = /^\/api\/discussions\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,99})(?:\/(messages|status|coordination|plan\.md))?$/.exec(url.pathname);
+      const roomMatch = /^\/api\/discussions\/([a-zA-Z0-9][a-zA-Z0-9._-]{0,99})(?:\/(messages|status|coordination|outcome|plan\.md))?$/.exec(url.pathname);
       const isWrite = request.method === 'POST';
       const isCreate = isWrite && url.pathname === '/api/discussions';
       if ((!roomMatch && url.pathname !== '/api/discussions') || (roomMatch && isWrite !== Boolean(roomMatch[2] && roomMatch[2] !== 'plan.md'))) {
@@ -139,6 +141,9 @@ export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ??
           } else if (roomMatch[2] === 'status') {
             if (!input.status) { send(400, { error: 'Choose a discussion status.' }); return; }
             send(200, store.status(room, participant, input.request_id, input.status, input.body));
+          } else if (roomMatch[2] === 'outcome') {
+            if (!input.outcome) { send(400, { error: 'Choose an outcome.' }); return; }
+            send(200, store.recordOutcome(room, participant, input.request_id, input.outcome, input.body, input.commit));
           } else {
             // The browser cannot choose an agent identity, kind, or decision revision.
             send(200, store.post(room, participant, input.request_id, 'user_direction', input.body));

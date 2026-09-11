@@ -14,11 +14,12 @@ import * as prompts from './prompts.js';
 import { withModelSuffix } from '../../../server/src/services/lireek/modelName.js';
 import { recalculateProfileStats } from '../../../server/src/services/lireek/profilerService.js';
 import { registerCollaborationTools } from './collaboration.js';
+import { channelServerOptions } from './discussion-wake.js';
 
 const server = new McpServer({
   name: 'lyricstudio',
   version: '1.0.0',
-});
+}, channelServerOptions());
 
 const collaboration = registerCollaborationTools(server);
 server.server.onclose = () => collaboration.close();

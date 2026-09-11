@@ -19,16 +19,16 @@ export class DiscussionConsensus {
   private available() {
     return Boolean(this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'discussion_agreements'").get());
   }
-  snapshot(room: string, revision: number) {
+  snapshot(room: string, revision: number, excluded: Set<string> = new Set()) {
     const status = (this.db.prepare('SELECT status FROM discussions WHERE id = ?').get(room) as { status: string }).status;
     const hasResults = this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'discussion_consensus_results'").get();
     const completed = hasResults ? this.db.prepare('SELECT agents FROM discussion_consensus_results WHERE room = ? AND revision = ?')
       .get(room, revision) as { agents: string } | undefined : undefined;
     if (status === 'closed' && completed) return { revision, reached: true, minimum_agents: 2, agents: JSON.parse(completed.agents) as { name: string; agreed: boolean }[] };
     // Keep consensus on old closed rooms readable after presence expires.
-    const roster = status === 'closed'
-      ? this.db.prepare("SELECT name FROM participants WHERE room = ? AND name != 'You' ORDER BY joined_at, rowid").all(room) as { name: string }[]
-      : new DiscussionPresence(this.db).list(room).filter(p => p.name !== 'You');
+    const roster = (status === 'closed'
+      ? this.db.prepare("SELECT id, name FROM participants WHERE room = ? AND name != 'You' ORDER BY joined_at, rowid").all(room) as { id: string; name: string }[]
+      : new DiscussionPresence(this.db).list(room).filter(p => p.name !== 'You')).filter(p => !excluded.has(p.id));
     const agents = new Map(roster.map(p => [p.name.trim().toLowerCase(), p.name]));
     const votes = this.available() ? this.db.prepare('SELECT agent FROM discussion_agreements WHERE room = ? AND revision = ?')
       .all(room, revision) as { agent: string }[] : [];
