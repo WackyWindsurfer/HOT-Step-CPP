@@ -56,6 +56,7 @@
 #include "ggml.h"
 
 #include <chrono>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -66,11 +67,16 @@
 
 // Identity of one merge: adapter path + mtime + every scale dial. Compared
 // against MM3Model::lm_merge_tag to decide "already merged" vs "reload first".
+static bool mm3_lm_merge_device_enabled() {
+    const char * value = std::getenv("MM3_MERGE_DEVICE");
+    return value && std::strcmp(value, "1") == 0;
+}
+
 static std::string mm3_lm_merge_make_tag(const std::string & path, int64_t mtime, const MM3LmAdapterScales & s) {
     char buf[128];
     snprintf(buf, sizeof(buf), "|%lld|%.6g|%.6g|%.6g|%.6g|%.6g|%.6g", (long long) mtime, (double) s.global,
              (double) s.attn, (double) s.mlp, (double) s.early, (double) s.mid, (double) s.late);
-    return path + buf;
+    return path + buf + (mm3_lm_merge_device_enabled() ? "|device-experimental" : "|host-reference");
 }
 
 // The base LM tensor an adapter module targets.
@@ -156,7 +162,7 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
     // 'verify' computes both paths but writes the CPU reference weights.
     const char * device_env = std::getenv("MM3_MERGE_DEVICE");
     const bool verify_device = device_env && std::strcmp(device_env, "verify") == 0;
-    const bool want_device = verify_device || (device_env && std::strcmp(device_env, "1") == 0);
+    const bool want_device = verify_device || mm3_lm_merge_device_enabled();
     int n_device = 0, n_verified = 0;
     size_t mismatched_bytes = 0;
     std::vector<uint8_t> device_bytes;
@@ -373,10 +379,12 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
         fprintf(stderr, "[MM3] LM merge phases: graph %.0f, allocate %.0f, compute %.0f, download %.0f, "
                         "CPU quantize %.0f, upload %.0f, cleanup %.0f ms\n",
                 phases[0], phases[1], phases[2], phases[3], phases[4], phases[5], phases[6]);
-        if (want_device) {
+        if (verify_device) {
             fprintf(stderr, "[MM3] LM merge device: %d modules, verify=%s, %d byte-identical, %llu differing bytes\n",
                     n_device, verify_device ? "yes (CPU weights written)" : "no", n_verified,
                     (unsigned long long) mismatched_bytes);
+        } else if (want_device) {
+            fprintf(stderr, "[MM3] LM merge device: %d modules written; byte verification disabled\n", n_device);
         }
         fprintf(stderr, "[MM3] LM merge CPU quantizer: %d threads, %d modules verified against serial\n",
                 quant_threads, n_cpu_verified);

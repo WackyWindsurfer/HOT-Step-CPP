@@ -450,6 +450,9 @@ static void mm3_ar_key_add_models(std::string & k, const MM3Model & m, const MM3
         add_s("ad", req.lm_adapter);
         add_i("ad_mtime", ok ? (long long) sb.st_mtime : -1);
         add_s("ad_mode", req.lm_adapter_mode);
+        // GPU requantization changes rounding. A saved hidden block or a
+        // resident merge must not cross that numerical policy boundary.
+        add_i("ad_device", req.lm_adapter_mode == "merge" && mm3_lm_merge_device_enabled() ? 1 : 0);
         add_i("ad_soft_off", req.lm_soft_off ? 1 : 0);  // a token-off plan is not a token-on plan
         const MM3LmAdapterScales & s = req.lm_adapter_scales;
         add_f("ad_g", s.global); add_f("ad_a", s.attn);  add_f("ad_m", s.mlp);
