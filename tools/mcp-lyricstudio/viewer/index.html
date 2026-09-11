@@ -24,7 +24,13 @@
           <input id="new-room-name" type="text" required maxlength="100" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,99}" placeholder="project-planning" autocomplete="off">
           <p class="hint">Use letters, numbers, dots, underscores or hyphens.</p>
           <label for="new-room-brief">What should we discuss?</label>
-          <textarea id="new-room-brief" rows="3" required maxlength="24000" placeholder="Describe the topic and any constraints..."></textarea>
+          <textarea id="new-room-brief" rows="3" required maxlength="24000" placeholder="The decision to make, the constraints, and the evidence that exists..."></textarea>
+          <p class="hint">State the question, not a proposal. The room records the current commit so both agents plan from the same source.</p>
+          <label class="option"><input id="new-room-blind" type="checkbox" checked> Sealed first positions</label>
+          <p class="hint">Each agent commits its own plan before it can see the other's. Positions are revealed together once every present agent has submitted, or when you open them.</p>
+          <label for="new-room-rounds">Plan revisions before it comes to you</label>
+          <input id="new-room-rounds" type="number" min="1" max="6" value="2">
+          <p class="hint">A revision at this count that still has open items pauses the room for your ruling.</p>
           <button id="create" type="submit">Create discussion</button>
           <p id="create-status" class="hint" role="status"></p>
         </form>
@@ -37,6 +43,12 @@
       <section id="details" hidden>
         <div class="section-heading"><h2>Brief</h2><span id="room-status" class="badge"></span></div>
         <p id="brief" class="prose"></p>
+        <p id="base-commit" class="hint"></p>
+        <section id="positions" aria-live="polite" hidden>
+          <h2>Sealed positions</h2>
+          <p id="positions-status" class="hint"></p>
+          <button id="reveal-positions" type="button" hidden>Reveal positions now</button>
+        </section>
         <h2>Participants</h2>
         <p id="participants" class="hint"></p>
         <p class="hint">Agents appear while monitoring or researching. Disconnected chats disappear within 90 seconds of their last check; an active research hold lasts until its displayed expiry.</p>
@@ -56,8 +68,12 @@
           <summary>Current proposed plan <span id="revision"></span></summary>
           <p><a id="export-plan" download>Download plan (.md)</a></p>
           <p id="plan" class="prose"></p>
-          <h3>Open disagreements</h3>
+          <h3>Open items</h3>
+          <ol id="open-items" class="prose"></ol>
+          <p id="rounds" class="hint"></p>
+          <h3>Open disagreements (free text)</h3>
           <p id="disagreements" class="prose"></p>
+          <p><a id="export-transcript" download>Download plan with transcript (.md)</a></p>
         </details>
       </section>
     </aside>

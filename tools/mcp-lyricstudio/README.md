@@ -9,28 +9,37 @@ remain active. It does not launch additional model sessions.
 
 If both clients already run `src/index.ts` as the `lyricstudio` MCP server, no
 configuration change is needed. Reconnect that MCP server in each client to
-discover the eleven `collab_*` tools. An already running process keeps its old
+discover the twelve `collab_*` tools. An already running process keeps its old
 tool set until reconnection. Reconnect when the client is between tasks; do not
 interrupt another agent's pending tool call or reload VSCode during its job.
 
 The music app, engine, and training workers do not need a restart. This package
 is outside their source tree and the discussion tools do not call their APIs.
 
-Tell the first agent:
+The recommended flow starts in the viewer: create the room there with the
+question to resolve as the brief and **Sealed first positions** ticked, then
+paste the generated invitation into each agent chat. It tells the agent to pass
+its role and to submit an independent position before it can read the other's.
 
-> Use the collaboration MCP tools to join room `cache-design` as Codex.
-> Create it with this brief: [describe the plan to discuss and constraints].
-> Read the discussion, propose an approach, and exchange critiques with Claude.
+If an agent creates the room instead, tell the first agent:
+
+> Use the collaboration MCP tools to join room `cache-design` as Codex with
+> role "app/integration lead" and blind_positions=true. Create it with this
+> brief: [the decision to make, the constraints, the evidence]. Submit your
+> independent position, then critique Claude's from your role once revealed.
 > Keep this to planning. Read every transcript page, keep waiting through empty
-> waits, and follow the returned participation instructions. Read and explicitly
+> waits, and follow the returned participation instructions. List every
+> unresolved contradiction as an open item with an owner. Read and explicitly
 > agree to the recorded plan. Stop when the room closes or I stop you.
 
 Tell the other agent:
 
-> Join collaboration room `cache-design` as Claude using the MCP tools.
-> Read its brief and messages, then discuss the plan with Codex.
+> Join collaboration room `cache-design` as Claude with role "engine/logic
+> lead" using the MCP tools. Read its brief, submit your independent position,
+> then critique Codex's from your role once revealed and work toward a plan.
 > Keep this to planning. Read every transcript page, keep waiting through empty
-> waits, and follow the returned participation instructions. Read and explicitly
+> waits, and follow the returned participation instructions. List every
+> unresolved contradiction as an open item with an owner. Read and explicitly
 > agree to the recorded plan. Stop when the room closes or I stop you.
 
 Use the same room name in both chats. Empty waits do not end participation.
@@ -115,12 +124,13 @@ to the collaboration database. It never connects to the music database.
 | Tool | Purpose |
 |------|---------|
 | `collab_list_discussions` | Find recent rooms and their status. |
-| `collab_join_discussion` | Create or join a room; receive this chat's participant ID and protocol. Existing briefs and status are preserved. |
+| `collab_join_discussion` | Create or join a room; receive this chat's participant ID and protocol. Existing briefs and status are preserved. Optional `role`; on creation, `blind_positions` and `max_rounds`. |
+| `collab_submit_position` | Sealed positions phase only: submit one independent position (max 24,000 characters). Hidden from other agents until the reveal. Does not consume a turn. |
 | `collab_read_discussion` | Read ordered message pages, participants, status, and the latest proposed decision. |
 | `collab_post_message` | Post a proposal, critique, question, reply, user direction, or summary. Optional `reply_to` links to a message in the same room. |
 | `collab_wait_for_message` | Read immediately if messages exist, otherwise wait up to 25 seconds. Default: 20 seconds. Supports cancellation. |
 | `collab_set_status` | Set `active`, `paused`, or `closed`, recording who changed it and why. |
-| `collab_record_decision` | Save a proposed plan and disagreements with a checked revision number. This never represents user approval. |
+| `collab_record_decision` | Save a proposed plan, its `open_items` (each with an owner), and free-text disagreements with a checked revision number. This never represents user approval. |
 | `collab_agree_plan` | Agree to the current plan revision after reading all messages. All present agents agreeing, at least two, automatically closes the room. |
 | `collab_leave_discussion` | Remove your live presence before ending your chat turn. Preserves identity and transcript. |
 | `collab_set_activity` | Claim or renew a research hold, or release your own hold with `idle`. Does not consume a reply. |
@@ -205,22 +215,72 @@ filler message. MCP does not wake a finished chat; start or resume it in its cha
 window. No API keys, extra model invocations, or message delivery to other
 services are added by these tools.
 
+## Sealed positions, base commit, open items and the round cap
+
+These four rules exist so a room's "consensus" means two independent views
+converged, not one view politely edited by the other.
+
+**Sealed positions.** A room created with **Sealed first positions** (the
+viewer default; `blind_positions=true` from MCP) starts in the `positions`
+phase. Each agent must submit one position with `collab_submit_position`
+before it can post, record a plan or agree. Positions are stored outside the
+transcript and are not readable by other agents. Reads show who has submitted
+and who is still awaited, never the text. When every present agent has
+submitted, with at least two positions, the server reveals them together: one
+coordination event, then each position in submission order as a `position`
+message. **Reveal positions now** in the viewer opens them early. Revealed
+positions do not consume a discussion turn, so either agent may speak first.
+Research holds are allowed during the phase. A retried submission with the
+same `request_id` and body is idempotent, before and after the reveal.
+
+**Base commit.** On creation the room records `git rev-parse HEAD` of this
+checkout, with `-dirty` appended when tracked files have uncommitted changes.
+Agents see it as `discussion.base_commit` on the first read and are told to
+plan against it. It is a label for the record, not a checkout: the agents
+still read whatever is on disk. Set `HOTSTEP_COLLAB_REPO` to point the
+detection at another checkout, or pass `base_commit` explicitly from MCP.
+
+**Open items.** `collab_record_decision` takes `open_items`, a list of
+`{issue, owner}` where the owner is `You` or a joined agent name. Non-empty
+free-text `disagreements` become one item owned by `You`, so the old habit of
+recording a plan "with disagreements" cannot slip past the gate. Wording such
+as `None` or `N/A` counts as empty. `collab_agree_plan` refuses while the
+current revision has open items, and the viewer says why. A later revision
+that resolves an item, or cites the user's ruling on it, clears the list.
+
+**Round cap.** `max_rounds` (viewer field, default 2) bounds negotiation. When
+a revision at or past that number still has open items, the server pauses the
+room in the same transaction and posts a status event listing the items and
+their owners. Agents stop; the human reads, resumes the room, and posts the ruling as a
+message. The next revision should remove each ruled item and cite the direction
+message. A revision past the cap with items still open pauses the room again.
+
+Roles are optional labels an agent passes on join, shown in the participant
+list and the export. They tell each agent which side of the design it speaks
+for when critiquing the other position.
+
 ## Export the proposed plan
 
 Expand **Current proposed plan** in the viewer and click **Download plan (.md)**.
 The download contains the latest saved revision and open disagreements, labelled
 as a proposal. It does not export the whole conversation or imply user approval.
 The endpoint is `GET /api/discussions/ROOM/plan.md`; rooms without a plan return 404.
+The export lists the base commit, the revision against the round cap, and the
+open items with owners. **Download plan with transcript** (or `?transcript=1`)
+appends every message, including revealed positions, so the record shows what
+each side believed before it saw the other.
 
 For an offline snapshot without the viewer, run from this tool's directory:
 
 ```powershell
 npm run export:plan -- MM3_Optimisations
+npm run export:plan -- MM3_Optimisations --transcript
 ```
 
-This writes `docs/plans/discussions/MM3_Optimisations-rN.md` at the repository
-root. Optional `--out FILE.md` chooses another path; `--db DATABASE` chooses a
-database. Existing files are never overwritten. Older plans containing literal
+This writes `docs/plans/discussions/MM3_Optimisations-rN.md` (or
+`-rN-transcript.md`) at the repository root. Optional `--out FILE.md` chooses
+another path; `--db DATABASE` chooses a database. Existing files are never
+overwritten. Older plans containing literal
 `\n` separators throughout are converted to actual Markdown line breaks.
 
 Restart both clients' MCP connections to load the new protocol and enforcement.
@@ -272,7 +332,12 @@ activity updates are not invitations for agents to reply.
 After updating, restart the discussion viewer and the MCP connection in both
 agent clients, then refresh the viewer page. Existing processes keep the old
 rules and tool list until restarted. The database migration is automatic and
-preserves existing rooms, messages and plans. Reuse the participant ID already
+preserves existing rooms, messages and plans. Older rooms read as
+`phase: discussion` with no base commit and the default round cap; the viewer
+and the export script open one writer at startup so read-only page loads see
+the new columns. Roles and open items live in side tables, so an MCP process
+still running the previous code keeps working on the migrated file until it
+is reconnected. Reuse the participant ID already
 held by each chat.
 
 ### Waking an idle VSCode chat
@@ -339,7 +404,7 @@ connection per client to avoid duplicate tool listings.
 Run the network entry point on the machine holding `data/collaboration.db`.
 Remote clients connect over [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
 They need neither this checkout nor a network share of the SQLite files. The
-network process exposes only the eleven discussion tools, plus the same viewer.
+network process exposes only the twelve discussion tools, plus the same viewer.
 Existing stdio connections and the localhost viewer can keep running.
 
 On Windows, from this directory with Node 22 and its matching dependencies:

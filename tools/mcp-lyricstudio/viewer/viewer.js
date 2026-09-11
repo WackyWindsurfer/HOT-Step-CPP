@@ -11,6 +11,7 @@ let timer;
 let polling = false;
 let sending = false;
 let roomStatus = 'active';
+let roomPhase = 'discussion';
 let selectionVersion = 0;
 const memory = new Map();
 function requestId() {
@@ -35,6 +36,7 @@ function identity(room) {
   return saved(key) || saved(key, requestId());
 }
 
+const SEALED_INSTRUCTION = " The room is in the sealed positions phase: before anything else, research the brief and submit your own independent position with collab_submit_position (your plan, the evidence, what would change your mind). You cannot see the other agent's position until both are in. After the reveal, critique the other position from your role before converging.";
 function updateControls() {
   byId('composer').hidden = !selectedRoom;
   byId('send').disabled = sending || !selectedRoom || roomStatus !== 'active';
@@ -49,9 +51,11 @@ function updateControls() {
   byId('end-discussion').disabled = sending || !selectedRoom;
   byId('release-research').disabled = sending;
   byId('clear-requests').disabled = sending;
-  for (const id of ['create', 'new-room-name', 'new-room-brief']) byId(id).disabled = sending;
+  byId('reveal-positions').disabled = sending || roomStatus !== 'active';
+  for (const id of ['create', 'new-room-name', 'new-room-brief', 'new-room-blind', 'new-room-rounds']) byId(id).disabled = sending;
   byId('invite').hidden = !selectedRoom;
-  const invitation = `Join MCP discussion room "${selectedRoom}" as this chat's agent. Read the brief and full transcript, paging compact reads until has_more=false. Follow the returned participation instructions. Keep waiting through empty waits. When a solid plan is recorded, each agent including its author must read it and use collab_agree_plan for that revision. Stop when the room closes or the user stops you. Planning only.`;
+  const sealed = roomPhase === 'positions' ? SEALED_INSTRUCTION : '';
+  const invitation = `Join MCP discussion room "${selectedRoom}" as this chat's agent, passing role="<your role, e.g. engine/logic lead or app/integration lead>". Read the brief and full transcript, paging compact reads until has_more=false. Follow the returned participation instructions.${sealed} Keep waiting through empty waits. When a solid plan is recorded, list every unresolved contradiction in open_items with an owner; each agent including the author must read the plan and use collab_agree_plan for that revision, which is only possible with no open items. Stop when the room closes, pauses for the user's ruling, or the user stops you. Planning only.`;
   if (byId('invite-text').value !== invitation) byId('invite-text').value = invitation;
 }
 
@@ -60,6 +64,7 @@ function selectRoom(room) {
   if (selectedRoom) saved(`hotstep-draft:${selectedRoom}`, byId('message').value);
   selectedRoom = room;
   roomStatus = 'active';
+  roomPhase = 'discussion';
   byId('message').value = saved(`hotstep-draft:${room}`) || '';
   byId('send-status').textContent = '';
   cursor = 0;
@@ -103,8 +108,10 @@ byId('create-room').addEventListener('submit', async event => {
   const participant_id = identity(room);
   let pending;
   try { pending = JSON.parse(saved(key) || 'null'); } catch { /* Replace invalid saved state. */ }
-  if (!pending || pending.brief !== brief || pending.participant_id !== participant_id) {
-    pending = { room, brief, participant_id, request_id: requestId() };
+  const blind_positions = byId('new-room-blind').checked;
+  const max_rounds = Math.min(6, Math.max(1, Number(byId('new-room-rounds').value) || 2));
+  if (!pending || pending.brief !== brief || pending.participant_id !== participant_id || pending.blind_positions !== blind_positions || pending.max_rounds !== max_rounds) {
+    pending = { room, brief, participant_id, request_id: requestId(), blind_positions, max_rounds };
   }
   saved(key, JSON.stringify(pending));
   byId('create-status').textContent = 'Creating discussion...';
@@ -150,6 +157,7 @@ byId('resume').addEventListener('click', () => void write('status', 'User resume
 byId('end-discussion').addEventListener('click', () => void write('status', 'User ended the discussion. All agents must stop waiting and participating.', 'closed'));
 byId('release-research').addEventListener('click', () => void write('coordination', 'User released the research hold.', undefined, 'release_research'));
 byId('clear-requests').addEventListener('click', () => void write('coordination', 'User cleared the pending pings.', undefined, 'clear_requests'));
+byId('reveal-positions').addEventListener('click', () => void write('coordination', 'User revealed the sealed positions.', undefined, 'reveal_positions'));
 
 async function write(endpoint, body, status, action) {
   if (sending || !selectedRoom || !body) return;
@@ -229,7 +237,8 @@ function renderMessage(message) {
     try {
       const value = JSON.parse(body);
       body = message.kind === 'agreement' ? `Agreed to plan revision ${value.revision}.`
-        : message.kind === 'status' ? `${value.status}: ${value.reason}` : `${value.plan}\n\nOpen disagreements:\n${value.disagreements || 'None recorded.'}`;
+        : message.kind === 'status' ? `${value.status}: ${value.reason}`
+        : `${value.plan}\n\nOpen items:\n${(value.open_items || []).map(item => `- ${item.issue} (owner: ${item.owner})`).join('\n') || 'None.'}\n\nOpen disagreements:\n${value.disagreements || 'None recorded.'}`;
     } catch { /* Display the original text if an older event has another shape. */ }
   }
   article.append(meta, node('p', 'message-body', body));
@@ -304,21 +313,31 @@ async function poll() {
       byId('details').hidden = false;
       byId('room-title').textContent = room;
       byId('brief').textContent = page.discussion.brief;
-      byId('room-status').textContent = page.discussion.status;
+      byId('room-status').textContent = page.discussion.phase === 'positions' ? `${page.discussion.status} · sealed positions` : page.discussion.status;
+      byId('base-commit').textContent = `Base commit: ${page.discussion.base_commit || 'not recorded'} · up to ${page.discussion.max_rounds} plan revision${page.discussion.max_rounds === 1 ? '' : 's'} with open items before it comes to you.`;
+      roomPhase = page.discussion.phase || 'discussion';
+      const positions = page.positions || { submitted: [], awaiting: [] };
+      byId('positions').hidden = roomPhase !== 'positions';
+      byId('reveal-positions').hidden = roomPhase !== 'positions' || !positions.submitted.length;
+      byId('positions-status').textContent = roomPhase === 'positions'
+        ? `Submitted: ${positions.submitted.join(', ') || 'nobody yet'}. Awaiting: ${positions.awaiting.join(', ') || 'no agent currently present'}. Agents cannot reply or record a plan until the reveal. Positions open automatically once every present agent, at least two, has submitted; with one agent, use the button.`
+        : '';
       if (roomStatus !== page.discussion.status && !sending) {
         byId('send-status').textContent = page.discussion.status === 'active' ? '' : `Discussion ${page.discussion.status}. Resume to send messages.`;
       }
       roomStatus = page.discussion.status;
       updateControls();
       const present = new Map(page.participants.map(p => [p.name.trim().toLowerCase(), p]));
-      byId('participants').textContent = [...present.values()].map(p => p.name === 'You' ? 'You' : `${p.name} (@${p.handle})`).join(', ') || 'No agents currently monitoring';
+      byId('participants').textContent = [...present.values()].map(p => p.name === 'You' ? 'You' : `${p.name} (@${p.handle}${p.role ? `, ${p.role}` : ''})`).join(', ') || 'No agents currently monitoring';
       renderCoordination(page.coordination);
       const consensus = page.consensus;
       byId('consensus').hidden = !page.decision;
       byId('consensus-title').textContent = consensus?.reached ? 'Consensus reached' : 'Plan agreement';
+      const openCount = page.decision?.open_items?.length || 0;
       byId('consensus-status').textContent = consensus?.reached
         ? `All agents agreed to revision ${consensus.revision}. Discussion ended.`
         : roomStatus === 'closed' ? 'Discussion ended without consensus.'
+        : openCount ? `Revision ${page.decision?.revision} has ${openCount} open item${openCount === 1 ? '' : 's'}; consensus is blocked until a revision resolves them or carries your ruling.`
         : `Every agent must agree to revision ${page.decision?.revision}. At least two agents are required. New discussion clears agreements.`;
       byId('consensus-agents').textContent = (consensus?.agents || [])
         .map(agent => `${agent.name}: ${agent.agreed ? 'Agreed' : 'Not yet agreed'}`).join(' · ');
@@ -327,7 +346,18 @@ async function poll() {
         byId('export-plan').href = `/api/discussions/${encodeURIComponent(room)}/plan.md`;
         byId('export-plan').download = `${room}-r${page.decision.revision}.md`;
         byId('revision').textContent = `(revision ${page.decision.revision})`;
+        byId('export-transcript').href = `/api/discussions/${encodeURIComponent(room)}/plan.md?transcript=1`;
+        byId('export-transcript').download = `${room}-r${page.decision.revision}-transcript.md`;
         byId('plan').textContent = page.decision.plan;
+        const items = byId('open-items');
+        items.replaceChildren();
+        for (const item of page.decision.open_items || []) {
+          const li = node('li', '', item.issue);
+          li.append(node('span', 'owner', `owner: ${item.owner}`));
+          items.append(li);
+        }
+        if (!items.children.length) items.append(node('li', 'hint', 'None. Consensus is possible for this revision.'));
+        byId('rounds').textContent = `Revision ${page.decision.revision} of at most ${page.discussion.max_rounds} with open items before the room pauses for your ruling.`;
         byId('disagreements').textContent = page.decision.disagreements || 'None recorded.';
       }
       for (const message of page.messages) renderMessage(message);

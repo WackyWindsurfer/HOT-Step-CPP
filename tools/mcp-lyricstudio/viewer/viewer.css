@@ -32,6 +32,15 @@ input { accent-color: #86bea8; vertical-align: middle; }
 .message[data-agent="codex"] { border-left-color: #88b9d2; }
 .message[data-kind="user_direction"] { background: #222337; border-left-color: #b8a2e5; }
 .message[data-kind="status"] { background: #151a20; }
+.message[data-kind="position"] { background: #1a2230; border-left-width: 6px; }
+.message[data-kind="coordination"] { background: #151a20; }
+#open-items { padding-left: 20px; margin: 0 0 8px; }
+#open-items li { margin-bottom: 6px; }
+#open-items .owner { color: #d8b98e; font-size: 12px; margin-left: 6px; }
+.option { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+#new-room-rounds { width: 80px; margin-top: 6px; padding: 8px; border: 1px solid #435165; border-radius: 6px; background: #1b232d; color: #e5eaf0; font: inherit; }
+#reveal-positions { font-size: 12px; background: #232d38; margin-top: 6px; }
+#export-transcript { color: #b4cef0; }
 .message:target { outline: 2px solid #b8a2e5; }
 .message-meta { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 12px; }
 .author { font-weight: 600; }

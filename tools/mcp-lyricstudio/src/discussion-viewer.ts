@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { z } from 'zod';
-import { DEFAULT_COLLAB_DB, DiscussionStore } from './collaboration.js';
+import { DEFAULT_COLLAB_DB, DEFAULT_MAX_ROUNDS, DiscussionStore } from './collaboration.js';
 
 export async function readJson(request: IncomingMessage) {
   return new Promise<unknown>((resolve, reject) => {
@@ -26,11 +26,13 @@ const humanWrite = z.object({
   request_id: z.string().uuid(),
   body: z.string().trim().min(1).max(24000),
   status: z.enum(['active', 'paused', 'closed']).optional(),
-  action: z.enum(['release_research', 'clear_requests']).optional(),
+  action: z.enum(['release_research', 'clear_requests', 'reveal_positions']).optional(),
 });
 const humanCreate = humanWrite.pick({ participant_id: true, request_id: true }).extend({
   room: z.string().trim().min(1).max(100).regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/),
   brief: z.string().trim().min(1).max(24000),
+  blind_positions: z.boolean().default(true),
+  max_rounds: z.number().int().min(1).max(6).default(DEFAULT_MAX_ROUNDS),
 });
 
 // Local group chat. Reads use read-only SQLite connections; explicit human
@@ -47,6 +49,12 @@ export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ??
   const assets = new Map(Object.entries(assetFiles).map(([url, asset]) => [
     url, { type: asset.type, body: readFileSync(new URL(`../viewer/${asset.file}`, import.meta.url)) },
   ]));
+  // Read-only page loads cannot migrate an older database; one writer open at
+  // startup adds the sealed-position columns before the first GET needs them.
+  if (existsSync(dbPath)) {
+    try { new DiscussionStore(dbPath).close(); }
+    catch { /* A locked or foreign database is reported per request below. */ }
+  }
   const server = createServer(async (request, response) => {
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('X-Content-Type-Options', 'nosniff');
@@ -102,7 +110,7 @@ export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ??
         try { input = humanCreate.parse(await readJson(request)); }
         catch { send(400, { error: 'Enter a room name (letters, numbers, dots, underscores or hyphens; max 100 characters) and a brief (1 to 24,000 characters), with valid request and participant IDs.' }); return; }
         store = new DiscussionStore(dbPath);
-        try { send(200, store.createViewerDiscussion(input.room, input.brief, input.participant_id, input.request_id)); }
+        try { send(200, store.createViewerDiscussion(input.room, input.brief, input.participant_id, input.request_id, { blind_positions: input.blind_positions, max_rounds: input.max_rounds })); }
         catch (error) { send(409, { error: error instanceof Error ? error.message : 'Unable to create the discussion.' }); }
         return;
       }
@@ -142,10 +150,11 @@ export function createDiscussionViewer(dbPath = process.env.HOTSTEP_COLLAB_DB ??
       }
       if (roomMatch[2] === 'plan.md') {
         if (!store.latestDecision(room)) { send(404, { error: 'No proposed plan has been recorded for this discussion.' }); return; }
-        const plan = store.exportPlan(room);
+        const plan = store.exportPlan(room, { transcript: url.searchParams.get('transcript') === '1' });
+        const filename = url.searchParams.get('transcript') === '1' ? plan.filename.replace(/\.md$/, '-transcript.md') : plan.filename;
         response.writeHead(200, {
           'Content-Type': 'text/markdown; charset=utf-8',
-          'Content-Disposition': `attachment; filename="${plan.filename}"`,
+          'Content-Disposition': `attachment; filename="${filename}"`,
         });
         response.end(plan.markdown); return;
       }

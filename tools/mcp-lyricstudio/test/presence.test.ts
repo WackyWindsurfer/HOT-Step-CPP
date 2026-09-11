@@ -29,7 +29,7 @@ test('presence tracks active room monitoring without deleting transcript identit
     });
     const message = store.post('room', codex, 'evidence', 'reply', 'Preserve this evidence');
     await t.test('old duplicate identities remain attributable but are not present', () => {
-      raw.prepare('INSERT INTO participants VALUES (?, ?, ?, ?)').run(randomUUID(), 'room', 'Codex', '2000-01-01');
+      raw.prepare('INSERT INTO participants (id, room, name, joined_at) VALUES (?, ?, ?, ?)').run(randomUUID(), 'room', 'Codex', '2000-01-01');
       assert.deepEqual(names(), ['You', 'Claude', 'Codex']);
     });
     await t.test('expired agents disappear on read and viewer polling never renews them', () => {

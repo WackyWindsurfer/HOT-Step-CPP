@@ -43,7 +43,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
 
     await t.test('tools load without music database; concurrent joins share one room', async () => {
       const tools = await codex.listTools();
-      assert.equal(tools.tools.length, 11);
+      assert.equal(tools.tools.length, 12);
       await assert.rejects(call(codex, 'collab_join_discussion', { room: 'missing', name: 'Codex' }), /brief is required/);
       const joined = await Promise.all([
         call(codex, 'collab_join_discussion', { room, name: 'Codex', brief: 'Review cache design without touching running jobs.' }),
@@ -166,7 +166,7 @@ test('shared discussions over two independent MCP stdio processes', { timeout: 3
       await assert.rejects(send(b.participant_id, 'long', 'reply', 'x'.repeat(2401)), /2400/);
       await send(b.participant_id, 'reply');
       const decision = await call(codex, 'collab_record_decision', { room: 'turns', participant_id: a.participant_id, request_id: 'decision', expected_revision: 0, plan: 'The accepted proposal', disagreements: 'None' });
-      assert.deepEqual(Object.keys(decision).sort(), ['message_id', 'revision']);
+      assert.deepEqual(Object.keys(decision).sort(), ['message_id', 'open_items', 'paused', 'revision']);
       await assert.rejects(send(a.participant_id, 'after-decision'), /Wait for another/);
       // Another agent's control event cannot masquerade as its discussion reply.
       await call(claude, 'collab_set_status', { room: 'turns', participant_id: b.participant_id, request_id: 'active', status: 'active', reason: 'Continue' });
