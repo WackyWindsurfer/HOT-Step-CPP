@@ -90,6 +90,17 @@
 //    unchanged: greedy argmax over the CFG-guided logits, which is what
 //    POST /mm3/depth-frame still does by default.
 //
+// E. MM3_DEPTH_FUSED=1 COLLAPSES THE SEVEN STEPS INTO ONE GRAPH, SAMPLER AND
+//    ALL. Opt-in, off by default, and the default path below is untouched —
+//    same seven graphs, same seven scheds, same arithmetic. What the flag buys
+//    is the seven GPU->CPU->GPU round trips per frame: the feedback chain
+//    (sample codebook c on the host, upload the code, embed it for c+1) becomes
+//    ggml ops, so a frame is one dispatch and one sync. Nsight put the GPU at
+//    91 % of AR wall time with CUDA graphs already on, so the ceiling here is
+//    ~8-10 % of the AR stage, not a step change. The formulation, its numerical
+//    differences from the host sampler, and the RNG contract are documented on
+//    MM3DepthFused below; forced_codes still takes the step path.
+//
 // ── Parity, measured 2026-08-13 (AR iteration 0, RTX 5090, f16 GGUF) ──────────
 //
 // Fed `lm_i0_last_hidden` (both rows), semantic = `depth_i0_codes[0]` = 13095,
@@ -137,6 +148,10 @@
 
 // 4 blocks x ~30 nodes + embedding/head plumbing measures ~150; loose on purpose.
 #define MM3_DEPTH_MAX_NODES 512
+// The fused path (design note E) holds all seven codebook passes plus their
+// sampling tails in ONE graph, so it needs ~7x the per-step budget with room
+// for the sampling ops and the output concats.
+#define MM3_DEPTH_FUSED_MAX_NODES 8192
 // Hard cap on acoustic codebooks, so the per-step arrays can be fixed size.
 #define MM3_DEPTH_MAX_STEPS 16
 
@@ -159,6 +174,89 @@ struct MM3DepthStep {
     int64_t       S    = 0;
     size_t        compute_bytes = 0;
     int           n_nodes       = 0;
+};
+
+// ── The fused path (design note E; opt in with MM3_DEPTH_FUSED=1) ───────────
+//
+// One graph for the whole frame: all seven codebook passes AND their sampling,
+// so a frame costs ONE dispatch and ONE host sync instead of seven of each. The
+// feedback chain that forces the seven steps apart on the host (sample cb -> upload
+// the code -> embed it for cb+1) is expressed with ggml ops instead, so it never
+// leaves the GPU.
+//
+// Per codebook, after the head:
+//
+//   logits [V, 1, B]  (B = P*K, take-major)
+//     -> guided [V, K] = u_row + cfg*(c_row - u_row)        (identity at P = 1)
+//     -> clamp(-1e9, 1e9)                                   (= nan_to_num, below)
+//     -> thr  = the k-th largest, via argsort DESC + a gather of the sorted run
+//     -> keep = 1 - step(thr - guided)                      (>= threshold, ties kept)
+//     -> masked = guided - 1e9*(1 - keep)
+//     -> probs  = soft_max_ext(masked)                      (sums to 1 over survivors)
+//     -> cdf    = cumsum(probs)
+//     -> j*     = V - sum_rows(step(cdf - u))               (ascending inverse CDF)
+//     -> code   = clamp(j*, 0, V-1)
+//     -> row    = code + (cb-1)*V -> get_rows(audio_embd) -> feedback token
+//
+// NUMERICAL DIFFERENCES FROM THE HOST SAMPLER (mm3-sample.h), all deliberate:
+//
+//  * The survivor softmax runs in FLOAT here, in DOUBLE on the host. Over ~50
+//    survivors that moves the CDF by ~1e-7, which can flip the draw when u lands
+//    within that of a boundary. Distribution-identical, draw-by-draw it is not.
+//  * `clamp(-1e9, 1e9)` IS the reference's nan_to_num, not an approximation:
+//    fminf(fmaxf(NaN, -1e9), 1e9) returns -1e9 because IEEE maxNum ignores a NaN
+//    operand, and +/-inf saturate to +/-1e9. Same three substitutions, same order
+//    (before the top-k), which is the ordering note 2 in mm3-sample.h pins.
+//  * The tie rule is reproduced exactly: `keep` is `NOT (guided < thr)`, so values
+//    EQUAL to the threshold survive and more than k candidates can remain.
+//  * `step(cdf - u)` is `cdf > u`, character-for-character the host's `acc > u`,
+//    and the walk is over the ORIGINAL index order, not the sorted one.
+//  * DEGENERATE FALLBACK: the host returns the argmax without drawing when the
+//    survivor max is non-finite or the mass is zero. Here the draw is always
+//    consumed and a saturated CDF yields index V-1 via the clamp instead of the
+//    argmax. Both require logits that are entirely non-finite.
+//  * The projection of the semantic / acoustic feedback embeddings is HOISTED:
+//    each token is projected once and reused by every later codebook, instead of
+//    re-projecting the whole prefix per step (14 sweeps of `depth.proj` per frame
+//    become 8). Column-independent, so mathematically identical; the matmul shape
+//    changes, so the last ulp can.
+//
+// RNG CONTRACT. The draws are made on the HOST, before the graph runs, in the
+// host sampler's own order — for cb in 1..7, for take t, one
+// uniform_real_distribution<double>(0,1) from rngs[t]. Each take's generator
+// therefore advances by exactly seven draws per frame, the same as the unfused
+// path, which is what keeps the AR loop's SEMANTIC draws (same rngs[t]) in
+// lockstep. The degenerate fallback above is the only way that can drift.
+struct MM3DepthFused {
+    ggml_backend_sched_t sched = nullptr;
+    ggml_context *       gctx  = nullptr;
+    uint8_t *            gbuf  = nullptr;
+    ggml_cgraph *        graph = nullptr;
+
+    ggml_tensor * in_hidden = nullptr;  // [H, 1, B]  F32 — LM last_hidden, take-major
+    ggml_tensor * in_sem    = nullptr;  // [K]        I32 — LM vocab ids of the semantic codes
+    ggml_tensor * in_u      = nullptr;  // [1, K, NC] F32 — uniform draws; null in greedy mode
+
+    ggml_tensor * out_codes = nullptr;  // [NC, K]    F32, integral — the sampled codes
+    ggml_tensor * out_hid   = nullptr;  // [H, NC, K] F32 — CONDITIONAL-row hidden per codebook
+    ggml_tensor * out_lc    = nullptr;  // [V, NC, K] F32 — pre-CFG conditional logits
+    ggml_tensor * out_lu    = nullptr;  // [V, NC, K] F32 — pre-CFG unconditional; null at P = 1
+
+    // Everything the cached build is keyed on. The first five mirror the step
+    // graphs' invalidation; top_k / cfg / greedy are extra because the fused
+    // graph BAKES them (they are graph constants, not uploads).
+    const void * synth_token = nullptr;
+    const void * lm_token    = nullptr;
+    int          cfg_rows    = 0;
+    int          n_takes     = 0;
+    bool         fold_rows   = false;
+    int          n_steps     = 0;
+    int          top_k       = 0;
+    float        cfg         = 0.0f;
+    bool         greedy      = false;
+
+    size_t compute_bytes = 0;
+    int    n_nodes       = 0;
 };
 
 struct MM3DepthGraph {
@@ -192,6 +290,12 @@ struct MM3DepthGraph {
     // mm3_depth_block. Baked into the cached steps.
     bool         fold_rows = false;
 
+    // The opt-in single-graph frame (MM3_DEPTH_FUSED=1). Built lazily, beside
+    // the seven steps rather than instead of them: a forced-codes run still
+    // needs the step path, and the ~35 MB of step compute buffers is cheap
+    // insurance against having to rebuild them mid-song.
+    MM3DepthFused fused;
+
     // The real batch: cfg_rows * n_takes, capped at MM3_MAX_BATCH_ROWS.
     int rows() const { return cfg_rows * n_takes; }
 };
@@ -222,7 +326,24 @@ static void mm3_depth_free_step(MM3DepthStep * s) {
     *s = MM3DepthStep{};
 }
 
+static void mm3_depth_free_fused(MM3DepthFused * f) {
+    if (f->gctx) {
+        if (f->sched) {
+            ggml_backend_sched_reset(f->sched);
+        }
+        ggml_free(f->gctx);
+        free(f->gbuf);
+    }
+    if (f->sched) {
+        ggml_backend_sched_free(f->sched);
+    }
+    *f = MM3DepthFused{};
+}
+
 static void mm3_depth_free(MM3DepthGraph * g) {
+    // Before the steps and before backend_release: the fused scheduler holds a
+    // buffer on the same backend.
+    mm3_depth_free_fused(&g->fused);
     for (int i = 0; i < MM3_DEPTH_MAX_STEPS; i++) {
         mm3_depth_free_step(&g->step[i]);
     }
@@ -587,6 +708,297 @@ static bool mm3_depth_prepare(const MM3Model & m, MM3DepthGraph * g, std::string
     return true;
 }
 
+// ── Fused frame graph (opt-in) ──────────────────────────────────────────────
+
+// MM3_DEPTH_FUSED=1 — read ONCE per process, like every other MM3_* knob.
+static bool mm3_depth_fused_on() {
+    static const bool on = [] {
+        const char * e = std::getenv("MM3_DEPTH_FUSED");
+        return e && e[0] && e[0] != '0';
+    }();
+    return on;
+}
+
+// Build the one-graph frame. Assumes mm3_depth_prepare has already run: the
+// backend, the causal masks and g->n_steps all come from it, and the masks are
+// SHARED with the step graphs (they live in g->prep, not in either graph's
+// context, so two graphs referencing them is fine).
+//
+// `top_k`, `cfg` and `greedy` are baked as graph constants — that is the price
+// of moving the sampler into the graph, and why MM3DepthFused carries them in
+// its cache key.
+static bool mm3_depth_build_fused(const MM3Model & m, MM3DepthGraph * g, int top_k, float cfg, bool greedy,
+                                  std::string * err) {
+    const MM3DepthConfig &  c  = m.synth_cfg.depth;
+    const MM3DepthWeights & w  = m.synth.depth;
+    const int64_t           H  = (int64_t) c.embedding_length;
+    const int64_t           V  = (int64_t) c.audio_vocab_size;
+    const int               NC = g->n_steps;
+    const int64_t           K  = (int64_t) g->n_takes;
+    const int64_t           P  = (int64_t) g->cfg_rows;
+    const int64_t           B  = (int64_t) g->rows();
+    MM3DepthFused *         f  = &g->fused;
+
+    mm3_depth_free_fused(f);
+
+    if (NC < 1 || NC > MM3_DEPTH_MAX_STEPS) {
+        if (err) {
+            *err = "fused depth graph: the step graphs are not prepared";
+        }
+        return false;
+    }
+
+    const size_t ctx_bytes = ggml_tensor_overhead() * (MM3_DEPTH_FUSED_MAX_NODES + 256) +
+                             ggml_graph_overhead_custom(MM3_DEPTH_FUSED_MAX_NODES, false);
+    f->gbuf = (uint8_t *) malloc(ctx_bytes);
+    if (!f->gbuf) {
+        if (err) {
+            *err = "out of host memory allocating the fused depth graph context";
+        }
+        return false;
+    }
+    ggml_init_params ip  = { ctx_bytes, f->gbuf, /*no_alloc*/ true };
+    ggml_context *   ctx = ggml_init(ip);
+    if (!ctx) {
+        free(f->gbuf);
+        f->gbuf = nullptr;
+        if (err) {
+            *err = "ggml_init failed for the fused depth graph context";
+        }
+        return false;
+    }
+
+    f->in_hidden = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H, 1, B);
+    ggml_set_name(f->in_hidden, "mm3_depth_fused_lm_hidden");
+    ggml_set_input(f->in_hidden);
+
+    f->in_sem = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, K);
+    ggml_set_name(f->in_sem, "mm3_depth_fused_semantic_id");
+    ggml_set_input(f->in_sem);
+
+    if (!greedy) {
+        // [1, K, NC]: codebook-major blocks of K contiguous draws, which is the
+        // order the host fills them in (see the RNG contract above).
+        f->in_u = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, K, (int64_t) NC);
+        ggml_set_name(f->in_u, "mm3_depth_fused_draws");
+        ggml_set_input(f->in_u);
+    }
+
+    // Hoisted: token 0 is the same projected LM hidden in every codebook pass,
+    // and each feedback embedding is projected once and reused by every later
+    // pass (see the hoisting note above).
+    ggml_tensor * tok0 = ggml_mul_mat(ctx, w.proj, f->in_hidden);  // [H, 1, B]
+
+    std::vector<ggml_tensor *> tok;  // projected, per take, [H, 1, K] each
+    tok.reserve((size_t) NC);
+    {
+        ggml_tensor * sem = ggml_get_rows(ctx, m.lm.token_embd, f->in_sem);  // [H, K] — LM table (note 1)
+        tok.push_back(ggml_mul_mat(ctx, w.proj, ggml_reshape_3d(ctx, sem, H, 1, K)));
+    }
+
+    // The top-k cap, resolved once. kk == V means "no cap": the threshold is
+    // then the row minimum and every candidate survives, which is what the host
+    // sampler's threshold = -INFINITY does.
+    const int64_t kk = (top_k > 0 && (int64_t) top_k < V) ? (int64_t) top_k : V;
+
+    ggml_tensor * hid_all  = nullptr;
+    ggml_tensor * lc_all   = nullptr;
+    ggml_tensor * lu_all   = nullptr;
+    ggml_tensor * code_all = nullptr;
+
+    for (int cb = 1; cb <= NC; cb++) {
+        const int64_t S = cb + 1;
+
+        // ── the take's own token block, [H, cb, K] ──
+        ggml_tensor * shared = tok[0];
+        for (int i = 1; i < cb; i++) {
+            shared = ggml_concat(ctx, shared, tok[(size_t) i], 1);
+        }
+        if (P > 1) {
+            // repeat_interleave across each take's CFG pair, take-major — the
+            // same expression mm3_depth_build_step uses.
+            shared = ggml_reshape_3d(ctx, ggml_cont(ctx, shared), H * cb, 1, K);
+            shared = ggml_repeat_4d(ctx, shared, H * cb, P, K, 1);
+            shared = ggml_reshape_3d(ctx, shared, H, cb, B);
+        } else {
+            shared = ggml_reshape_3d(ctx, ggml_cont(ctx, shared), H, cb, B);
+        }
+
+        ggml_tensor * seq = ggml_concat(ctx, tok0, shared, 1);  // [H, S, B]
+        ggml_tensor * pos = ggml_view_2d(ctx, w.pos_embd, H, S, w.pos_embd->nb[1], 0);
+        ggml_tensor * h   = ggml_add(ctx, seq, pos);
+        for (size_t i = 0; i < w.blk.size(); i++) {
+            h = mm3_depth_block(ctx, c, w.blk[i], h, g->step[cb - 1].mask, g->fold_rows);
+        }
+        h = mm3_depth_norm(ctx, h, w.output_norm, c.rms_eps);
+
+        ggml_tensor * last = ggml_cont(
+            ctx, ggml_view_3d(ctx, h, H, 1, B, h->nb[1], h->nb[2], (size_t) (S - 1) * h->nb[1]));  // [H, 1, B]
+        ggml_tensor * logits = ggml_mul_mat(ctx, w.head[(size_t) (cb - 1)], last);                 // [V, 1, B]
+
+        // ── CFG blend over the take-major cond/uncond pairs ──
+        ggml_tensor * lr  = ggml_reshape_3d(ctx, logits, V, P, K);
+        ggml_tensor * lc3 = P > 1 ? ggml_cont(ctx, ggml_view_3d(ctx, lr, V, 1, K, lr->nb[1], lr->nb[2], 0)) : lr;
+        ggml_tensor * lu3 =
+            P > 1 ? ggml_cont(ctx, ggml_view_3d(ctx, lr, V, 1, K, lr->nb[1], lr->nb[2], lr->nb[1])) : nullptr;
+
+        // Its own buffer either way: `guided` is clamped IN PLACE below (ggml_clamp
+        // returns a view of its source), and at P = 1 lc3 aliases the logits we
+        // still have to hand back.
+        ggml_tensor * guided = P > 1 ? ggml_add(ctx, lu3, ggml_scale(ctx, ggml_sub(ctx, lc3, lu3), cfg))
+                                     : ggml_cont(ctx, lc3);
+        guided               = ggml_reshape_2d(ctx, guided, V, K);
+
+        // nan_to_num(nan=-1e9, posinf=1e9, neginf=-1e9), before the top-k.
+        ggml_tensor * gs = ggml_clamp(ctx, guided, -1e9f, 1e9f);  // [V, K]
+
+        ggml_tensor * codef = nullptr;  // [1, K] F32, integral
+        if (greedy) {
+            // Expected to agree with the host argmax exactly: same guided row,
+            // same comparison, and ggml_argmax keeps the lowest index on a tie
+            // the same way the host's strict `>` scan does.
+            ggml_tensor * am = ggml_argmax(ctx, gs);  // [K] I32
+            codef            = ggml_reshape_2d(ctx, ggml_cast(ctx, am, GGML_TYPE_F32), 1, K);
+        } else {
+            ggml_tensor * excl = nullptr;  // 1 where the candidate is BELOW the threshold
+            if (kk < V) {
+                // The k-th largest VALUE. Ties in the argsort are irrelevant here
+                // — the value at sorted position k-1 is the same whichever equal
+                // index wins the sort.
+                ggml_tensor * ids = ggml_argsort(ctx, gs, GGML_SORT_ORDER_DESC);  // [V, K] I32
+                // Per-row gather: a as [1, V, K] indexes its ne1 with one index
+                // list per ne2 slice, which is exactly "sorted values per take".
+                ggml_tensor * sv  = ggml_get_rows(ctx, ggml_reshape_3d(ctx, gs, 1, V, K), ids);  // [1, V, K]
+                ggml_tensor * sv2 = ggml_reshape_2d(ctx, sv, V, K);
+                ggml_tensor * thr =
+                    ggml_cont(ctx, ggml_view_2d(ctx, sv2, 1, K, sv2->nb[1], (size_t) (kk - 1) * sizeof(float)));
+                // step(thr - guided) is 1 exactly where guided < thr, so a value
+                // EQUAL to the threshold is kept (mm3-sample.h note 3).
+                excl = ggml_step(ctx, ggml_scale(ctx, ggml_sub(ctx, gs, thr), -1.0f));
+            }
+            // -1e9 on the excluded entries; softmax shifts by the survivor max,
+            // so they come out as exp(-1e9) == 0 rather than as a masked NaN.
+            ggml_tensor * masked = excl ? ggml_add(ctx, gs, ggml_scale(ctx, excl, -1e9f)) : gs;
+            ggml_tensor * probs  = ggml_soft_max_ext(ctx, masked, nullptr, 1.0f, 0.0f);  // [V, K], sums to 1
+            ggml_tensor * cdf    = ggml_cumsum(ctx, probs);                              // [V, K]
+            ggml_tensor * u_cb =
+                ggml_view_2d(ctx, f->in_u, 1, K, f->in_u->nb[1], (size_t) (cb - 1) * f->in_u->nb[2]);  // [1, K]
+            // step(cdf - u) is the host's `acc > u`; the run of ones starts at the
+            // chosen index, so counting them locates it without a search.
+            ggml_tensor * sel = ggml_step(ctx, ggml_sub(ctx, cdf, u_cb));    // [V, K]
+            ggml_tensor * cnt = ggml_sum_rows(ctx, sel);                     // [1, K]
+            codef = ggml_clamp(ctx, ggml_scale_bias(ctx, cnt, -1.0f, (float) V), 0.0f, (float) (V - 1));
+        }
+
+        // ── feedback: embed code + (cb-1)*V for the next pass (note 2) ──
+        if (cb < NC) {
+            ggml_tensor * rowf = ggml_scale_bias(ctx, codef, 1.0f, (float) ((int64_t) (cb - 1) * V));
+            ggml_tensor * rows = ggml_reshape_1d(ctx, ggml_cast(ctx, rowf, GGML_TYPE_I32), K);
+            ggml_tensor * emb  = ggml_get_rows(ctx, w.audio_embd, rows);  // [H, K]
+            tok.push_back(ggml_mul_mat(ctx, w.proj, ggml_reshape_3d(ctx, emb, H, 1, K)));
+        }
+
+        // ── collect, so the whole frame comes back in four reads ──
+        ggml_tensor * lastr = ggml_reshape_3d(ctx, last, H, P, K);
+        ggml_tensor * hc =
+            P > 1 ? ggml_cont(ctx, ggml_view_3d(ctx, lastr, H, 1, K, lastr->nb[1], lastr->nb[2], 0)) : lastr;
+
+        hid_all  = hid_all ? ggml_concat(ctx, hid_all, hc, 1) : hc;
+        lc_all   = lc_all ? ggml_concat(ctx, lc_all, lc3, 1) : lc3;
+        code_all = code_all ? ggml_concat(ctx, code_all, codef, 0) : codef;
+        if (P > 1) {
+            lu_all = lu_all ? ggml_concat(ctx, lu_all, lu3, 1) : lu3;
+        }
+    }
+
+    // At NC == 1 nothing was concatenated, so these are still views of interior
+    // nodes. Materialise them rather than reading back through a view.
+    if (NC == 1) {
+        hid_all  = ggml_cont(ctx, hid_all);
+        lc_all   = ggml_cont(ctx, lc_all);
+        code_all = ggml_cont(ctx, code_all);
+        if (lu_all) {
+            lu_all = ggml_cont(ctx, lu_all);
+        }
+    }
+
+    f->out_hid   = hid_all;    // [H, NC, K]
+    f->out_lc    = lc_all;     // [V, NC, K]
+    f->out_lu    = lu_all;     // [V, NC, K] or null at P = 1
+    f->out_codes = code_all;   // [NC, K]
+    ggml_set_name(f->out_hid, "mm3_depth_fused_hidden");
+    ggml_set_name(f->out_lc, "mm3_depth_fused_logits_cond");
+    ggml_set_name(f->out_codes, "mm3_depth_fused_codes");
+    ggml_set_output(f->out_hid);
+    ggml_set_output(f->out_lc);
+    ggml_set_output(f->out_codes);
+    if (f->out_lu) {
+        ggml_set_name(f->out_lu, "mm3_depth_fused_logits_uncond");
+        ggml_set_output(f->out_lu);
+    }
+
+    f->graph = ggml_new_graph_custom(ctx, MM3_DEPTH_FUSED_MAX_NODES, false);
+    ggml_build_forward_expand(f->graph, f->out_hid);
+    ggml_build_forward_expand(f->graph, f->out_lc);
+    ggml_build_forward_expand(f->graph, f->out_codes);
+    if (f->out_lu) {
+        ggml_build_forward_expand(f->graph, f->out_lu);
+    }
+
+    BackendPair bp = { g->backend, g->cpu_backend, g->backend != g->cpu_backend };
+    f->sched       = backend_sched_new(bp, MM3_DEPTH_FUSED_MAX_NODES * 2);
+    ggml_backend_sched_reset(f->sched);
+    if (!ggml_backend_sched_alloc_graph(f->sched, f->graph)) {
+        ggml_free(ctx);
+        free(f->gbuf);
+        f->gbuf  = nullptr;
+        f->graph = nullptr;
+        if (err) {
+            *err = "fused depth graph allocation failed (out of VRAM?)";
+        }
+        return false;
+    }
+
+    f->gctx          = ctx;
+    f->n_nodes       = ggml_graph_n_nodes(f->graph);
+    f->compute_bytes = ggml_backend_sched_get_buffer_size(f->sched, g->backend);
+    return true;
+}
+
+// Cheap after the first call. Invalidated by everything the step graphs are
+// invalidated by, PLUS the three baked sampling constants.
+static bool mm3_depth_prepare_fused(const MM3Model & m, MM3DepthGraph * g, int top_k, float cfg, bool greedy,
+                                    std::string * err) {
+    MM3DepthFused * f  = &g->fused;
+    const void *    st = (const void *) m.wctx_depth.buffer;
+    const void *    lt = (const void *) m.wctx_lm.buffer;
+    if (f->graph && f->synth_token == st && f->lm_token == lt && f->cfg_rows == g->cfg_rows &&
+        f->n_takes == g->n_takes && f->fold_rows == g->fold_rows && f->n_steps == g->n_steps &&
+        f->top_k == top_k && f->cfg == cfg && f->greedy == greedy) {
+        return true;
+    }
+    if (!mm3_depth_build_fused(m, g, top_k, cfg, greedy, err)) {
+        mm3_depth_free_fused(f);
+        return false;
+    }
+    f->synth_token = st;
+    f->lm_token    = lt;
+    f->cfg_rows    = g->cfg_rows;
+    f->n_takes     = g->n_takes;
+    f->fold_rows   = g->fold_rows;
+    f->n_steps     = g->n_steps;
+    f->top_k       = top_k;
+    f->cfg         = cfg;
+    f->greedy      = greedy;
+
+    fprintf(stderr,
+            "[MM3-Depth] Fused frame graph: %d codebooks in one graph (%d nodes, compute buffer %.1f MB), "
+            "%s sampling, top_k %d, cfg %.3f, %d take%s x %d row%s\n",
+            f->n_steps, f->n_nodes, (double) f->compute_bytes / (1024.0 * 1024.0), greedy ? "greedy" : "top-k",
+            top_k, (double) cfg, f->n_takes, f->n_takes == 1 ? "" : "s", f->cfg_rows, f->cfg_rows == 1 ? "" : "s");
+    return true;
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 static MM3DepthGraph g_mm3_depth;
@@ -700,6 +1112,111 @@ static bool mm3_depth_decode_takes(const MM3Model & m, const float * lm_hidden_r
     };
 
     const auto t0 = std::chrono::steady_clock::now();
+
+    // ── MM3_DEPTH_FUSED=1: the whole frame in ONE graph and ONE host sync ──
+    //
+    // Forced codes stay on the step path: there is nothing to sample, and the
+    // fused graph has no forced-feedback input to give them to. Everything else
+    // — greedy and top-k, one take or K, CFG or guidance-baked — goes through
+    // here, and fills MM3DepthFrame to the same contract.
+    if (mm3_depth_fused_on() && !forced_codes) {
+        const bool greedy = rngs == nullptr;
+        if (!mm3_depth_prepare_fused(m, &g_mm3_depth, top_k, cfg, greedy, err)) {
+            return false;
+        }
+        MM3DepthFused * f = &g_mm3_depth.fused;
+
+        // Allocation-free across frames. Safe as statics for the same reason the
+        // prof counters are: this function is serialised by g_mm3_mutex.
+        static std::vector<float> fu, fhid, flc, flu, fcode;
+
+        const auto tu = now();
+        ggml_backend_tensor_set(f->in_hidden, lm_hidden_rows, 0, (size_t) (H * B) * sizeof(float));
+        ggml_backend_tensor_set(f->in_sem, sem_ids.data(), 0, (size_t) K * sizeof(int32_t));
+        if (f->in_u) {
+            // Codebook-major, take-minor — the host sampler's own draw order, so
+            // every take's generator advances by exactly the seven draws per
+            // frame it would have consumed on the step path. The AR loop shares
+            // these generators with its semantic draw; that is why the order is
+            // part of the contract and not an implementation detail.
+            fu.resize((size_t) (NC * K));
+            for (int cb = 0; cb < NC; cb++) {
+                for (int64_t t = 0; t < K; t++) {
+                    fu[(size_t) (cb * K + t)] = (float) std::uniform_real_distribution<double>(0.0, 1.0)(rngs[t]);
+                }
+            }
+            ggml_backend_tensor_set(f->in_u, fu.data(), 0, fu.size() * sizeof(float));
+        }
+        if (depth_prof) {
+            prof_up += ms_since(tu);
+        }
+
+        const auto tc = now();
+        mm3_imatrix_hook(f->sched);
+        if (ggml_backend_sched_graph_compute(f->sched, f->graph) != GGML_STATUS_SUCCESS) {
+            if (err) {
+                *err = "fused depth graph compute failed";
+            }
+            return false;
+        }
+        if (depth_prof) {
+            prof_comp += ms_since(tc);
+        }
+
+        const auto td = now();
+        fhid.resize((size_t) (H * NC * K));
+        flc.resize((size_t) (V * NC * K));
+        fcode.resize((size_t) (NC * K));
+        // Four reads, and only the first of them actually waits on the frame.
+        ggml_backend_tensor_get(f->out_hid, fhid.data(), 0, fhid.size() * sizeof(float));
+        ggml_backend_tensor_get(f->out_lc, flc.data(), 0, flc.size() * sizeof(float));
+        if (f->out_lu) {
+            flu.resize((size_t) (V * NC * K));
+            ggml_backend_tensor_get(f->out_lu, flu.data(), 0, flu.size() * sizeof(float));
+        }
+        ggml_backend_tensor_get(f->out_codes, fcode.data(), 0, fcode.size() * sizeof(float));
+        if (depth_prof) {
+            prof_down += ms_since(td);
+        }
+
+        const auto th = now();
+        for (int64_t t = 0; t < K; t++) {
+            // [H, NC, K] and [V, NC, K] are take-major blocks of exactly the
+            // [NC, H] / [NC, V] the frame contract wants — one memcpy each.
+            memcpy(out[t].hiddens.data(), fhid.data() + (size_t) (t * NC * H), (size_t) (NC * H) * sizeof(float));
+            memcpy(out[t].logits_cond.data(), flc.data() + (size_t) (t * NC * V), (size_t) (NC * V) * sizeof(float));
+            // At P = 1 the guidance is baked in, so the unconditional row IS the
+            // conditional one — mirrored rather than left uninitialised, exactly
+            // as the step path does it.
+            memcpy(out[t].logits_uncond.data(), (f->out_lu ? flu.data() : flc.data()) + (size_t) (t * NC * V),
+                   (size_t) (NC * V) * sizeof(float));
+            for (int i = 0; i < NC; i++) {
+                // Exact integers in f32 (a sum of 1.0f terms, or an argmax cast),
+                // so this rounds rather than repairs — but truncation on a
+                // 1023.99999 would be a silent off-by-one, and rounding is free.
+                out[t].codes[i] = (int32_t) std::lrintf(fcode[(size_t) (t * NC + i)]);
+            }
+        }
+        if (depth_prof) {
+            prof_host += ms_since(th);
+        }
+
+        const double fused_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        for (int64_t t = 0; t < K; t++) {
+            out[t].ms = fused_ms;
+        }
+        if (depth_prof && ++prof_frames % 100 == 0) {
+            fprintf(stderr,
+                    "[MM3-Depth] FUSED prof over %d frames (%lld take%s): upload %.2f + compute %.2f + readback "
+                    "%.2f + host %.2f = %.2f ms/frame\n",
+                    prof_frames, (long long) K, K == 1 ? "" : "s", prof_up / prof_frames, prof_comp / prof_frames,
+                    prof_down / prof_frames, prof_host / prof_frames,
+                    (prof_up + prof_comp + prof_down + prof_host) / prof_frames);
+        }
+        return true;
+    }
+
     for (int cb = 1; cb <= NC; cb++) {
         MM3DepthStep * s = &g_mm3_depth.step[cb - 1];
 
