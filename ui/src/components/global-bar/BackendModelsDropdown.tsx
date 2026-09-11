@@ -54,7 +54,9 @@ export const BackendModelsDropdown: React.FC = () => {
   const ditRuntime = (capabilities?.core as { dit_runtime?: Mm3DitRuntime } | undefined)?.dit_runtime;
   const backendParams = useGlobalParamsStore(s => s.backendParams) as Record<string, unknown> | undefined;
   const setBackendParam = useGlobalParamsStore(s => s.setBackendParam) as (key: string, v: unknown) => void;
-  const ditBackend = (backendParams?.mm3DitBackend as 'ggml' | 'tensorrt' | undefined) ?? 'ggml';
+  // Unset = "TensorRT when available", which is what the server resolves too.
+  const ditBackend = (backendParams?.mm3DitBackend as 'ggml' | 'tensorrt' | undefined)
+    ?? (ditRuntime?.available ? 'tensorrt' : 'ggml');
 
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);

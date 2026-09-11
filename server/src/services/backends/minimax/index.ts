@@ -315,6 +315,15 @@ async function capabilities(): Promise<BackendCapabilities> {
     // validates params.mm3DitBackend unchanged.
     extensions: [
       {
+        key: 'mm3DepthFused',
+        type: 'toggle',
+        label: 'Fused Depth Decoder',
+        hint: 'Run the planner\'s seven acoustic codebook passes as one GPU graph with '
+            + 'on-device sampling: about 9% faster planning with the same musical '
+            + 'distribution. Off restores the original seven-step, host-sampled path.',
+        default: true,
+      },
+      {
         key: 'mm3Steps',
         type: 'slider',
         label: 'Flow Steps',

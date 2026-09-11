@@ -275,8 +275,11 @@ export interface MinimaxParamMapping {
  */
 export function mapMinimaxParams(params: any): MinimaxParamMapping {
   const notes: string[] = [];
-  const requestedDitBackend = params.mm3DitBackend ?? 'ggml';
-  if (requestedDitBackend !== 'ggml' && requestedDitBackend !== 'tensorrt') {
+  // Unset means "TensorRT when this machine can, else GGML": resolved in
+  // runMinimaxGeneration against live /mm3/props, because availability is
+  // engine state (DLLs, downloaded graph, CUDA), not a UI preference.
+  const requestedDitBackend = params.mm3DitBackend ?? 'auto';
+  if (requestedDitBackend !== 'ggml' && requestedDitBackend !== 'tensorrt' && requestedDitBackend !== 'auto') {
     throw new Error(`Invalid MM3 renderer: ${String(requestedDitBackend)}`);
   }
 
@@ -440,6 +443,7 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
   return {
     req: {
       dit_backend: requestedDitBackend,
+      depth_fused: params.mm3DepthFused === undefined ? true : Boolean(params.mm3DepthFused),
       caption,
       lyrics,
       duration: Math.round(duration * 1000) / 1000,
@@ -841,7 +845,10 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
       throw new Error('MiniMax-Music3 needs a caption — the Style Description field is empty');
     }
 
-    if (req.dit_backend === 'tensorrt') {
+    if (req.dit_backend === 'auto') {
+      const runtime = (await mm3Props()).props?.dit_runtime;
+      req.dit_backend = runtime?.available === true ? 'tensorrt' : 'ggml';
+    } else if (req.dit_backend === 'tensorrt') {
       const runtime = (await mm3Props()).props?.dit_runtime;
       if (runtime?.available !== true) {
         throw new Error(

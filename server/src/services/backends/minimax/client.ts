@@ -165,7 +165,9 @@ export interface Mm3PropsResult {
 
 export interface Mm3SynthRequest {
   /** DiT renderer. GGML is the portable default; TensorRT needs a prepared engine. */
-  dit_backend?: 'ggml' | 'tensorrt';
+  dit_backend?: 'ggml' | 'tensorrt' | 'auto';
+  /** Depth decoder: fused one-graph frame with GPU sampling (default true). */
+  depth_fused?: boolean;
   /** REQUIRED, non-blank. The Structured Caption (see .claude/skills/mm3-captioning). */
   caption: string;
   /** "" (or omitted) → the engine substitutes its instrumental lyric. */

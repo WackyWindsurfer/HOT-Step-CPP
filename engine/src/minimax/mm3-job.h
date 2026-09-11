@@ -685,7 +685,9 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
         mm3_free_rest(&g_mm3);
         g_mm3.dit_backend = req.dit_backend;
     }
-    fprintf(stderr, "[MM3-Job] %s: renderer=%s\n", job->id.c_str(), g_mm3.dit_backend.c_str());
+    g_mm3.depth_fused = req.depth_fused;
+    fprintf(stderr, "[MM3-Job] %s: renderer=%s, depth=%s\n", job->id.c_str(), g_mm3.dit_backend.c_str(),
+            req.depth_fused ? "fused" : "stepped");
 
     // ── AR cache lookup ─────────────────────────────────────────────────────
     //

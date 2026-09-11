@@ -710,13 +710,19 @@ static bool mm3_depth_prepare(const MM3Model & m, MM3DepthGraph * g, std::string
 
 // ── Fused frame graph (opt-in) ──────────────────────────────────────────────
 
-// MM3_DEPTH_FUSED=1 — read ONCE per process, like every other MM3_* knob.
-static bool mm3_depth_fused_on() {
-    static const bool on = [] {
+// The fused frame is the default since 2026-09-11 (measured ~9% off AR, ear
+// pair judged fine). Per request: `depth_fused` (MM3Model::depth_fused, set by
+// the job from the request). MM3_DEPTH_FUSED=0|1 forces it either way for the
+// whole process, for A/B runs.
+static bool mm3_depth_fused_on(const MM3Model & m) {
+    static const int forced = [] {
         const char * e = std::getenv("MM3_DEPTH_FUSED");
-        return e && e[0] && e[0] != '0';
+        if (!e || !e[0]) {
+            return -1;
+        }
+        return e[0] == '0' ? 0 : 1;
     }();
-    return on;
+    return forced >= 0 ? forced == 1 : m.depth_fused;
 }
 
 // Build the one-graph frame. Assumes mm3_depth_prepare has already run: the
@@ -1119,7 +1125,7 @@ static bool mm3_depth_decode_takes(const MM3Model & m, const float * lm_hidden_r
     // fused graph has no forced-feedback input to give them to. Everything else
     // — greedy and top-k, one take or K, CFG or guidance-baked — goes through
     // here, and fills MM3DepthFrame to the same contract.
-    if (mm3_depth_fused_on() && !forced_codes) {
+    if (mm3_depth_fused_on(m) && !forced_codes) {
         const bool greedy = rngs == nullptr;
         if (!mm3_depth_prepare_fused(m, &g_mm3_depth, top_k, cfg, greedy, err)) {
             return false;

@@ -3792,9 +3792,7 @@
       "sizeBytes": 2030122,
       "repo": "scragnog/MiniMax-Music3-GGUF",
       "description": "The MiniMax-Music3 Flow DiT exported as a TensorRT graph — network structure only, no meaningful weights of its own. On first use per GPU, the engine builds a GPU- and TensorRT-version-specific engine from this graph (one time, a few minutes; cached under models/mm3/mm3-trt-cache/). Every weight is then refit at load time from whichever DiT GGUF quant you already have selected (F16/F32 direct, quantized ones dequantized on the fly), so installing this does not replace your DiT choice. Needs the TensorRT runtime entries below — the core pair plus the ONE builder resource DLL matching your GPU's compute capability (SM); without those TensorRT stays unavailable and generation falls back to the GGML renderer.",
-      "tags": [
-        "pending-upload"
-      ],
+      "tags": [],
       "companions": [
         {
           "filename": "mm3-dit-trt.engine.json"

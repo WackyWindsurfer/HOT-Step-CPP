@@ -496,6 +496,8 @@ struct MM3Model {
     // TensorRT keeps the DiT's merge sources on CPU, avoiding duplicate GPU weights.
     WeightCtx      wctx_dit_cpu   = {};
     std::string    dit_backend    = "ggml";
+    // Depth decoder fused frame graph (mm3-depth-graph.h note E); per request.
+    bool           depth_fused    = true;
     mutable std::shared_ptr<MM3DitRuntime> dit_runtime;
     size_t         vram_lm        = 0;
     size_t         vram_depth     = 0;

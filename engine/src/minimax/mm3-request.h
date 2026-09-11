@@ -542,6 +542,9 @@ static std::string mm3_assemble_prompt(const std::string & caption, const std::s
 // attached.
 struct MM3SynthRequest {
     std::string dit_backend = "ggml";
+    // Depth decoder: one fused graph per frame with GPU sampling (default)
+    // or the seven-step host-sampled path (mm3-depth-graph.h design note E).
+    bool        depth_fused = true;
     std::string caption;
     std::string lyrics;
     bool        instrumental = false;
@@ -722,6 +725,16 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
     if (out->dit_backend != "ggml" && out->dit_backend != "tensorrt") {
         if (err) *err = "dit_backend must be ggml or tensorrt";
         return false;
+    }
+    {
+        yyjson_val * v = yyjson_obj_get(root, "depth_fused");
+        if (v && !yyjson_is_null(v)) {
+            if (!yyjson_is_bool(v)) {
+                if (err) *err = "\"depth_fused\" must be a boolean";
+                return false;
+            }
+            out->depth_fused = yyjson_get_bool(v);
+        }
     }
     if (!mm3_req_str(root, "caption", &out->caption, &present, err)) {
         return false;
