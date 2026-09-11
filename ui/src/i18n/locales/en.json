@@ -792,6 +792,8 @@
     "globalBar.mm3LmAdapter": "LM Adapter",
     "globalBar.mm3LmAdapterNone": "None — base model",
     "globalBar.mm3LmAdapterHint": "A LoRA on the MiniMax-Music3 planner LM — artist identity lives here. Applied at runtime, so these strengths are live per generation. An adapter that fails to load fails the job rather than silently rendering the base model.",
+    "globalBar.mm3LmMergeGpu": "GPU merging",
+    "globalBar.mm3LmMergeGpuHint": "Use the GPU for adapter merging. Turn off to use CPU-assisted merging. Unsupported GPU formats fall back automatically.",
     "globalBar.mm3LmNone": "No MiniMax-Music3 LM adapters installed. Drop a PEFT .safetensors (and an optional .json sidecar) into the folder below and reopen this panel.",
     "globalBar.mm3LmListFailed": "Adapter list unavailable",
     "globalBar.mm3LmTrigger": "Trigger",

@@ -67,16 +67,19 @@
 
 // Identity of one merge: adapter path + mtime + every scale dial. Compared
 // against MM3Model::lm_merge_tag to decide "already merged" vs "reload first".
-static bool mm3_lm_merge_device_enabled() {
+static bool mm3_lm_merge_device_enabled(bool requested_gpu = true) {
     const char * value = std::getenv("MM3_MERGE_DEVICE");
-    return value && std::strcmp(value, "1") == 0;
+    // The request defaults to GPU. Retain process-level CPU/verification
+    // overrides for diagnostics; an explicit CPU request always stays CPU.
+    return requested_gpu && (!value || (std::strcmp(value, "0") != 0 && std::strcmp(value, "verify") != 0));
 }
 
-static std::string mm3_lm_merge_make_tag(const std::string & path, int64_t mtime, const MM3LmAdapterScales & s) {
+static std::string mm3_lm_merge_make_tag(const std::string & path, int64_t mtime, const MM3LmAdapterScales & s,
+                                       bool requested_gpu) {
     char buf[128];
     snprintf(buf, sizeof(buf), "|%lld|%.6g|%.6g|%.6g|%.6g|%.6g|%.6g", (long long) mtime, (double) s.global,
              (double) s.attn, (double) s.mlp, (double) s.early, (double) s.mid, (double) s.late);
-    return path + buf + (mm3_lm_merge_device_enabled() ? "|device-experimental" : "|host-reference");
+    return path + buf + (mm3_lm_merge_device_enabled(requested_gpu) ? "|device-experimental" : "|host-reference");
 }
 
 // The base LM tensor an adapter module targets.
@@ -128,7 +131,7 @@ static size_t mm3_lm_merge_quantize(ggml_type type, const float * src, void * ds
 }
 
 static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3LmAdapterScales & sc,
-                               std::string * err) {
+                               bool requested_gpu, std::string * err) {
     if (!m->lm_resident) {
         if (err) {
             *err = "the LM is not resident; merge must run after warm";
@@ -158,11 +161,13 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
     int                  n_merged  = 0;
     size_t               moved     = 0;
     bool                 ok        = true;
-    // Experimental until byte parity is measured on the merged F32 tensors.
+    // GPU quantization has different rounding from the CPU reference path.
     // 'verify' computes both paths but writes the CPU reference weights.
     const char * device_env = std::getenv("MM3_MERGE_DEVICE");
-    const bool verify_device = device_env && std::strcmp(device_env, "verify") == 0;
-    const bool want_device = verify_device || mm3_lm_merge_device_enabled();
+    const bool verify_device = requested_gpu && device_env && std::strcmp(device_env, "verify") == 0;
+    const bool want_device = verify_device || mm3_lm_merge_device_enabled(requested_gpu);
+    fprintf(stderr, "[MM3] LM merge policy: %s\n", verify_device ? "GPU verification (CPU weights written)" :
+            want_device ? "GPU preferred (CPU-assisted fallback)" : "CPU-assisted");
     int n_device = 0, n_verified = 0;
     size_t mismatched_bytes = 0;
     std::vector<uint8_t> device_bytes;

@@ -452,7 +452,7 @@ static void mm3_ar_key_add_models(std::string & k, const MM3Model & m, const MM3
         add_s("ad_mode", req.lm_adapter_mode);
         // GPU requantization changes rounding. A saved hidden block or a
         // resident merge must not cross that numerical policy boundary.
-        add_i("ad_device", req.lm_adapter_mode == "merge" && mm3_lm_merge_device_enabled() ? 1 : 0);
+        add_i("ad_device", req.lm_adapter_mode == "merge" && mm3_lm_merge_device_enabled(req.lm_adapter_merge_gpu) ? 1 : 0);
         add_i("ad_soft_off", req.lm_soft_off ? 1 : 0);  // a token-off plan is not a token-on plan
         const MM3LmAdapterScales & s = req.lm_adapter_scales;
         add_f("ad_g", s.global); add_f("ad_a", s.attn);  add_f("ad_m", s.mlp);
@@ -971,7 +971,7 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
         std::string want_tag;  // "" = this render wants a pristine base
         if (merge_mode) {
             want_tag = mm3_lm_merge_make_tag(req.lm_adapter, stat_ok ? (int64_t) asb.st_mtime : 0,
-                                             req.gen.lm_adapter_scales);
+                                             req.gen.lm_adapter_scales, req.lm_adapter_merge_gpu);
         }
         if (g_mm3.lm_merge_tag != want_tag && !g_mm3.lm_merge_tag.empty()) {
             // Something else is baked into the resident LM — reload pristine.
@@ -1007,7 +1007,8 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
                 if (g_mm3.lm_merge_tag != want_tag) {
                     set_stage("merging", -1, 0, 0, 0);
                     std::string merr;
-                    if (!mm3_lm_merge_apply(&g_mm3, g_mm3_lm_adapter, req.gen.lm_adapter_scales, &merr)) {
+                    if (!mm3_lm_merge_apply(&g_mm3, g_mm3_lm_adapter, req.gen.lm_adapter_scales,
+                                            req.lm_adapter_merge_gpu, &merr)) {
                         // A part-way merge leaves mixed weights — drop the LM so
                         // the next generation reloads a pristine base.
                         mm3_lm_free(&g_mm3_lm);

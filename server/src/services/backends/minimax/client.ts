@@ -243,6 +243,10 @@ export interface Mm3SynthRequest {
    *  rename), so an interrupted save leaves any previous file intact. */
   frame_hiddens_save_path?: string;
 
+  /** Merge-mode LM adapter writeback. Defaults to GPU with CPU fallback;
+   * false selects CPU-assisted reference quantization. */
+  lm_adapter_merge_gpu?: boolean;
+
   // ── Sampler plugins (engine: minimax/mm3-plugins.h) ───────────────────────
   // The SAME Lua solver/scheduler/guidance plugins the ACE DiT uses, driving
   // MM3's flow DiT through a convention adapter. Field names are ACE's, so one

@@ -38,6 +38,7 @@ const inputClasses =
 const PARAM = {
   adapter: 'mm3LmAdapter',
   mode:    'mm3LmAdapterMode',
+  mergeGpu: 'mm3LmMergeGpu',
   scale:   'mm3LmAdapterScale',
   attn:    'mm3LmAdapterScaleAttn',
   mlp:     'mm3LmAdapterScaleMlp',
@@ -276,6 +277,22 @@ export const Mm3LmAdapterDropdown: React.FC = () => {
       {/* ── Strength dials ── */}
       {selected && (
         <>
+          {String(params[PARAM.mode] ?? 'runtime') === 'merge' && (
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={params[PARAM.mergeGpu] !== false}
+                onChange={e => setBackendParam(PARAM.mergeGpu, e.target.checked)}
+                className="mt-0.5 accent-emerald-500"
+              />
+              <ParamLabel
+                label={t('globalBar.mm3LmMergeGpu', 'GPU merging')}
+                info={t('globalBar.mm3LmMergeGpuHint',
+                  'Use the GPU for adapter merging. Turn off to use CPU-assisted merging. Unsupported GPU formats fall back automatically.')}
+                className="text-xs text-zinc-600 dark:text-zinc-400"
+              />
+            </label>
+          )}
           <Slider
             label={t('globalBar.mm3LmStrength', 'Strength')}
             value={num(PARAM.scale, defaults.scale)}

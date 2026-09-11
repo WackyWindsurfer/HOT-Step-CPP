@@ -627,6 +627,8 @@ struct MM3SynthRequest {
     // at r256. "merge" = fold scale·B·A into the resident weights once
     // (mm3-lm-merge.h) — zero per-step cost, scale changes re-merge.
     std::string        lm_adapter_mode = "runtime";
+    // Prefer GPU writeback in merge mode; false retains CPU-assisted merging.
+    bool               lm_adapter_merge_gpu = true;
     // A/B switch for the soft-prompt halves (artist token, trained KV prefix):
     // true runs the adapter's weight delta ALONE — same weights, same seed, no
     // token, no prefix — so the only difference between the two arms is the
@@ -1024,6 +1026,14 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
                 return false;
             }
             out->lm_adapter_mode = mode;
+        }
+        yyjson_val * gpu_merge = yyjson_obj_get(root, "lm_adapter_merge_gpu");
+        if (gpu_merge && !yyjson_is_null(gpu_merge)) {
+            if (!yyjson_is_bool(gpu_merge)) {
+                if (err) *err = "\"lm_adapter_merge_gpu\" must be a boolean";
+                return false;
+            }
+            out->lm_adapter_merge_gpu = yyjson_get_bool(gpu_merge);
         }
         // Read by VALUE, not by presence: a client that serialises its whole
         // option struct sends "lm_soft_off": false for the normal arm.

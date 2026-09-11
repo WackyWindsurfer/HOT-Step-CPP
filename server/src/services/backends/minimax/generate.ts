@@ -593,9 +593,12 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
         // weights once — zero per-step cost; scale changes re-merge).
         const mode = params.mm3LmAdapterMode === 'merge' ? 'merge' : 'runtime';
         notes.push(`LM adapter: ${path.basename(resolved)} (${mode})`);
+        const mergeGpu = params.mm3LmMergeGpu !== false;
+        if (mode === 'merge') notes.push(`LM adapter merging: ${mergeGpu ? 'GPU preferred' : 'CPU-assisted'}`);
         return {
           lm_adapter: resolved,
           lm_adapter_mode: mode,
+          lm_adapter_merge_gpu: mergeGpu,
           lm_adapter_scale: dial('mm3LmAdapterScale', d.scale),
           lm_adapter_scale_attn: dial('mm3LmAdapterScaleAttn', d.scaleAttn),
           lm_adapter_scale_mlp: dial('mm3LmAdapterScaleMlp', d.scaleMlp),
