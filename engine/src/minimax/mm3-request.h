@@ -541,6 +541,7 @@ static std::string mm3_assemble_prompt(const std::string & caption, const std::s
 // defaults. `gen` is ready to hand to mm3_generate() once a cancel hook is
 // attached.
 struct MM3SynthRequest {
+    std::string dit_backend = "ggml";
     std::string caption;
     std::string lyrics;
     bool        instrumental = false;
@@ -716,6 +717,12 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
     *out = MM3SynthRequest{};
 
     bool present = false;
+    if (!mm3_req_str(root, "dit_backend", &out->dit_backend, &present, err)) return false;
+    if (!present) out->dit_backend = "ggml";
+    if (out->dit_backend != "ggml" && out->dit_backend != "tensorrt") {
+        if (err) *err = "dit_backend must be ggml or tensorrt";
+        return false;
+    }
     if (!mm3_req_str(root, "caption", &out->caption, &present, err)) {
         return false;
     }

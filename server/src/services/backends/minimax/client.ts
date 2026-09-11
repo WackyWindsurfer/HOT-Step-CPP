@@ -43,6 +43,13 @@ export interface Mm3PropsFile {
   [k: string]: unknown;
 }
 
+export interface Mm3DitRuntime {
+  supported: boolean;
+  available: boolean;
+  backend: 'ggml' | 'tensorrt' | string;
+  reason: string;
+}
+
 /** One mm3-{lm,synth}-<quant>.gguf found on disk. `quant` is the filename
  *  token verbatim ('f16' | 'q8_0' | 'Q4_K_M' | ...) and is the authoritative
  *  label — general.file_type is display-only and unassigned for some quants. */
@@ -85,6 +92,7 @@ export interface Mm3Props {
   };
   vram?: Record<string, number>;
   errors?: string[];
+  dit_runtime?: Mm3DitRuntime;
   [k: string]: unknown;
 }
 
@@ -129,6 +137,8 @@ export interface Mm3PropsResult {
 }
 
 export interface Mm3SynthRequest {
+  /** DiT renderer. GGML is the portable default; TensorRT needs a prepared engine. */
+  dit_backend?: 'ggml' | 'tensorrt';
   /** REQUIRED, non-blank. The Structured Caption (see .claude/skills/mm3-captioning). */
   caption: string;
   /** "" (or omitted) → the engine substitutes its instrumental lyric. */

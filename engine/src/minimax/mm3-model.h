@@ -55,6 +55,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -440,6 +441,15 @@ struct MM3Variant {
 
 // ── The model ───────────────────────────────────────────────────────────────
 
+// Optional native DiT owns its allocations independently from GGML graphs.
+// Keeping the interface CUDA-free preserves CPU/Vulkan/Metal builds.
+struct MM3DitRuntime {
+    virtual ~MM3DitRuntime() = default;
+    virtual size_t gpu_bytes() const = 0;
+    virtual bool run(const float * x, const float * cond, float gate, float t, int64_t L,
+                     float * out_c, float * out_u, std::string * err) = 0;
+};
+
 struct MM3Model {
     // discovery + probe (populated at server start, cheap, header-only)
     std::string              models_dir;
@@ -483,6 +493,10 @@ struct MM3Model {
     WeightCtx      wctx_lm        = {};
     WeightCtx      wctx_depth     = {};
     WeightCtx      wctx_synth     = {};   // cond + dit + voc
+    // TensorRT keeps the DiT's merge sources on CPU, avoiding duplicate GPU weights.
+    WeightCtx      wctx_dit_cpu   = {};
+    std::string    dit_backend    = "ggml";
+    mutable std::shared_ptr<MM3DitRuntime> dit_runtime;
     size_t         vram_lm        = 0;
     size_t         vram_depth     = 0;
     size_t         vram_synth     = 0;
@@ -1357,6 +1371,10 @@ static bool mm3_load_rest_tensors(MM3Model * m, const GGUFModel & gf_cond, const
 
     // ── dit ──
     ld.gf = &gf_dit;
+    if (m->dit_backend == "tensorrt") {
+        wctx_init(&m->wctx_dit_cpu, n_dit);
+        ld.wctx = &m->wctx_dit_cpu;
+    }
     {
         const MM3DitConfig & t  = c.dit;
         const int64_t        E  = t.embedding_length;
@@ -1394,6 +1412,7 @@ static bool mm3_load_rest_tensors(MM3Model * m, const GGUFModel & gf_cond, const
 
     // ── voc ── channel ladder hidden_dim >> B, strides from upsample_rates
     ld.gf = &gf_voc;
+    ld.wctx = &m->wctx_synth;
     {
         const MM3VocConfig & v  = c.voc;
         const int            NB = (int) v.upsample_rates.size();
@@ -1441,16 +1460,20 @@ static bool mm3_load_rest_tensors(MM3Model * m, const GGUFModel & gf_cond, const
 // Weight bytes currently resident across all three parts. Excludes the AR KV
 // cache, which is a separate allocation owned by the LM graph state.
 static size_t mm3_vram_bytes(const MM3Model & m) {
-    return m.vram_lm + m.vram_depth + m.vram_synth;
+    return m.vram_lm + m.vram_depth + m.vram_synth + (m.dit_runtime ? m.dit_runtime->gpu_bytes() : 0);
 }
 
 static void mm3_unload(MM3Model * m) {
-    if (!m->loaded && !m->wctx_lm.ctx && !m->wctx_depth.ctx && !m->wctx_synth.ctx) {
+    m->dit_runtime.reset();
+    if (!m->backend_ref && !m->loaded && !m->wctx_lm.ctx && !m->wctx_depth.ctx && !m->wctx_synth.ctx && !m->wctx_dit_cpu.ctx) {
         return;
     }
     wctx_free(&m->wctx_lm);
     wctx_free(&m->wctx_depth);
     wctx_free(&m->wctx_synth);
+    wctx_free(&m->wctx_dit_cpu);
+    m->wctx_dit_cpu.pending.clear();
+    m->wctx_dit_cpu.staging.clear();
     m->lm    = MM3LmWeights{};
     m->synth = MM3SynthWeights{};
     m->tmap_lm.clear();
@@ -1608,7 +1631,8 @@ static void mm3_apply_adapters(MM3Model * m, const GGUFModel & gf_sy) {
 
     int total = 0;
     for (const std::string & p : paths) {
-        const int n = mm3_adapter_merge(&m->wctx_synth, gf_sy, p.c_str(), scale, m->backend);
+        WeightCtx * weights = m->dit_backend == "tensorrt" ? &m->wctx_dit_cpu : &m->wctx_synth;
+        const int n = mm3_adapter_merge(weights, gf_sy, p.c_str(), scale, m->backend);
         if (n > 0) {
             total += n;
             if (!m->rest_adapter_desc.empty()) {
@@ -1738,7 +1762,11 @@ static bool mm3_load_parts(MM3Model * m, bool want_lm, bool want_depth, bool wan
             // wctx_alloc then uploads already-adapted weights and no
             // extra VRAM or second pass is needed. It reads the DiT's file.
             mm3_apply_adapters(m, *gf_dit);
-            ok = wctx_alloc(&m->wctx_synth, m->backend);
+            if (m->dit_backend == "tensorrt" && !wctx_alloc(&m->wctx_dit_cpu, m->cpu_backend)) {
+                errs.push_back("CPU allocation failed for TensorRT DiT merge sources");
+                ok = false;
+            }
+            ok = ok && wctx_alloc(&m->wctx_synth, m->backend);
             if (!ok) {
                 errs.push_back("backend buffer allocation failed for the synth stack (out of VRAM?)");
             }
@@ -1826,6 +1854,10 @@ static void mm3_free_depth(MM3Model * m) {
 // Drop ONLY cond+dit+voc (the stage-2 buffer). The cheap reload path behind a
 // DiT quant or adapter change: LM and depth stay warm.
 static void mm3_free_rest(MM3Model * m) {
+    m->dit_runtime.reset();
+    wctx_free(&m->wctx_dit_cpu);
+    m->wctx_dit_cpu.pending.clear();
+    m->wctx_dit_cpu.staging.clear();
     if (!m->rest_resident) {
         return;
     }

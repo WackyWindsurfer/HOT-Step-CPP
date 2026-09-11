@@ -296,6 +296,21 @@ async function capabilities(): Promise<BackendCapabilities> {
     // generically by the existing PluginControls schema renderer.
     extensions: [
       {
+        key: 'mm3DitBackend',
+        type: 'select',
+        label: 'Renderer',
+        hint: props?.dit_runtime?.available === true
+          ? 'GGML is the portable default. TensorRT uses the prepared native CUDA engine.'
+          : `GGML is available. TensorRT is unavailable${props?.dit_runtime?.reason ? `: ${props.dit_runtime.reason}` : ' until a native engine is prepared.'}`,
+        default: 'ggml',
+        options: [
+          { value: 'ggml', label: 'GGML' },
+          ...(props?.dit_runtime?.available === true
+            ? [{ value: 'tensorrt', label: 'TensorRT (native CUDA)' }]
+            : []),
+        ],
+      },
+      {
         key: 'mm3Steps',
         type: 'slider',
         label: 'Flow Steps',

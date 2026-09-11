@@ -144,6 +144,7 @@
 // is a third of the error the reference itself ships with. Not worth buying back.
 
 #include "mm3-model.h"
+#include "mm3-dit-trt.h"
 
 #include "backend.h"
 #include "ggml.h"
@@ -283,6 +284,9 @@ static bool mm3_dit_prepare(const MM3Model & m, MM3DitGraph * g, std::string * e
             *err = "MiniMax-Music3 is not warm (POST /mm3/warm first)";
         }
         return false;
+    }
+    if (m.dit_backend == "tensorrt") {
+        return mm3_trt_prepare(m, err);
     }
     const void * token = (const void *) m.wctx_synth.buffer;
     if (g->weights_token == token && g->sched) {
@@ -607,6 +611,9 @@ static MM3DitGraph g_mm3_dit;
 // Not thread-safe: the caller serialises (mm3-server.h holds g_mm3_mutex).
 static bool mm3_dit_run(const MM3Model & m, MM3DitGraph * g, const float * latents, const float * cond, float gate,
                         float t, int64_t L, float * out, std::string * err) {
+    if (m.dit_backend == "tensorrt") {
+        return mm3_trt_run(m, latents, cond, gate, t, L, out, nullptr, err);
+    }
     if (!mm3_dit_ensure_graph(m, g, L, 1, err)) {
         return false;
     }
@@ -659,6 +666,9 @@ static bool mm3_dit_run(const MM3Model & m, MM3DitGraph * g, const float * laten
 // row 1 -> out_u (unconditional). The 2.4B weights stream once instead of twice.
 static bool mm3_dit_run_cfg2(const MM3Model & m, MM3DitGraph * g, const float * latents, const float * cond, float t,
                              int64_t L, float * out_c, float * out_u, std::string * err) {
+    if (m.dit_backend == "tensorrt") {
+        return mm3_trt_run(m, latents, cond, 1.0f, t, L, out_c, out_u, err);
+    }
     if (!mm3_dit_ensure_graph(m, g, L, 2, err)) {
         return false;
     }

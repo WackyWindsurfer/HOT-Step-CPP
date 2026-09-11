@@ -288,13 +288,12 @@ static bool mm3_flow_sample_chunk(const MM3Model & m, const float * noise, const
     const bool use_plugins = plugins && plugins->active;
 
     // Batched CFG (mm3-dit-graph.h design note B): both branches in one graph
-    // compute. Opt-in via MM3_DIT_CFG_BATCH=1 — measured SLOWER than two-pass
-    // (see the note), kept for re-testing on future ggml versions. Disabled
-    // for post_step guidance plugins regardless — those evaluate ONE branch at
-    // a time through the B=1 graph, and alternating B=2/B=1 computes would
-    // rebuild the graph twice per step.
+    // compute. GGML opts in via MM3_DIT_CFG_BATCH=1; its measured two-pass path
+    // is faster. TensorRT batches by default unless guidance-delta caching was
+    // requested. post_step guidance keeps single-branch evaluations on either
+    // backend; on GGML this also avoids rebuilding between B=2 and B=1.
     const bool wants_post_step = use_plugins && plugins->guidance && plugins->guidance->has_post_step;
-    const bool batched_cfg     = mm3_dit_cfg_batched() && !wants_post_step;
+    const bool batched_cfg     = (m.dit_backend == "tensorrt" ? uncond_interval <= 1 : mm3_dit_cfg_batched()) && !wants_post_step;
 
     // -- CFG guidance-delta cache --------------------------------------------
     //

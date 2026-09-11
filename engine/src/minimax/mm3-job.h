@@ -316,6 +316,9 @@ static size_t mm3_kv_bytes_estimate(const MM3Model & m, int64_t n_ctx_needed) {
 // VRAM this run will not touch.
 static size_t mm3_vram_need(const MM3Model & m, int64_t n_ctx_needed, bool stage2_only = false) {
     uint64_t weights = mm3_total_tensor_bytes(m);
+    // TensorRT uses BF16 weights plus its execution context; reserve additional
+    // workspace before deciding whether planner/render streaming can co-reside.
+    if (m.dit_backend == "tensorrt") weights += 1024ULL * 1024 * 1024;
     if (stage2_only) {
         weights -= m.lm_file.found ? m.lm_file.tensor_bytes : 0;  // the LM is never a role file
         return (size_t) weights + MM3_VRAM_COMPUTE_HEADROOM;
@@ -669,6 +672,22 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     // the one worker thread.
     std::lock_guard<std::mutex> mm3_lock(g_mm3_mutex);
     holds_mm3_lock = true;
+
+    if (req.dit_backend == "tensorrt") {
+        std::string reason;
+        if (!mm3_trt_available(g_mm3, &reason)) { fail(2, "failed", reason); return; }
+        if (g_mm3.role_file[MM3_R_DIT].file_type != 1 && g_mm3.role_file[MM3_R_DIT].file_type != 0) {
+            fail(2, "failed", "TensorRT requires the F16 or F32 DiT model; select it in Models first"); return;
+        }
+    }
+    if (g_mm3.dit_backend != req.dit_backend) {
+        mm3_vocoder_free(&g_mm3_voc);
+        mm3_cond_free(&g_mm3_cond);
+        mm3_dit_free(&g_mm3_dit);
+        mm3_free_rest(&g_mm3);
+        g_mm3.dit_backend = req.dit_backend;
+    }
+    fprintf(stderr, "[MM3-Job] %s: renderer=%s\n", job->id.c_str(), g_mm3.dit_backend.c_str());
 
     // ── AR cache lookup ─────────────────────────────────────────────────────
     //

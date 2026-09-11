@@ -304,6 +304,21 @@ static void mm3_handle_props(const httplib::Request &, httplib::Response & res) 
     yyjson_mut_obj_add_bool(doc, root, "available", mm3_available(g_mm3));
     yyjson_mut_obj_add_bool(doc, root, "loaded", g_mm3.loaded);
     yyjson_mut_obj_add_strcpy(doc, root, "models_dir", g_mm3.models_dir.c_str());
+    {
+        yyjson_mut_val * rt = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_val(doc, root, "dit_runtime", rt);
+#ifdef HOT_STEP_TRT
+        yyjson_mut_obj_add_bool(doc, rt, "supported", true);
+#else
+        yyjson_mut_obj_add_bool(doc, rt, "supported", false);
+#endif
+        std::string reason;
+        const bool available = mm3_trt_available(g_mm3, &reason);
+        yyjson_mut_obj_add_bool(doc, rt, "available", available);
+        yyjson_mut_obj_add_strcpy(doc, rt, "backend", g_mm3.dit_backend.c_str());
+        yyjson_mut_obj_add_strcpy(doc, rt, "reason", reason.c_str());
+        yyjson_mut_obj_add_real(doc, rt, "gpu_mb", g_mm3.dit_runtime ? double(g_mm3.dit_runtime->gpu_bytes()) / 1048576 : 0);
+    }
 
     // synth_ready: every role's GGUF found AND its header parsed clean, i.e.
     // POST /mm3/synth will get as far as loading weights. Deliberately NOT a

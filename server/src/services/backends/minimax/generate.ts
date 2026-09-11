@@ -58,7 +58,7 @@ import {
   finishGenerationLog, failGenerationLog,
 } from '../../logger.js';
 import {
-  mm3Synth, mm3JobDetail, mm3TokenizeCheck, mm3Unload,
+  mm3Synth, mm3JobDetail, mm3TokenizeCheck, mm3Unload, mm3Props,
   type Mm3SynthRequest, type Mm3JobDetail,
 } from './client.js';
 import type { GenerationJob, StageTiming } from '../../../routes/generate.js';
@@ -275,6 +275,10 @@ export interface MinimaxParamMapping {
  */
 export function mapMinimaxParams(params: any): MinimaxParamMapping {
   const notes: string[] = [];
+  const requestedDitBackend = params.mm3DitBackend ?? 'ggml';
+  if (requestedDitBackend !== 'ggml' && requestedDitBackend !== 'tensorrt') {
+    throw new Error(`Invalid MM3 renderer: ${String(requestedDitBackend)}`);
+  }
 
   // Resolved up here rather than where the request's adapter fields are built,
   // because the trigger has to go into the caption and the caption is finished
@@ -435,6 +439,7 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
 
   return {
     req: {
+      dit_backend: requestedDitBackend,
       caption,
       lyrics,
       duration: Math.round(duration * 1000) / 1000,
@@ -835,6 +840,17 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
     if (!req.caption.trim()) {
       throw new Error('MiniMax-Music3 needs a caption — the Style Description field is empty');
     }
+
+    if (req.dit_backend === 'tensorrt') {
+      const runtime = (await mm3Props()).props?.dit_runtime;
+      if (runtime?.available !== true) {
+        throw new Error(
+          `TensorRT renderer is unavailable${runtime?.reason ? `: ${runtime.reason}` : ''}. `
+          + 'Choose GGML or prepare the native TensorRT engine.',
+        );
+      }
+    }
+    log('INFO', `[MM3] Renderer: ${req.dit_backend ?? 'ggml'}`);
 
     // ── Defensive arbitration is NOT needed here ──
     // The MM3 job evicts the ACE side itself, on the GPU worker thread, only
