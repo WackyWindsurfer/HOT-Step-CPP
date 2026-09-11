@@ -159,6 +159,9 @@ export interface Mm3SynthRequest {
    *  nothing may derive a song count or a seed list from the SUBMIT response on
    *  this path. */
   require_eos?: boolean;
+  /** Keep the candidate batch, but render only the first nonempty EOS take.
+   *  Only applies with require_eos; explicit variations leave this false. */
+  stop_after_first_eos?: boolean;
   /** Maximum planning rounds before the job fails. Only read when
    *  `require_eos` is set. */
   eos_rounds?: number;
@@ -354,6 +357,9 @@ export interface Mm3JobDetail {
   /** Candidates that hit the frame cap without an ending and were dropped
    *  before the flow stage. `takes_planned - takes_dropped` is `takes`. */
   takes_dropped?: number;
+  /** Dropped candidates that actually reached the frame ceiling. Other
+   *  dropped candidates were stopped or not selected after an EOS winner. */
+  takes_capped?: number;
   /** Per-take summary. Present whenever there is more than one take, and —
    *  since the ending arbitration — whenever `require_eos` was set, even for a
    *  single surviving take. Take t's audio is at

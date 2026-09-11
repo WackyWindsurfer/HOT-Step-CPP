@@ -442,12 +442,10 @@ async function capabilities(): Promise<BackendCapabilities> {
         key: 'mm3RequireEnding',
         type: 'toggle',
         label: 'Require Natural Ending',
-        hint: 'Plans 3 candidates from the seed; renders only the ones that end '
-            + 'naturally, re-plans with the next seeds if none do. Candidates that run '
-            + 'to the length ceiling without an ending are dropped before the flow '
-            + 'stage, so they cost planning time only — and you get one song per '
-            + 'candidate that ended, up to 3. Off renders whatever the planner '
-            + 'produced, endings included or not.',
+        hint: 'Plans candidates together. For one requested song, stops the batch '
+            + 'at the first natural ending and renders that song. Variations keep '
+            + 'all candidates that end. Re-plans with fresh seeds if none end before '
+            + 'the ceiling. Off renders the plan even if it reaches the ceiling.',
         default: true,
       },
       {

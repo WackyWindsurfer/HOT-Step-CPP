@@ -425,7 +425,10 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
     notes.push(
       `natural ending required: ${takes} candidate plans per round, up to ${MM3_ENDING_ROUNDS} rounds. `
       + `Candidates that reach the ${MM3_MAX_DURATION_SEC}s cap without an ending are dropped before the flow `
-      + `stage, so the number of songs this produces is 1..${takes} — whatever ended. `
+      + `stage. `
+      + (askedTakes === 1
+        ? 'The batch stops at the first natural ending and renders that one song. '
+        : `This produces 1..${takes} songs, depending on which candidates ended. `)
       + `Turn "Require Natural Ending" off to render whatever the planner produced.`,
     );
   }
@@ -501,7 +504,11 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
       // Natural endings. Omitted entirely when off, so turning the toggle off
       // gives back exactly the request this backend sent before the feature
       // existed.
-      ...(requireEnding ? { require_eos: true, eos_rounds: MM3_ENDING_ROUNDS } : {}),
+      ...(requireEnding ? {
+        require_eos: true,
+        eos_rounds: MM3_ENDING_ROUNDS,
+        ...(askedTakes === 1 ? { stop_after_first_eos: true } : {}),
+      } : {}),
       // MM3 Plank replay. A plank that will not load is a note, not a failure:
       // the render proceeds with a normal AR pass.
       ...(params.mm3PlankPath ? (() => {
@@ -968,7 +975,7 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
           const seeds = (d.take_detail ?? []).map((t: any) => String(t?.seed_str ?? t?.seed ?? '')).filter((s: string) => s.length > 0);
           if (survived !== job.mm3Takes) {
             log('INFO', `[MM3] Natural ending: ${survived} of ${d.takes_planned} candidate(s) ended and will render; `
-              + `${Number(d.takes_dropped ?? 0)} capped and dropped (round ${Number(d.eos_rounds_used ?? 1)})`);
+              + `${Number(d.takes_dropped ?? 0)} candidates dropped (round ${Number(d.eos_rounds_used ?? 1)})`);
           }
           job.mm3Takes = survived;
           if (seeds.length) job.mm3TakeSeeds = seeds;
@@ -1124,6 +1131,7 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
     if (req.require_eos) {
       const planned = Math.max(nTakes, Number(finalDetail?.takes_planned ?? req.takes ?? nTakes));
       const dropped = Number(finalDetail?.takes_dropped ?? Math.max(0, planned - nTakes));
+      const capped = Number(finalDetail?.takes_capped ?? dropped);
       const rounds  = Math.max(1, Number(finalDetail?.eos_rounds_used ?? 1));
       const seeds   = takeDetail
         .map(d => String(d?.seed_str ?? d?.seed ?? ''))
@@ -1135,8 +1143,8 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
       log('INFO',
         `[MM3] Natural ending: ${planned} ${plural(planned, 'candidate', 'candidates')} planned in `
         + `${rounds} ${plural(rounds, 'round', 'rounds')}, ${nTakes} ended and `
-        + `${plural(nTakes, 'was', 'were')} rendered, ${dropped} capped and `
-        + `${plural(dropped, 'was', 'were')} dropped`
+        + `${plural(nTakes, 'was', 'were')} rendered, ${capped} capped, `
+        + `${Math.max(0, dropped - capped)} other candidates not selected`
         + (seeds.length ? ` (seeds ${seeds.join(', ')})` : ''));
     }
     const audioUrls: string[] = [];

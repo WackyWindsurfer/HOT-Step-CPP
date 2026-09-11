@@ -601,6 +601,7 @@ struct MM3SynthRequest {
     int     takes  = 1;
     /** Natural-ending candidates: see MM3GenRequest::require_eos. */
     bool    require_eos = false;
+    bool    stop_after_first_eos = false;
     int     eos_rounds  = 4;
 
     // Replay previously-captured codes instead of sampling them. Both must be
@@ -896,6 +897,16 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
             out->require_eos = yyjson_get_bool(v);
         }
         yyjson_val * r = yyjson_obj_get(root, "eos_rounds");
+        yyjson_val * first = yyjson_obj_get(root, "stop_after_first_eos");
+        if (first && !yyjson_is_null(first)) {
+            if (!yyjson_is_bool(first)) {
+                if (err) {
+                    *err = "\"stop_after_first_eos\" must be a boolean";
+                }
+                return false;
+            }
+            out->stop_after_first_eos = yyjson_get_bool(first);
+        }
         if (r && !yyjson_is_null(r)) {
             if (!yyjson_is_int(r) || yyjson_get_sint(r) < 1 || yyjson_get_sint(r) > 16) {
                 if (err) {
@@ -1222,6 +1233,7 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
     out->gen.cfg_flow   = (float) cfg;
     out->gen.flow_uncond_interval = (int) llround(uncond_iv);
     out->gen.require_eos = out->require_eos;
+    out->gen.stop_after_first_eos = out->stop_after_first_eos;
     out->gen.eos_rounds  = out->eos_rounds;
     out->gen.plugins    = plug;
     // MM3 Plank replay. MM3GenRequest holds these by value, and the job worker

@@ -193,6 +193,7 @@ struct MM3ArResult {
     double  prefill_ms       = 0.0;
     double  lm_ms            = 0.0;  // decode steps only
     double  depth_ms         = 0.0;
+    int64_t depth_steps      = 0;  // shared batch calls, independent of take 0's length
     double  host_ms          = 0.0;  // masking, CFG, top-k, sampling
     double  total_ms         = 0.0;
     int64_t lm_steps         = 0;
@@ -235,6 +236,8 @@ struct MM3ArOptions {
     // ids back into the text lrc_align() groups into lines, so both are set
     // together or not at all.
     bool                  want_lrc = false;
+    bool                  lrc_eos_only = false;
+    bool                  stop_after_first_eos = false;
     const MM3Tokenizer *  tok      = nullptr;
 
     // Called after every emitted frame. Cheap; used for server-side progress.
@@ -636,6 +639,7 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
     std::vector<int32_t>       sem_code((size_t) K);
     std::vector<int64_t>       frames_done((size_t) K, 0);
     std::vector<char>          active((size_t) K, 1);
+    int                       first_eos_take = -1;
     std::vector<MM3DepthFrame> frames((size_t) K);
 
     for (int t = 0; t < K; t++) {
@@ -832,6 +836,21 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
         }
         out->host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_host0).count();
 
+        if (opt.stop_after_first_eos) {
+            // Every row has sampled. Same-step ties use the original take
+            // index; the winner has exactly the same draws as a full batch.
+            for (int t = 0; t < K; t++) {
+                if (outs[t].eos_hit && outs[t].n_frames > 0) {
+                    first_eos_take = t;
+                    break;
+                }
+            }
+            if (first_eos_take >= 0) {
+                fprintf(stderr, "[MM3-AR] First EOS: take %d at %lld frames; stopping the candidate batch\n",
+                        first_eos_take, (long long) outs[first_eos_take].n_frames);
+                break;
+            }
+        }
         bool any_active = false;
         for (int t = 0; t < K; t++) {
             any_active = any_active || active[t] != 0;
@@ -858,6 +877,7 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
             return false;
         }
         out->depth_ms += frames[0].ms;
+        out->depth_steps++;
         for (int t = 0; t < K; t++) {
             if (frames[(size_t) t].n_codes != (int) NC) {
                 if (err) {
@@ -1068,6 +1088,10 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
     if (opt.want_lrc && opt.tok != nullptr && !g_mm3_lm.align_capture && !align_dump && lyr0 >= 0 && lyr1 > lyr0) {
         for (int t = 0; t < K; t++) {
             MM3ArResult * o = &outs[t];
+            // Selection is already known, before any alignment work.
+            if ((opt.lrc_eos_only && !o->eos_hit) || (first_eos_take >= 0 && t != first_eos_take)) {
+                continue;
+            }
             if (o->n_frames <= 1) {
                 continue;
             }
@@ -1149,11 +1173,12 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
     }
     fprintf(stderr,
             "[MM3-AR] %lld frames (%lld iterations%s) in %.0f ms — prefill %.0f, LM %.0f (%lld steps, %.1f ms/step), "
-            "depth %.0f (%.1f ms/frame), host %.0f\n",
+            "depth %.0f (%lld batch steps, %.1f ms/frame), host %.0f\n",
             (long long) out->n_frames, (long long) out->n_iterations, out->eos_hit ? ", EOS" : "", out->total_ms,
             out->prefill_ms, out->lm_ms, (long long) out->lm_steps,
             out->lm_steps ? out->lm_ms / (double) out->lm_steps : 0.0, out->depth_ms,
-            out->n_iterations ? out->depth_ms / (double) out->n_iterations : 0.0, out->host_ms);
+            (long long) out->depth_steps,
+            out->depth_steps ? out->depth_ms / (double) out->depth_steps : 0.0, out->host_ms);
     // ── Non-finite logits: warn, or refuse ──────────────────────────────────
     //
     // `fix()` clamps a NaN/+inf candidate to -inf so the draw stays well

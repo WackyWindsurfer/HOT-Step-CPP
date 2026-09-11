@@ -710,6 +710,7 @@ struct MM3GenRequest {
      *  a natural ending is to plan several at once (one batched pass) and
      *  render only the ones that ended. */
     bool require_eos = false;
+    bool stop_after_first_eos = false;  // one song, still K candidate rows
     int  eos_rounds  = 4;
     /** Called once, right after planning, with the ORIGINAL take indices
      *  that ended (in order), so the job layer can compact its take list
@@ -1296,6 +1297,8 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
         // eos_rounds times. mm3_ar_plan_takes resets every MM3ArResult and
         // prefills afresh on each call, so re-running it is a clean re-plan.
         const bool cand       = req.require_eos && !interleave;
+        aopt.stop_after_first_eos = cand && req.stop_after_first_eos;
+        aopt.lrc_eos_only = cand;
         const int  rounds_max = cand ? (req.eos_rounds > 0 ? req.eos_rounds : 1) : 1;
         if (req.require_eos && interleave) {
             fprintf(stderr, "[MM3-Pipe] require_eos ignored on an interleaved stream: what was planned has already "
@@ -1340,8 +1343,17 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
                 return false;
             }
         }
+        int winner = -1;
+        if (aopt.stop_after_first_eos) {
+            for (int t = 0; t < K; t++) {
+                if (ars[(size_t) t].eos_hit && ars[(size_t) t].n_frames > 0) {
+                    winner = t;
+                    break;
+                }
+            }
+        }
         for (int t = 0; t < K; t++) {
-            outs[t].dropped         = cand && !ars[(size_t) t].eos_hit;
+            outs[t].dropped         = cand && (!ars[(size_t) t].eos_hit || (winner >= 0 && t != winner));
             outs[t].round           = round;
             outs[t].eos_rounds_used = round + 1;
         }
@@ -1389,8 +1401,11 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
             st.F           = F;
             st.NW          = 0;
             out->n_windows = 0;
-            fprintf(stderr, "[MM3-Pipe] take %d (seed %llu) reached the cap at %lld frames without EOS: dropped, not rendered\n",
-                    t, (unsigned long long) ars[(size_t) t].seed, (long long) F);
+            const char * reason = ars[(size_t) t].eos_hit ? "another EOS candidate was selected"
+                                 : F >= req.max_frames ? "frame cap without EOS"
+                                 : "batch stopped after another candidate reached EOS";
+            fprintf(stderr, "[MM3-Pipe] take %d (seed %llu) at %lld frames: %s; dropped, not rendered\n",
+                    t, (unsigned long long) ars[(size_t) t].seed, (long long) F, reason);
             continue;
         }
         if (F <= 0) {

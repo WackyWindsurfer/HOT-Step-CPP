@@ -238,6 +238,7 @@ struct MM3JobState {
     int      eos_rounds_used = 0;
     int      takes_planned   = 0;
     int      takes_dropped   = 0;
+    int      takes_capped    = 0;
 
     bool    have_result = false;
     int64_t frames      = 0;
@@ -512,6 +513,9 @@ static std::string mm3_ar_cache_key(const MM3Model & m, const MM3SynthRequest & 
     // asking for LRC can move the emitted codes — and the LRC text itself is
     // cached alongside, so a hit must not be able to hand back a missing one.
     add_i("lrc", (req.want_lrc && !req.instrumental) ? 1 : 0);
+    add_i("require_eos", req.gen.require_eos ? 1 : 0);
+    add_i("eos_rounds", req.gen.require_eos ? req.gen.eos_rounds : 0);
+    add_i("first_eos", req.gen.stop_after_first_eos ? 1 : 0);
 
     // Plank replay pins the codes, which pins the hiddens with them.
     if (!req.forced_semantic.empty()) {
@@ -1155,8 +1159,12 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     if (req.gen.require_eos && !st->interleaved) {
         std::vector<MM3GenResult> kept;
         std::string               dropped_seeds;
+        int capped = K * (rs[0].eos_rounds_used - 1);
         for (MM3GenResult & x : rs) {
             if (x.dropped) {
+                if (!x.ar.eos_hit && x.ar.n_frames >= req.gen.max_frames) {
+                    capped++;
+                }
                 dropped_seeds += (dropped_seeds.empty() ? "" : ", ") + std::to_string(x.ar.seed);
             } else {
                 kept.push_back(std::move(x));
@@ -1182,11 +1190,12 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
             st->eos_rounds_used = rs[0].eos_rounds_used;
             st->takes_planned   = planned;
             st->takes_dropped   = planned - K;
+            st->takes_capped    = capped;
         }
-        const std::string tail = dropped_seeds.empty() ? std::string() : " (capped seeds in the last round: " + dropped_seeds + ")";
+        const std::string tail = dropped_seeds.empty() ? std::string() : " (dropped seeds in the last round: " + dropped_seeds + ")";
         fprintf(stderr, "[MM3-Job] %s: natural ending - %d candidate(s) planned over %d round(s), %d ended and were rendered, "
-                        "%d capped and dropped%s\n",
-                job->id.c_str(), planned, rs[0].eos_rounds_used, K, planned - K, tail.c_str());
+                        "%d capped, %d other candidates not selected%s\n",
+                job->id.c_str(), planned, rs[0].eos_rounds_used, K, capped, planned - K - capped, tail.c_str());
     }
     // Take 0 is the job's primary result: it fills the upstream Job exactly as
     // a one-take render always has, so nothing downstream needs to know the
@@ -1671,6 +1680,7 @@ static void mm3_handle_job(const httplib::Request & hreq, httplib::Response & re
     yyjson_mut_obj_add_int(o, orot, "eos_rounds_used", st->eos_rounds_used);
     yyjson_mut_obj_add_int(o, orot, "takes_planned", st->takes_planned);
     yyjson_mut_obj_add_int(o, orot, "takes_dropped", st->takes_dropped);
+    yyjson_mut_obj_add_int(o, orot, "takes_capped", st->takes_capped);
     if (st->n_takes > 1 || st->require_eos) {
         yyjson_mut_val * arr = yyjson_mut_arr(o);
         for (int t = 0; t < (int) st->takes.size(); t++) {
