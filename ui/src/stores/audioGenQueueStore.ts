@@ -645,6 +645,23 @@ function _maybeAutoAddToPlaylist(item: AudioQueueItem): void {
  * Also backfills the queue item's coverUrl from the song's cover_url so the
  * playback backdrop shows the track's cover art instead of the artist image.
  */
+/**
+ * Notify the library of EVERY song a finished item produced: its own, plus
+ * the sibling take entries an MM3 ensemble / natural-ending render fanned out
+ * (mm3TakeOf). Until 2026-09-11 the Lyric Studio queue notified `item.songId`
+ * alone, so a render that saved two ended takes put one in the library and
+ * the other appeared only after a reload; the Create page's poll had always
+ * delivered them all.
+ */
+function _notifyItemSongs(item: AudioQueueItem): void {
+  const ids = new Set<string>();
+  if (item.songId) ids.add(item.songId);
+  for (const s of _state.items) {
+    if (s.mm3TakeOf === item.id && s.songId) ids.add(s.songId);
+  }
+  for (const id of ids) _notifySongCreated(id);
+}
+
 async function _notifySongCreated(songId: string): Promise<void> {
   try {
     const { song } = await songApi.get(songId);
@@ -1028,7 +1045,7 @@ async function _processQueue(token: string): Promise<void> {
             // Just ensure it's counted and notified.
             if (next.status === 'succeeded') {
               _state.completionCounter++;
-              if (next.songId) _notifySongCreated(next.songId);
+              _notifyItemSongs(next);
               _maybeAutoAddToPlaylist(next);
             }
             _emit(true);
@@ -1045,8 +1062,9 @@ async function _processQueue(token: string): Promise<void> {
         next.status = 'succeeded';
         _engineWaits.delete(next.id);
         _state.completionCounter++;
-        // Notify App.tsx so Library updates in real-time
-        if (next.songId) _notifySongCreated(next.songId);
+        // Notify App.tsx so Library updates in real-time — every take, not
+        // just the first (see _notifyItemSongs).
+        _notifyItemSongs(next);
         _maybeAutoAddToPlaylist(next);
       } catch (err) {
         const msg = (err as Error).message || '';
