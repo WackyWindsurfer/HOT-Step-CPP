@@ -119,6 +119,7 @@ dev-rebuild.bat
 server/restart-loop.cmd
 
 # Local-only content
+/_experiments/
 benchmark-results/
 docs/plans/
 scratch/
