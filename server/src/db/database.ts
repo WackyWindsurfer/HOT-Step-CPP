@@ -348,6 +348,11 @@ export function initDb(): void {
     // Planner-LM adapter per album (local HOT-Step feature)
     "ALTER TABLE album_presets ADD COLUMN lm_adapter_path TEXT",
     "ALTER TABLE album_presets ADD COLUMN lm_adapter_scale REAL",
+    // MM3 LM adapter per album (2026-09-11): the checkpoint's weights file,
+    // relative to the mm3-lm-adapters root — the same reference the
+    // mm3LmAdapter request param carries. ACE's lm_adapter_path above is the
+    // 5 Hz planner adapter and stays separate: one preset serves both backends.
+    "ALTER TABLE album_presets ADD COLUMN mm3_adapter_path TEXT",
   ];
   for (const sql of lireekMigrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

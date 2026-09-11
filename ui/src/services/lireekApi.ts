@@ -130,7 +130,22 @@ export interface AlbumPreset {
   /** Planner-LM adapter (song structure; local HOT-Step feature) */
   lm_adapter_path?: string;
   lm_adapter_scale?: number;
+  /** MM3 LM adapter weights file, relative to the mm3-lm-adapters root — the
+   *  reference the mm3LmAdapter backend param carries (2026-09-11). */
+  mm3_adapter_path?: string;
   created_at: string;
+}
+
+/** One MM3 adapter checkpoint as the Album Preset modal lists it. */
+export interface Mm3PresetAdapter {
+  file: string;
+  name?: string;
+  run: string;
+  ckpt: string;
+  step: number;
+  trainedSteps?: number;
+  dataset?: string;
+  mtime: number;
 }
 
 export interface AudioGeneration {
@@ -320,8 +335,16 @@ export const lireekApi = {
     audio_cover_strength?: number;
     lm_adapter_path?: string;
     lm_adapter_scale?: number;
+    mm3_adapter_path?: string;
   }): Promise<{ preset: AlbumPreset }> =>
     api(`/api/lireek/lyrics-sets/${lyricsSetId}/preset`, { method: 'PUT', body: params }),
+
+  /** MM3 adapters for this album: `candidates` trained on the dataset the
+   *  album was exported from (newest first), `others` = everything else. */
+  mm3AdaptersForLyricsSet: (lyricsSetId: number): Promise<{
+    datasetId: string | null; datasetSlug: string | null;
+    candidates: Mm3PresetAdapter[]; others: Mm3PresetAdapter[];
+  }> => api(`/api/training/lyrics-sets/${lyricsSetId}/mm3-adapters`),
 
   deletePreset: (lyricsSetId: number): Promise<{ deleted: boolean }> =>
     api(`/api/lireek/lyrics-sets/${lyricsSetId}/preset`, { method: 'DELETE' }),

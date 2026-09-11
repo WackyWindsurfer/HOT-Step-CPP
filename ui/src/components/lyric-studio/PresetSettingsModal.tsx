@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, Save, Loader2, ChevronDown, ChevronRight, Zap, Music, FolderSearch, Brain } from 'lucide-react';
-import { lireekApi } from '../../services/lireekApi';
+import { lireekApi, type Mm3PresetAdapter } from '../../services/lireekApi';
 import { FileBrowserModal } from '../shared/FileBrowserModal';
+import { useBackendStore } from '../../stores/backendStore';
+import { MM3_BACKEND_ID } from '../../utils/captionForBackend';
 
 interface PresetForm {
   adapter_path: string;
@@ -12,6 +14,8 @@ interface PresetForm {
   cond_embed: number;
   reference_track_path: string;
   lm_adapter_path: string;
+  /** MM3 LM adapter, relative to the mm3-lm-adapters root ('' = base model). */
+  mm3_adapter_path: string;
 }
 
 const DEFAULT_FORM: PresetForm = {
@@ -22,7 +26,12 @@ const DEFAULT_FORM: PresetForm = {
   cond_embed: 1.0,
   reference_track_path: '',
   lm_adapter_path: '',
+  mm3_adapter_path: '',
 };
+
+/** "run-stamp · ckpt-300" — the part of an MM3 adapter reference a human recognises. */
+const mm3Label = (a: Mm3PresetAdapter): string =>
+  `${a.run}${a.ckpt ? ' · ' + a.ckpt : ''}${a.trainedSteps && !a.ckpt ? ` · ${a.trainedSteps} steps` : ''}`;
 
 interface PresetSettingsModalProps {
   isOpen: boolean;
@@ -65,6 +74,13 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
   const [groupsExpanded, setGroupsExpanded] = useState(false);
   const [browserOpen, setBrowserOpen] = useState(false);
   const [browserTarget, setBrowserTarget] = useState<'adapter' | 'lmAdapter' | 'reference'>('adapter');
+  // MM3 mode shows the MM3 adapter for this album instead of the two ACE
+  // adapters (2026-09-11): the preset row is shared, the backends' adapters
+  // are not interchangeable, so each mode edits its own column.
+  const mm3Mode = useBackendStore(s => s.activeBackendId) === MM3_BACKEND_ID;
+  const [mm3Adapters, setMm3Adapters] = useState<{
+    datasetSlug: string | null; candidates: Mm3PresetAdapter[]; others: Mm3PresetAdapter[];
+  } | null>(null);
 
   // Load existing preset
   useEffect(() => {
@@ -81,6 +97,7 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
             cond_embed: res.preset.adapter_group_scales?.cond_embed ?? 1.0,
             reference_track_path: res.preset.reference_track_path || '',
             lm_adapter_path: res.preset.lm_adapter_path || '',
+            mm3_adapter_path: res.preset.mm3_adapter_path || '',
           });
         } else {
           setForm(DEFAULT_FORM);
@@ -89,6 +106,19 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
       .catch(err => showToast(`Failed to load preset: ${err.message}`))
       .finally(() => setLoading(false));
   }, [isOpen, lyricsSetId, showToast]);
+
+  // The MM3 adapters that belong to this album (runs on the dataset it was
+  // exported from), plus every other installed one. Advisory: a failure here
+  // leaves the picker empty, never blocks the modal.
+  useEffect(() => {
+    if (!isOpen || !mm3Mode) return;
+    let cancelled = false;
+    setMm3Adapters(null);
+    lireekApi.mm3AdaptersForLyricsSet(lyricsSetId)
+      .then(res => { if (!cancelled) setMm3Adapters(res); })
+      .catch(() => { if (!cancelled) setMm3Adapters({ datasetSlug: null, candidates: [], others: [] }); });
+    return () => { cancelled = true; };
+  }, [isOpen, mm3Mode, lyricsSetId]);
 
   const save = async () => {
     setSaving(true);
@@ -99,6 +129,7 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
         adapter_group_scales: { self_attn: form.self_attn, cross_attn: form.cross_attn, mlp: form.mlp, cond_embed: form.cond_embed },
         reference_track_path: form.reference_track_path || undefined,
         lm_adapter_path: stripWeightsFile(form.lm_adapter_path) || undefined,
+        mm3_adapter_path: form.mm3_adapter_path || undefined,
       });
       showToast('Preset saved');
       onClose();
@@ -154,6 +185,77 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
               <div className="flex items-center justify-center py-12">
                 <Loader2 className="w-6 h-6 text-zinc-500 animate-spin" />
               </div>
+            ) : mm3Mode ? (
+              <>
+                {/* MM3 Adapter Section — the one adapter that exists for this backend */}
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-zinc-700 dark:text-zinc-300">
+                    <Brain className="w-4 h-4 text-emerald-400" />
+                    {t('lyric.mm3Adapter', 'MM3 Adapter')}
+                  </div>
+                  <div className="space-y-2">
+                    <select value={form.mm3_adapter_path}
+                      onChange={e => setForm(p => ({ ...p, mm3_adapter_path: e.target.value }))}
+                      className="w-full bg-zinc-200 dark:bg-black/20 border border-zinc-300 dark:border-white/10 rounded-lg px-3 py-2 text-xs text-zinc-800 dark:text-white focus:outline-none focus:border-emerald-500 transition-colors">
+                      <option value="">{t('lyric.mm3AdapterNone', 'None — base model')}</option>
+                      {form.mm3_adapter_path && mm3Adapters
+                        && ![...mm3Adapters.candidates, ...mm3Adapters.others].some(a => a.file === form.mm3_adapter_path) && (
+                        <option value={form.mm3_adapter_path}>{form.mm3_adapter_path} ({t('lyric.mm3AdapterMissing', 'not installed')})</option>
+                      )}
+                      {mm3Adapters && mm3Adapters.candidates.length > 0 && (
+                        <optgroup label={t('lyric.mm3AdapterTrainedHere', 'Trained on this album')}>
+                          {mm3Adapters.candidates.map(a => <option key={a.file} value={a.file}>{mm3Label(a)}</option>)}
+                        </optgroup>
+                      )}
+                      {mm3Adapters && mm3Adapters.others.length > 0 && (
+                        <optgroup label={t('lyric.mm3AdapterOthers', 'Other installed adapters')}>
+                          {mm3Adapters.others.map(a => <option key={a.file} value={a.file}>{mm3Label(a)}</option>)}
+                        </optgroup>
+                      )}
+                    </select>
+                    {form.mm3_adapter_path && (
+                      <span className="text-[10px] text-zinc-500 truncate block" title={form.mm3_adapter_path}>{form.mm3_adapter_path}</span>
+                    )}
+                    <p className="text-[10px] text-zinc-600">
+                      {mm3Adapters === null
+                        ? t('lyric.mm3AdapterLoading', 'Looking up this album’s training runs…')
+                        : mm3Adapters.datasetSlug
+                          ? t('lyric.mm3AdapterHint', 'Newest run first. A finished MM3 training run on this album’s dataset ({{slug}}) selects its final checkpoint here automatically. Strength comes from the global LM Adapter menu.', { slug: mm3Adapters.datasetSlug })
+                          : t('lyric.mm3AdapterNoDataset', 'This album was not exported from a training dataset, so no run is linked to it; pick any installed adapter.')}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="border-t border-zinc-200 dark:border-white/5" />
+
+                {/* Reference Track Section (shared with ACE mode) */}
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-zinc-700 dark:text-zinc-300">
+                    <Music className="w-4 h-4 text-amber-400" />
+                    {t('lyric.referenceTrack')}
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Reference Audio</label>
+                    <div className="flex gap-2">
+                      <input type="text" value={form.reference_track_path}
+                        onChange={e => setForm(p => ({ ...p, reference_track_path: e.target.value }))}
+                        placeholder="Path to reference audio (.wav, .mp3, .flac)"
+                        className="flex-1 bg-zinc-200 dark:bg-black/20 border border-zinc-300 dark:border-white/10 rounded-lg px-3 py-2 text-xs text-white placeholder-zinc-400 dark:placeholder-zinc-600 focus:outline-none focus:border-amber-500 transition-colors"
+                      />
+                      <button onClick={() => { setBrowserTarget('reference'); setBrowserOpen(true); }}
+                        className="px-2.5 py-2 rounded-lg text-xs font-semibold bg-amber-900/20 text-amber-400 hover:bg-amber-900/30 transition-colors flex items-center gap-1 flex-shrink-0">
+                        <FolderSearch size={12} /> Browse
+                      </button>
+                    </div>
+                    {form.reference_track_path && (
+                      <span className="text-[10px] text-zinc-500 truncate block" title={form.reference_track_path}>{matchFileName}</span>
+                    )}
+                  </div>
+                  <p className="text-[10px] text-zinc-600">
+                    Used for timbre conditioning during generation
+                  </p>
+                </div>
+              </>
             ) : (
               <>
                 {/* Adapter Section */}

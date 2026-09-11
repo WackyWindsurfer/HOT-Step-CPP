@@ -405,6 +405,8 @@ export function upsertPreset(lyricsSetId: number, data: {
   audioCoverStrength?: number | null;
   lmAdapterPath?: string | null;
   lmAdapterScale?: number | null;
+  /** MM3 LM adapter weights file, relative to the mm3-lm-adapters root. */
+  mm3AdapterPath?: string | null;
 }): Record<string, any> {
   const db = getDb();
   const existing = getPreset(lyricsSetId);
@@ -413,21 +415,23 @@ export function upsertPreset(lyricsSetId: number, data: {
   if (existing) {
     db.prepare(
       `UPDATE album_presets SET adapter_path = ?, adapter_scale = ?, adapter_group_scales = ?,
-       reference_track_path = ?, audio_cover_strength = ?, lm_adapter_path = ?, lm_adapter_scale = ?
+       reference_track_path = ?, audio_cover_strength = ?, lm_adapter_path = ?, lm_adapter_scale = ?,
+       mm3_adapter_path = ?
        WHERE lyrics_set_id = ?`
     ).run(
       data.adapterPath ?? null, data.adapterScale ?? null, groupScalesJson,
       data.referenceTrackPath ?? null, data.audioCoverStrength ?? null,
-      data.lmAdapterPath ?? null, data.lmAdapterScale ?? null, lyricsSetId,
+      data.lmAdapterPath ?? null, data.lmAdapterScale ?? null,
+      data.mm3AdapterPath ?? null, lyricsSetId,
     );
   } else {
     db.prepare(
-      `INSERT INTO album_presets (lyrics_set_id, adapter_path, adapter_scale, adapter_group_scales, reference_track_path, audio_cover_strength, lm_adapter_path, lm_adapter_scale)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO album_presets (lyrics_set_id, adapter_path, adapter_scale, adapter_group_scales, reference_track_path, audio_cover_strength, lm_adapter_path, lm_adapter_scale, mm3_adapter_path)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       lyricsSetId, data.adapterPath ?? null, data.adapterScale ?? null, groupScalesJson,
       data.referenceTrackPath ?? null, data.audioCoverStrength ?? null,
-      data.lmAdapterPath ?? null, data.lmAdapterScale ?? null,
+      data.lmAdapterPath ?? null, data.lmAdapterScale ?? null, data.mm3AdapterPath ?? null,
     );
   }
   return getPreset(lyricsSetId)!;

@@ -125,6 +125,15 @@ export function useAudioGeneration({ profiles, showToast: _showToast }: UseAudio
       gps.setLmAdapter('');
     }
 
+    // MM3 adapter from album preset (2026-09-11): the backend param the global
+    // LM Adapter dropdown edits. Set when the preset names one, CLEARED when it
+    // does not — the param persists across sessions, so a previous album's
+    // adapter would otherwise keep planning this one. Scales stay where the
+    // dropdown left them, mirroring the DiT adapter semantics.
+    if (backendId === MM3_BACKEND_ID) {
+      gps.setBackendParam('mm3LmAdapter', preset?.mm3_adapter_path || '');
+    }
+
     // Mastering reference from album preset (does NOT force-enable — respects global toggle)
     if (preset?.reference_track_path) {
       gps.setMasteringReference(preset.reference_track_path);

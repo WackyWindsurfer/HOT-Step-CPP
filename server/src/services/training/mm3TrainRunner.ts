@@ -28,7 +28,8 @@ import {
   buildMm3CodesArgs, buildMm3TrainLmArgs, missingMm3TrainModels,
   type Mm3CodesArgs, type ResolvedMm3TrainLmOptions,
 } from './mm3Train.js';
-import { writeMm3RunManifest } from './mm3Runs.js';
+import { mm3AdapterRoot, writeMm3RunManifest } from './mm3Runs.js';
+import { refreshMm3PresetsForNewRun } from './lyricStudioExport.js';
 import {
   emitJob, emitProgress, finishJob, isCancelled, killJobChild, pushEvent, type TrainingJob,
 } from './labelingQueue.js';
@@ -607,6 +608,9 @@ export async function runMm3TrainLmJob(job: TrainingJob): Promise<void> {
     let resumable = false;
     let resumeFrom = opts.resumeFrom || '';
     let lastStep = resumeFrom ? Math.max(0, opts.resumeStep || 0) : 0;
+    // The last checkpoint any segment exported — what the album presets are
+    // pointed at once the run ends (see below the loop).
+    let finalCkpt = '';
     if (resumeFrom) {
       log(job, 'info',
         `Continuing this run from step ${lastStep} to ${opts.steps} — weights, optimizer momentum, `
@@ -656,6 +660,7 @@ export async function runMm3TrainLmJob(job: TrainingJob): Promise<void> {
       } finally {
         if (minuteTimer) clearTimeout(minuteTimer);
       }
+      if (st.lastCkpt) finalCkpt = st.lastCkpt;
       if (isCancelled(job)) return;
 
       if (st.pausedAt && st.pauseState && plan) {
@@ -692,6 +697,21 @@ export async function runMm3TrainLmJob(job: TrainingJob): Promise<void> {
     if (!isCancelled(job)) {
       log(job, 'info',
         'Checkpoints are in the MM3 adapter folder — they appear in the adapter picker with no install step.');
+      // Album presets follow the newest run (2026-09-11), as the ACE trainers'
+      // presets do: the dataset's exported lyrics set, and any preset already
+      // on an older run of this dataset, now point at the final checkpoint.
+      if (finalCkpt) {
+        const weights = path.join(finalCkpt, 'adapter_model.safetensors');
+        const rel = path.relative(mm3AdapterRoot(), weights);
+        if (fs.existsSync(weights) && rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+          const dsRow = getDataset(job.datasetId);
+          const touched = refreshMm3PresetsForNewRun({ slug: dsRow?.slug || '', lyricsSetId: dsRow?.lyricsSetId }, rel);
+          if (touched) {
+            log(job, 'info', `${touched} Lyric Studio album preset(s) now use this run's final checkpoint.`);
+            pushLog(`[Training] mm3-train-lm job ${job.id}: ${touched} album preset(s) updated to ${rel}`);
+          }
+        }
+      }
       // Reaching here means the run ENDED (step cap or target loss); a cancel,
       // a pause or a crash never gets this far, so their state survives for a
       // continuation. A finished run's optimizer state (~4.2 GB at r128) is

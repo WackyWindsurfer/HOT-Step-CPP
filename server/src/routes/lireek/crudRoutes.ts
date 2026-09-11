@@ -488,6 +488,7 @@ export function registerCrudRoutes(router: Router): void {
         audioCoverStrength: req.body.audio_cover_strength,
         lmAdapterPath: req.body.lm_adapter_path,
         lmAdapterScale: req.body.lm_adapter_scale,
+        mm3AdapterPath: req.body.mm3_adapter_path,
       });
       res.json({ preset: hydratePreset(preset) });
     } catch (err: any) {

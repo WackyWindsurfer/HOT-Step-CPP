@@ -254,6 +254,7 @@ function presetDataFromRow(row: Record<string, any> | null): {
   adapterPath: string | null; adapterScale: number | null; adapterGroupScales: any;
   referenceTrackPath: string | null; audioCoverStrength: number | null;
   lmAdapterPath: string | null; lmAdapterScale: number | null;
+  mm3AdapterPath: string | null;
 } {
   let groupScales: any = row?.adapter_group_scales ?? null;
   if (typeof groupScales === 'string') {
@@ -267,7 +268,51 @@ function presetDataFromRow(row: Record<string, any> | null): {
     audioCoverStrength: row?.audio_cover_strength ?? null,
     lmAdapterPath: row?.lm_adapter_path ?? null,
     lmAdapterScale: row?.lm_adapter_scale ?? null,
+    mm3AdapterPath: row?.mm3_adapter_path ?? null,
   };
+}
+
+/** The run directory an MM3 adapter reference belongs to: the first segment
+ *  of `<run>/ckpt-N/adapter_model.safetensors`, lower-cased, either slash. */
+function mm3RunOf(ref: string): string {
+  return String(ref ?? '').split(/[\\/]/).filter(Boolean)[0]?.toLowerCase() ?? '';
+}
+
+/**
+ * An MM3 training run on dataset `ds` just finished with its final checkpoint
+ * at `newRef` (relative to the mm3-lm-adapters root, the reference the
+ * mm3LmAdapter request param carries). Point the album presets that belong to
+ * this dataset at it (2026-09-11, Rob: "just like AS1.5 training does"):
+ *   - the preset of the lyrics set this dataset exported to (the direct link,
+ *     `training_datasets.lyrics_set_id`), whatever it held before;
+ *   - any preset whose MM3 column points at an OLDER run of the same dataset
+ *     (run dirs are `<slug>-<stamp>`), so re-exports and hand-linked albums
+ *     follow the newest training too.
+ * Presets pointing at other datasets' adapters are never touched. Returns the
+ * number updated; never throws (called from a job's success path).
+ */
+export function refreshMm3PresetsForNewRun(ds: { slug: string; lyricsSetId?: number }, newRef: string): number {
+  let updated = 0;
+  try {
+    const newRun = mm3RunOf(newRef);
+    const slugLower = String(ds.slug || '').toLowerCase();
+    const isRunOfDataset = (run: string) => !!slugLower && run.startsWith(slugLower + '-');
+    for (const preset of getAllPresets()) {
+      const stored = typeof preset.mm3_adapter_path === 'string' ? preset.mm3_adapter_path : '';
+      if (stored && stored.replace(/\\/g, '/').toLowerCase() === newRef.replace(/\\/g, '/').toLowerCase()) continue;
+      const direct = !!ds.lyricsSetId && preset.lyrics_set_id === ds.lyricsSetId;
+      const older  = !!stored && mm3RunOf(stored) !== newRun && isRunOfDataset(mm3RunOf(stored));
+      if (!direct && !older) continue;
+      const data = presetDataFromRow(preset);
+      data.mm3AdapterPath = newRef;
+      upsertPreset(preset.lyrics_set_id, data);
+      updated++;
+      console.log(`[Training] Album preset (lyrics set ${preset.lyrics_set_id}) mm3_adapter_path → ${newRef}`);
+    }
+  } catch (err: any) {
+    console.warn(`[Training] MM3 preset refresh after training failed: ${err?.message ?? err}`);
+  }
+  return updated;
 }
 
 /** Windows-safe path identity for run-dir comparison. */

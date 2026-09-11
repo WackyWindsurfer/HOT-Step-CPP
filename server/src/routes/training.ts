@@ -92,8 +92,9 @@ import {
   type Mm3BasePrecision,
 } from '../services/training/mm3Train.js';
 import {
-  listMm3Runs, readMm3Run, resolveMm3RunDir, resumeOptionsFor,
+  listMm3Runs, mm3AdapterRoot, readMm3Run, resolveMm3RunDir, resumeOptionsFor,
 } from '../services/training/mm3Runs.js';
+import { listMm3LmAdapters } from '../services/backends/minimax/lmAdapter.js';
 import { listMm3PreviewCandidates } from '../services/training/mm3Preview.js';
 import { writeSidecar } from '../services/training/sidecarIO.js';
 import { essentiaAvailable } from '../services/training/essentiaClient.js';
@@ -2428,6 +2429,47 @@ router.get('/datasets/:id/mm3-runs', (req: Request, res: Response) => {
         : { ...r, running: false }
     ));
     res.json({ runs: out, busy: !!active });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+/** GET /lyrics-sets/:id/mm3-adapters
+ *
+ *  The MM3 adapters that belong to a Lyric Studio album, for the Album Preset
+ *  modal in MM3 mode (2026-09-11). "Belong" = the checkpoints of runs on the
+ *  dataset this lyrics set was exported from (`training_datasets.lyrics_set_id`),
+ *  newest run first, final checkpoint first within a run; `others` is every
+ *  other installed MM3 adapter, for an album trained under a different name.
+ *  References are relative to the mm3-lm-adapters root, exactly what the
+ *  mm3LmAdapter request param and album_presets.mm3_adapter_path carry. */
+router.get('/lyrics-sets/:id/mm3-adapters', (req: Request, res: Response) => {
+  try {
+    const lyricsSetId = Number(req.params.id);
+    const ds = Number.isFinite(lyricsSetId)
+      ? repo.listDatasets().find(d => Number(d.lyricsSetId) === lyricsSetId) ?? null : null;
+    const slug = String(ds?.slug || '').toLowerCase();
+    const root = mm3AdapterRoot();
+    // `_pissa-init-cache` and `_prefix-selftest` hold safetensors that are not
+    // adapters; the underscore prefix marks every such helper folder.
+    const all = listMm3LmAdapters().filter(a => !a.file.startsWith('_')).map(a => {
+      const parts = a.file.split(/[\\/]/).filter(Boolean);
+      const run = parts[0] || '';
+      const ckpt = parts.length > 2 ? parts[parts.length - 2] : '';
+      let mtime = 0;
+      try { mtime = fs.statSync(path.join(root, a.file)).mtimeMs; } catch { /* listed but unreadable: sort last */ }
+      const step = Number((ckpt.match(/^ckpt-(\d+)$/) || [])[1] || a.trainedSteps || 0);
+      return { file: a.file, name: a.name, run, ckpt, step, trainedSteps: a.trainedSteps, dataset: a.dataset, mtime };
+    });
+    const mine = all.filter(a => slug && (a.run.toLowerCase().startsWith(slug + '-')
+                                          || String(a.dataset || '').toLowerCase() === slug));
+    const byNewest = (x: typeof all[number], y: typeof all[number]) =>
+      (y.run === x.run ? y.step - x.step : y.mtime - x.mtime);
+    res.json({
+      datasetId: ds?.id ?? null, datasetSlug: ds?.slug ?? null,
+      candidates: mine.sort(byNewest),
+      others: all.filter(a => !mine.includes(a)).sort(byNewest),
+    });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || String(err) });
   }
