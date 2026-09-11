@@ -134,8 +134,10 @@ export function useAudioGeneration({ profiles, showToast: _showToast }: UseAudio
       gps.setBackendParam('mm3LmAdapter', preset?.mm3_adapter_path || '');
     }
 
-    // Mastering reference from album preset (does NOT force-enable — respects global toggle)
-    if (preset?.reference_track_path) {
+    // Mastering reference from album preset (does NOT force-enable — respects global toggle).
+    // ACE only: the timbre reference is an ACE-Step conditioning input and the
+    // MM3 runner never reads it, so in MM3 mode it is left alone.
+    if (backendId !== MM3_BACKEND_ID && preset?.reference_track_path) {
       gps.setMasteringReference(preset.reference_track_path);
       gps.setTimbreReference(true);
     }

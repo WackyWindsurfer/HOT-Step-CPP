@@ -225,36 +225,9 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
                     </p>
                   </div>
                 </div>
-
-                <div className="border-t border-zinc-200 dark:border-white/5" />
-
-                {/* Reference Track Section (shared with ACE mode) */}
-                <div className="space-y-3">
-                  <div className="flex items-center gap-2 text-sm font-semibold text-zinc-700 dark:text-zinc-300">
-                    <Music className="w-4 h-4 text-amber-400" />
-                    {t('lyric.referenceTrack')}
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Reference Audio</label>
-                    <div className="flex gap-2">
-                      <input type="text" value={form.reference_track_path}
-                        onChange={e => setForm(p => ({ ...p, reference_track_path: e.target.value }))}
-                        placeholder="Path to reference audio (.wav, .mp3, .flac)"
-                        className="flex-1 bg-zinc-200 dark:bg-black/20 border border-zinc-300 dark:border-white/10 rounded-lg px-3 py-2 text-xs text-white placeholder-zinc-400 dark:placeholder-zinc-600 focus:outline-none focus:border-amber-500 transition-colors"
-                      />
-                      <button onClick={() => { setBrowserTarget('reference'); setBrowserOpen(true); }}
-                        className="px-2.5 py-2 rounded-lg text-xs font-semibold bg-amber-900/20 text-amber-400 hover:bg-amber-900/30 transition-colors flex items-center gap-1 flex-shrink-0">
-                        <FolderSearch size={12} /> Browse
-                      </button>
-                    </div>
-                    {form.reference_track_path && (
-                      <span className="text-[10px] text-zinc-500 truncate block" title={form.reference_track_path}>{matchFileName}</span>
-                    )}
-                  </div>
-                  <p className="text-[10px] text-zinc-600">
-                    Used for timbre conditioning during generation
-                  </p>
-                </div>
+                {/* No reference track here: the timbre reference is an ACE-Step
+                    conditioning input (generate.ts) and the MM3 runner never
+                    reads it. The column is kept for the ACE view of this preset. */}
               </>
             ) : (
               <>
