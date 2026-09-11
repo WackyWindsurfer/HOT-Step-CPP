@@ -12,6 +12,9 @@ py -3.13 tools/vocal-end/vocal_end.py "M:/Datasets/<album>/"*.flac
 ```
 
 Output: one JSON line per file, a summary table, stems and JSON under `tools/vocal-end/out/` (gitignored).
+Stems are cached under `out/` by basename plus a short hash of the file's absolute path, so two render sets that share
+file names in different folders do not share stems. Files shorter than 2 s are skipped. SuperSep evicts the MM3 model
+from the engine: re-warm MM3 before planning again after a pass.
 
 Why it exists: the MM3 endings investigation (docs/plans/mm3-endings-checklist.md, 2026-09-10) needed to know
 whether capped renders had finished singing. The LRC could not say (forced alignment); this could. It showed one

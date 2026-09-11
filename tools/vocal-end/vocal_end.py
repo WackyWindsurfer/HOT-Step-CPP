@@ -45,7 +45,10 @@ def http_raw(url, data=None, timeout=1800):
 
 def separate(path):
     """Returns the vocal stem as (mono float32, sr) via the engine's SuperSep; cached as <OUT>/<stem>.vocals.wav."""
-    cache = os.path.join(OUT, os.path.splitext(os.path.basename(path))[0] + '.vocals.wav')
+    # Keyed by basename PLUS a hash of the absolute path: two render sets with the same file names in different folders
+    # shared one cache on 2026-09-11 and scored identically. Old basename-only stems are simply not reused.
+    import hashlib; tag = hashlib.md5(os.path.abspath(path).encode()).hexdigest()[:8]
+    cache = os.path.join(OUT, os.path.splitext(os.path.basename(path))[0] + f'.{tag}.vocals.wav')
     if os.path.exists(cache):
         y, sr = sf.read(cache, dtype='float32'); return (y.mean(axis=1) if y.ndim > 1 else y), sr
     # The engine's audio reader takes WAV/MP3; datasets are 96 kHz FLAC, so decode + resample to 44.1 kHz WAV in memory.
@@ -129,9 +132,12 @@ def lyrics_for(path):
 
 results = []
 for path in files:
+    try:
+        if sf.info(path).duration < 2.0: print(json.dumps({'file': os.path.basename(path), 'skipped': 'shorter than 2 s'}), flush=True); continue
+    except Exception: pass
     t0 = time.time(); y, sr = separate(path)
     a = activity(y, sr)
-    stem = os.path.join(OUT, os.path.splitext(os.path.basename(path))[0] + '.vocals.wav')
+    import hashlib; stem = os.path.join(OUT, os.path.splitext(os.path.basename(path))[0] + '.' + hashlib.md5(os.path.abspath(path).encode()).hexdigest()[:8] + '.vocals.wav')
     w = whisper(stem, lyrics_for(path))
     rec = {'file': os.path.basename(path), **a, **w, 'wall_s': round(time.time() - t0)}
     results.append(rec); print(json.dumps(rec), flush=True)
